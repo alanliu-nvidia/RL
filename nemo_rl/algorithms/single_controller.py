@@ -112,6 +112,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
     algo_config,
+    dedicated_value_enabled,
     is_ppo_run,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
@@ -369,6 +370,7 @@ class SingleControllerActor:
         self._algo_cfg = algo_config(master_config)
         self._async_cfg = master_config.async_rl
         self._is_ppo: bool = is_ppo_run(master_config)
+        self._value_dedicated: bool = dedicated_value_enabled(master_config)
         # GRPO has no epoch knob: it makes one optimizer step per RL step.
         self._ppo_epochs: int = self._algo_cfg.ppo_epochs if self._is_ppo else 1
         self._critic_ppo_epochs: int = (
@@ -2943,7 +2945,7 @@ class SingleControllerActor:
                             # normalizer still counts all of them.
                             await asyncio.to_thread(
                                 self._trainer.prepare_for_lp_inference,
-                                keep_train_buffers=step_open,
+                                keep_train_buffers=step_open or self._value_dedicated,
                             )
                         with (
                             self._timer.time("policy_and_reference_logprobs"),
@@ -2962,7 +2964,7 @@ class SingleControllerActor:
                                     self._trainer.get_reference_policy_logprobs_from_meta,
                                     train_meta,
                                 )
-                    elif self._is_ppo:
+                    elif self._is_ppo and not self._value_dedicated:
                         # prepare_for_lp_inference is skipped here, and it is the only
                         # other call that parks the policy optimizer before the critic.
                         with (
@@ -2985,7 +2987,8 @@ class SingleControllerActor:
                                 tracer=self._tracer,
                             ),
                         ):
-                            await asyncio.to_thread(self._trainer.finish_inference)
+                            if not self._value_dedicated:
+                                await asyncio.to_thread(self._trainer.finish_inference)
                             train_meta = await self._value_stage(train_meta)
 
                     if self._is_ppo:
@@ -4863,23 +4866,32 @@ class SingleControllerActor:
             # serialized. The critic goes first because offloading the policy runs
             # finalize_async_save, which would block on the policy's own write if
             # that had already been staged.
-            await asyncio.to_thread(self._trainer.offload_to_cpu)
+            if not self._value_dedicated:
+                await asyncio.to_thread(self._trainer.offload_to_cpu)
             # The value model writes synchronously, so unlike the policy below it is
             # fully on disk when this returns and needs no finalize wait.
-            await asyncio.to_thread(self._value.prepare_for_training)
-            await asyncio.to_thread(
-                self._value.save_checkpoint,
-                weights_path=os.path.join(checkpoint_path, "value", "weights"),
-                optimizer_path=os.path.join(checkpoint_path, "value", "optimizer")
-                if self._checkpointer.save_optimizer
-                else None,
-                tokenizer_path=os.path.join(checkpoint_path, "value", "tokenizer"),
-                is_final_checkpoint=is_final_checkpoint,
+            resident_kwargs = {"keep_resident": True} if self._value_dedicated else {}
+            await self._ppo_worker_call(
+                self._value.prepare_for_training, **resident_kwargs
             )
-            await asyncio.to_thread(self._value.finish_training)
+            try:
+                await self._ppo_worker_call(
+                    self._value.save_checkpoint,
+                    weights_path=os.path.join(checkpoint_path, "value", "weights"),
+                    optimizer_path=os.path.join(checkpoint_path, "value", "optimizer")
+                    if self._checkpointer.save_optimizer
+                    else None,
+                    tokenizer_path=os.path.join(checkpoint_path, "value", "tokenizer"),
+                    is_final_checkpoint=is_final_checkpoint,
+                )
+            finally:
+                await self._ppo_worker_call(
+                    self._value.finish_training, **resident_kwargs
+                )
             # Also covers a warmup step, which never ran prepare_for_training in
             # the pump and would otherwise save from CPU-resident params.
-            await asyncio.to_thread(self._trainer.prepare_for_training)
+            if not self._value_dedicated:
+                await asyncio.to_thread(self._trainer.prepare_for_training)
 
         # Save policy model
         # With async_save this returns after D2H staging; disk writes finish
@@ -5161,15 +5173,20 @@ class SingleControllerActor:
         Tensors never touch SC: workers fetch the sequence columns from
         DataPlane and commit the per-token prediction back under ``values``,
         which the advantage stage then reads alongside the rewards. The value model
-        is loaded and offloaded around the call, so it holds the training GPUs
-        only for the duration of the forward.
+        is loaded and offloaded around the call in shared mode; dedicated value
+        workers keep it resident on their own GPUs.
 
         Returns:
             The batch metadata with the ``values`` column recorded on it.
         """
-        await asyncio.to_thread(self._value.prepare_for_inference)
-        await asyncio.to_thread(self._value.get_values_from_meta, meta)
-        await asyncio.to_thread(self._value.finish_inference)
+        resident_kwargs = {"keep_resident": True} if self._value_dedicated else {}
+        await self._ppo_worker_call(
+            self._value.prepare_for_inference, **resident_kwargs
+        )
+        try:
+            await self._ppo_worker_call(self._value.get_values_from_meta, meta)
+        finally:
+            await self._ppo_worker_call(self._value.finish_inference, **resident_kwargs)
         return meta.with_fields([self._advantage_cfg.values_field])
 
     async def _ppo_worker_call(
@@ -5193,7 +5210,8 @@ class SingleControllerActor:
         self, metas: list[KVBatchMeta], *, num_epochs: int
     ) -> dict[str, Any]:
         """Replay all step chunks per critic epoch under one residency cycle."""
-        await self._ppo_worker_call(self._value.prepare_for_training)
+        resident_kwargs = {"keep_resident": True} if self._value_dedicated else {}
+        await self._ppo_worker_call(self._value.prepare_for_training, **resident_kwargs)
         result: dict[str, Any] | None = None
         try:
             if self._algo_cfg.value_training_mode == "whole_batch":
@@ -5218,7 +5236,7 @@ class SingleControllerActor:
                     finally:
                         await self._ppo_worker_call(self._value.abort_train_step)
         finally:
-            await self._ppo_worker_call(self._value.finish_training)
+            await self._ppo_worker_call(self._value.finish_training, **resident_kwargs)
         assert result is not None
         return result
 
