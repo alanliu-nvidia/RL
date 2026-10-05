@@ -605,6 +605,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                         defer_fp32_logits=self.defer_fp32_logits,
                         global_valid_seqs=global_valid_seqs,
                         global_valid_toks=global_valid_toks,
+                        compute_mtp_loss=False,
                     )
 
                 # Empty unused memory
@@ -810,10 +811,6 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                 data["token_mask"][:, 1:] * sample_mask.unsqueeze(-1)
             ).sum()
             state.counts[2] += data.size
-            if state.counts[2].item() > state.gbs // self.dp_size:
-                raise ValueError(
-                    "value train chunks exceed the configured global batch"
-                )
             iterator, nmb, actual_mbs, _, padded_length = get_microbatch_iterator(
                 data,
                 self._policy_like_cfg,
@@ -848,6 +845,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                         defer_fp32_logits=self.defer_fp32_logits,
                         global_valid_seqs=one,
                         global_valid_toks=one,
+                        compute_mtp_loss=False,
                     )
                     executed = True
                 if not executed:
@@ -1036,6 +1034,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                 input_ids=input_ids_cp_sharded,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
+                compute_mtp_loss=False,
                 **additional_kwargs,
             )
 
@@ -1301,10 +1300,10 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                 "finish or abort the value train step before inference/offload"
             )
 
+        self.model.eval()
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=True
         )
-        self.model.eval()
 
         if (
             hasattr(self, "optimizer")
