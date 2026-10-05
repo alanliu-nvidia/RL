@@ -14,6 +14,8 @@
 
 from typing import Any, NotRequired, TypedDict
 
+from pydantic import BaseModel
+
 from nemo_rl.models.policy import (
     DTensorConfig,
     DTensorConfigDisabled,
@@ -31,6 +33,11 @@ from nemo_rl.models.policy import (
     TokenizerConfig,
 )
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
+
+
+class ValueResourcesConfig(BaseModel, extra="allow"):
+    dedicated: bool = False
+    num_nodes: int | None = None
 
 
 class ValueConfig(TypedDict):
@@ -60,6 +67,7 @@ class ValueConfig(TypedDict):
     # Backend configuration - DTensor or Megatron
     dtensor_cfg: DTensorConfig | DTensorConfigDisabled
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
+    resources: NotRequired[ValueResourcesConfig]
 
     # HuggingFace config overrides
     hf_config_overrides: NotRequired[dict[str, Any]]
