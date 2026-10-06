@@ -132,6 +132,56 @@ _AUX_LOSS_TRACK_NAMES: dict[str, str] = {
 }
 
 
+def count_moe_layers(model: Any = None, model_config: Any = None) -> Optional[int]:
+    """Return the MoE-layer divisor used by Megatron's loss logging."""
+    if model_config is None and model is None:
+        return None
+
+    pattern = None
+    for source in (model_config, model):
+        if source is None:
+            continue
+        for attr in ("hybrid_layer_pattern", "hybrid_override_pattern"):
+            pattern = getattr(source, attr, None)
+            if pattern:
+                break
+        if pattern:
+            break
+
+    if not pattern and model is not None:
+        node = model
+        for _ in range(4):
+            node = getattr(node, "module", None) or getattr(
+                node, "language_model", None
+            )
+            if node is None:
+                break
+            pattern = getattr(node, "hybrid_layer_pattern", None)
+            if pattern:
+                break
+
+    layers = None
+    if pattern:
+        try:
+            from megatron.core.models.hybrid.hybrid_layer_allocation import (
+                Symbols,
+                get_hybrid_layer_counts,
+            )
+
+            layers = get_hybrid_layer_counts(pattern)[Symbols.MOE]
+        except Exception:
+            layers = None
+
+    if layers is None:
+        layers = getattr(model_config, "num_layers", None)
+    if layers is None:
+        return None
+
+    mtp_layers = getattr(model_config, "mtp_num_layers", None) or 0
+    total = int(layers) + int(mtp_layers)
+    return total if total > 0 else None
+
+
 def get_aux_loss_track_names(model_config: Any) -> list[str]:
     """Returns the aux-loss tracker names the router records for a model config.
 
@@ -198,6 +248,7 @@ def get_moe_metrics(
     loss_scale: float,
     total_loss_dict: Optional[dict] = None,
     per_layer_logging: bool = False,
+    num_moe_layers: Optional[int] = None,
     num_layers: Optional[int] = None,
     mtp_num_layers: Optional[int] = None,
     track_names: Optional[list[str]] = None,
@@ -211,6 +262,8 @@ def get_moe_metrics(
         loss_scale: Scale factor to apply to each auxiliary loss (e.g., 1/num_microbatches).
         total_loss_dict: If provided, accumulate means into this dict (by name).
         per_layer_logging: If True, include per-layer values in the returned dict.
+        num_moe_layers: Divisor for the across-layer mean. Hybrid models must use
+            their actual MoE-layer count instead of the tracker tensor length.
         num_layers: Total number of transformer layers. When provided together with a
             non-empty ``track_names``, the aux-loss tracker is pre-initialized on every
             rank before the reduction (see Note). Defaults to None, which disables
@@ -265,9 +318,10 @@ def get_moe_metrics(
     if len(tracker) > 0:
         aux_losses = {k: v["values"].float() * loss_scale for k, v in tracker.items()}
         for name, loss_list in aux_losses.items():
-            # Megatron-LM aggregates aux losses across layers and normalizes by number of MoE layers
-            num_tracked_layers = int(loss_list.numel()) if loss_list.numel() > 0 else 1
-            aggregated_value = loss_list.sum() / num_tracked_layers
+            divisor = num_moe_layers
+            if not divisor:
+                divisor = int(loss_list.numel()) if loss_list.numel() > 0 else 1
+            aggregated_value = loss_list.sum() / divisor
             metrics[name] = float(aggregated_value.item())
             if total_loss_dict is not None:
                 if name not in total_loss_dict:
@@ -289,11 +343,11 @@ def get_mtp_metrics(loss_scale: float = 1.0) -> dict[str, Any]:
     This function reduces MTP metrics across ranks and returns a dictionary of metrics.
 
     Args:
-        loss_scale: Scale factor applied to each MTP layer's loss (e.g., 1/num_microbatches).
-            ``MTPLossLoggingHelper`` accumulates the per-microbatch loss across microbatches
-            without dividing, so callers must pass 1/num_microbatches to recover the mean
-            (mirroring ``get_moe_metrics``). Acceptance rate is a ratio of counts and is not
-            scaled. Defaults to 1.0.
+        loss_scale: Compatibility scale applied when only the legacy rank-local
+            mean losses are available (e.g., 1/num_microbatches). When MCore
+            provides globally reduced token sums, the loss is instead normalized
+            by the global main-loss token count. Acceptance rate is a ratio of
+            counts and is not scaled. Defaults to 1.0.
 
     Returns:
         dict[str, Any]: A flat dict of metrics. Each MTP layer's loss is returned
@@ -305,7 +359,18 @@ def get_mtp_metrics(loss_scale: float = 1.0) -> dict[str, Any]:
 
     metrics: dict[str, Any] = {}
     if "loss_values" in tracker:
-        mtp_losses = tracker["loss_values"].float() * loss_scale
+        if tracker.get("token_weighted_logging", False):
+            # These values are sum-reduced over DP+CP by MCore. Dividing the raw
+            # MTP loss by the global main-loss token count mirrors the gradient
+            # normalization used when mtp_normalize_loss_by_main_tokens=True and
+            # remains invariant to empty or uneven CP shards.
+            mtp_losses = tracker["loss_sum_values"].float() / tracker[
+                "main_total_values"
+            ].float().clamp(min=1)
+        else:
+            # Compatibility path for MCore versions/configurations that only
+            # track the legacy rank-local mean loss.
+            mtp_losses = tracker["loss_values"].float() * loss_scale
         mtp_corrects = tracker.get("correct_values", torch.zeros_like(mtp_losses))
         mtp_totals = tracker.get("total_values", torch.ones_like(mtp_losses))
         mtp_num_layers = mtp_losses.shape[0]

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import io
+import os
 from copy import deepcopy
 from typing import Any
 
@@ -28,8 +29,10 @@ pytest.importorskip("megatron.energon")
 
 pytestmark = pytest.mark.mcore
 
+
 from nemo_rl.algorithms.sft import prepare_sft_batch  # noqa: E402
 from nemo_rl.data.collate_fn import rl_collate_fn  # noqa: E402
+from nemo_rl.data.energon import sft_dataloader  # noqa: E402
 from nemo_rl.data.energon.config import (  # noqa: E402
     EnergonLoaderConfig,
     EnergonSourceConfig,
@@ -50,6 +53,7 @@ from nemo_rl.data.energon.sft_dataloader import (  # noqa: E402
     _identity_fingerprint,
     _loader_config,
     _loader_identity,
+    _set_nvdataset_cache_dir,
     build_energon_sft_loader,
 )
 from nemo_rl.data.interfaces import TaskDataSpec  # noqa: E402
@@ -481,6 +485,10 @@ def test_energon_config_validates_sequence_packing():
     assert config.topology_mapper == "default"
     assert config.task_encoder.name == "generic_sft"
     assert [cooker.name for cooker in config.cookers] == ["generic_conversation"]
+    assert config.cache_pool_max_gbytes is None
+    assert config.cache_pool_num_workers == 1
+    assert config.gc_collect_every_n_steps == 100000
+    assert config.nvdataset_cache_dir is None
 
     source = EnergonSourceConfig(
         path="/data/prepared", split="train", virtual_epoch_length=10
@@ -515,6 +523,24 @@ def test_energon_config_validates_sequence_packing():
         EnergonLoaderConfig.model_validate({})
     with pytest.raises(ValueError):
         EnergonLoaderConfig.model_validate({"model_family": "unsupported"})
+
+    for field in (
+        "cache_pool_max_gbytes",
+        "cache_pool_num_workers",
+        "gc_collect_every_n_steps",
+    ):
+        with pytest.raises(ValueError):
+            EnergonLoaderConfig(model_family="qwen", **{field: 0})
+
+
+def test_nvdataset_cache_dir_updates_env_and_energon_global(monkeypatch):
+    monkeypatch.delenv("NVDATASET_CACHE_DIR", raising=False)
+    monkeypatch.setattr(sft_dataloader.energon_epath, "NVDATASET_CACHE_DIR", None)
+
+    _set_nvdataset_cache_dir("/cache/dss")
+
+    assert os.environ["NVDATASET_CACHE_DIR"] == "/cache/dss"
+    assert str(sft_dataloader.energon_epath.NVDATASET_CACHE_DIR) == "/cache/dss"
 
 
 def _identity(

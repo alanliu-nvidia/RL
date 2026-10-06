@@ -1,0 +1,26 @@
+# Use with: --fp8-format e4m3 --fp8-recipe mxfp8 --te-precision-config-file <this file>
+# Matchers are ordered, first match wins. Unmatched modules keep the MXFP8 default.
+
+configs:
+  bf16:
+    transformer_engine_config_type: "TEQuantizationParams"
+    training_recipe: {}
+
+matchers:
+  mtp_bf16:
+    config: "bf16"
+    type: "glob"
+    pattern: "*mtp.layers.*"
+    enabled: true
+
+  mimo_vision_encoder_bf16:
+    config: "bf16"
+    type: "glob"
+    pattern: "*modality_submodules.*.encoders.*"
+    enabled: true
+
+  mimo_vision_projection_bf16:
+    config: "bf16"
+    type: "glob"
+    pattern: "*modality_submodules.*projections.*"
+    enabled: true

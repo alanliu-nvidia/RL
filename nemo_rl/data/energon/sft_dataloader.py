@@ -37,7 +37,11 @@ from megatron.energon import (
 )
 from megatron.energon.epathlib import epath as energon_epath
 
-from nemo_rl.data.energon.config import EnergonLoaderConfig, EnergonSourceConfig
+from nemo_rl.data.energon.config import (
+    EnergonLoaderConfig,
+    EnergonSourceConfig,
+    EnergonTaskEncoderOptions,
+)
 from nemo_rl.data.energon.multimodal.registry import (
     COOKER_REGISTRY,
     TASK_ENCODER_REGISTRY,
@@ -396,7 +400,14 @@ def _task_encoder(
             object_name=loader_config.task_encoder.object,
         ),
     )
-    encoder_options = loader_config.task_encoder.options
+    encoder_options = dict(loader_config.task_encoder.options)
+    if loader_config.task_encoder.name in (
+        "nemotron_multimodal",
+        "nemotron4_multimodal",
+    ):
+        encoder_options = EnergonTaskEncoderOptions.model_validate(
+            encoder_options
+        ).model_dump()
     packing = loader_config.task_encoder.packing
     if (
         packing is not None

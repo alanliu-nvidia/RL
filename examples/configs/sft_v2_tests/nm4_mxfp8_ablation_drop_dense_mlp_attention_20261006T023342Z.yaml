@@ -1,0 +1,25 @@
+configs:
+  bf16:
+    transformer_engine_config_type: TEQuantizationParams
+    training_recipe: {}
+matchers:
+  mamba_bf16:
+    config: bf16
+    type: glob
+    pattern: '*decoder.layers.*.mixer.*'
+    enabled: true
+  mtp_bf16:
+    config: bf16
+    type: glob
+    pattern: '*mtp.layers.*'
+    enabled: true
+  mimo_vision_encoder_bf16:
+    config: bf16
+    type: glob
+    pattern: '*modality_submodules.*.encoders.*'
+    enabled: true
+  mimo_vision_projection_bf16:
+    config: bf16
+    type: glob
+    pattern: '*modality_submodules.*projections.*'
+    enabled: true

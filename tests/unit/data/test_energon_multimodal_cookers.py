@@ -12,22 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# ruff: noqa: E402
+
 from dataclasses import FrozenInstanceError
 from io import BytesIO
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image
 
-# cookers.generic imports megatron.energon at module scope, and it ships only in
-# the `mcore` extra. importorskip must run before that import: the mcore mark is
-# applied in pytest_collection_modifyitems, too late to prevent a collection
-# error.
 pytest.importorskip("megatron.energon")
+pytest.importorskip("megatron.core")
 
 pytestmark = pytest.mark.mcore
 
-from nemo_rl.data.energon.multimodal.cookers.generic import (  # noqa: E402
-    cook_conversation,
+from megatron.energon import Cooker
+
+from nemo_rl.data.energon.multimodal.cookers.generic import cook_conversation
+from nemo_rl.data.energon.multimodal.cookers.nemotron import (
+    cook_nemotron_conversation,
 )
 
 
@@ -40,6 +43,54 @@ def _sample(payload, **members):
         "json": payload,
         **members,
     }
+
+
+class _FakeMediaStore:
+    def get_path(self):
+        return "/data/media"
+
+    def get_media_metadata(self, path):
+        return SimpleNamespace(width=80, height=40)
+
+
+class _FakeCache:
+    def get_lazy(self, store, path):
+        return ("lazy", store.get_path(), path)
+
+
+def test_nemotron_conversation_cooker_loads_fragment_media_from_aux_store():
+    sample = _sample(
+        {
+            "conversation": [
+                {
+                    "sender": "user",
+                    "fragments": [
+                        {"t": "image", "value": "data/example.png"},
+                        {"t": "text", "value": "Describe it."},
+                    ],
+                },
+                {
+                    "sender": "assistant",
+                    "fragments": [{"t": "text", "value": "A diagram."}],
+                },
+            ]
+        }
+    )
+
+    cooked = cook_nemotron_conversation(
+        sample,
+        cache=_FakeCache(),
+        media_source=_FakeMediaStore(),
+    )
+
+    assert cooked.media[0].value == ("lazy", "/data/media", "data/example.png")
+    assert cooked.media[0].metadata == (("height", 40), ("width", 80))
+    assert cooked.messages[0]["content"] == [
+        {"type": "image", "media_index": 0},
+        {"type": "text", "text": "Describe it."},
+    ]
+    assert cooked.__sources__[-1].index == "data/example.png"
+    assert Cooker(cook_nemotron_conversation).need_cache
 
 
 def test_generic_cooker_freezes_explicit_media_metadata_without_opening_media():

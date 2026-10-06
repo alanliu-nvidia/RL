@@ -1,0 +1,16 @@
+defaults:
+  - nm4_generalist_32n_mxfp8_cp64ep64_gbs2_hybridep_nogtp.yaml
+
+policy:
+  # DP=2 and microbatch=1: 16 accumulation microbatches per optimizer step.
+  train_global_batch_size: 32
+
+logger:
+  log_dir: logs/nm4-generalist-32n-mxfp8-cp64ep64-gbs32-hybridep-nogtp
+  wandb:
+    name: nm4-generalist-32n-mxfp8-cp64ep64-gbs32-hybridep-nogtp
+  tensorboard:
+    log_dir: logs/nm4-generalist-32n-mxfp8-cp64ep64-gbs32-hybridep-nogtp
+
+checkpointing:
+  checkpoint_dir: /data/nemorl-runs/nm4-generalist-32n-mxfp8-cp64ep64-gbs32-hybridep-nogtp

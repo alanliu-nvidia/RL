@@ -500,6 +500,7 @@ def get_formatted_message_log(
     tools: Optional[list[dict[str, Any]]] = None,
     debug: bool = False,
     chat_template_preapplied: bool = False,
+    skip_chat_template: bool = False,
 ) -> LLMMessageLogType:
     """Format and tokenize chat messages using the specified template.
 
@@ -522,7 +523,7 @@ def get_formatted_message_log(
     Returns:
         The message log with updated 'token_ids' and 'content' fields.
     """
-    if chat_template_preapplied:
+    if chat_template_preapplied or skip_chat_template:
         if add_generation_prompt or tools is not None or task_data_spec.prompt:
             raise ValueError(
                 "chat_template_preapplied=True does not support add_generation_prompt, "

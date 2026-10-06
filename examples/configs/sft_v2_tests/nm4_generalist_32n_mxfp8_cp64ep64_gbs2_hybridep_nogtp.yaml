@@ -1,0 +1,19 @@
+defaults:
+  - nm4_generalist_32n_mxfp8_cp64ep64_gtp2_gbs2_hybridep.yaml
+
+policy:
+  megatron_cfg:
+    model_overrides:
+      # Preserve two logical data lanes: DP=2, dense GTP=1, expert GTP=1.
+      # The GTP2 reference uses DP=1, dense GTP=2, expert GTP=1.
+      gtp_weight_remat_size: 1
+
+logger:
+  log_dir: logs/nm4-generalist-32n-mxfp8-cp64ep64-gbs2-hybridep-nogtp
+  wandb:
+    name: nm4-generalist-32n-mxfp8-cp64ep64-gbs2-hybridep-nogtp
+  tensorboard:
+    log_dir: logs/nm4-generalist-32n-mxfp8-cp64ep64-gbs2-hybridep-nogtp
+
+checkpointing:
+  checkpoint_dir: /data/nemorl-runs/nm4-generalist-32n-mxfp8-cp64ep64-gbs2-hybridep-nogtp

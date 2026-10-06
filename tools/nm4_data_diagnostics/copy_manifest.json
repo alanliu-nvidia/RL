@@ -1,0 +1,26 @@
+[
+  {
+    "original": "nemo_rl/data/energon/multimodal/task_encoders/nemotron_multimodal.py",
+    "copy": "nemo_rl/data/energon/multimodal/task_encoders/nemotron4_multimodal.py",
+    "original_sha256": "b1d0771eafbc7868301b3fe6721c40b15b16a75d630cc8d21f93be03ad6faecd",
+    "copy_sha256": "90e9d4109c36cb6071f8ad327eb3070d2feacdf3d3cb03781104faa47ac0d15b"
+  },
+  {
+    "original": "nemo_rl/data/energon/multimodal/task_encoders/nemotron_tokenization.py",
+    "copy": "nemo_rl/data/energon/multimodal/task_encoders/nemotron4_tokenization.py",
+    "original_sha256": "271e851f58483c989c9cf6f24e7a02c4a4144834aac8e0cf5134dc0e27f34e86",
+    "copy_sha256": "728cca1d7fbc8a028b7ca75d038b9fb1505a0f5683f71f0060bdc12508d59711"
+  },
+  {
+    "original": "nemo_rl/data/energon/multimodal/task_encoders/nemotron_visual.py",
+    "copy": "nemo_rl/data/energon/multimodal/task_encoders/nemotron4_visual.py",
+    "original_sha256": "94adbf0cf0c15ee5cd4bcada881fd1e9da0c91db3e6183db98fbc41534f4a6c9",
+    "copy_sha256": "152c3b2b1249bd0e120dd05d1763128b278881a3ccce70bdf15ef276a6b6750c"
+  },
+  {
+    "original": "nemo_rl/data/energon/multimodal/cookers/nemotron.py",
+    "copy": "nemo_rl/data/energon/multimodal/cookers/nemotron4.py",
+    "original_sha256": "748832749689785cd0caa1e65d9e6c1f7c9b01658895e3ec198ec162c7734cfc",
+    "copy_sha256": "1d2e1c1aae3e133af22af5c1af0a2f48c36b49aa00b8b5b7341e911f02b4ca78"
+  }
+]

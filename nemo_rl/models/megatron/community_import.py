@@ -38,6 +38,10 @@ def iter_vlm_config_overrides(
     keys = (
         "radio_force_eval_mode",
         "radio_force_cpe_eval_mode",
+        "recompute_vision",
+        "vision_recompute_granularity",
+        "vision_recompute_method",
+        "vision_recompute_num_layers",
         "freeze_vision_model",
         "freeze_vision_projection",
         "freeze_sound_encoder",

@@ -16,12 +16,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
+import random
 from collections.abc import Sequence
 from copy import deepcopy
 from typing import Any, Protocol, cast
 
 import torch
 from megatron.energon import SampleDecoder, stateless
+from PIL import Image
 
 from nemo_rl.data.energon.multimodal.model_families import (
     ALL_MODEL_FAMILIES,
@@ -46,9 +50,239 @@ from nemo_rl.data.energon.multimodal.types import (
 )
 from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.llm_message_utils import get_formatted_message_log
-from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.multimodal_utils import PackedTensor, image_patch_dim
 from nemo_rl.data.packing import SequencePacker
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+logger = logging.getLogger(__name__)
+
+
+def _assistant_text(message: dict[str, Any]) -> str:
+    content = message.get("content", "")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = "".join(
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    else:
+        text = str(content)
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[1]
+    return text.strip()
+
+
+def add_answer_diagnostics(
+    *,
+    message_log: list[dict[str, Any]],
+    source_messages: list[dict[str, Any]],
+    tokenizer: Any,
+    sample_key: str,
+) -> None:
+    """Mark raw answer tokens and optionally dump one decoded example."""
+    if os.environ.get("NRL_SFT_ANSWER_DIAGNOSTICS") != "1":
+        return
+    tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+    for message in message_log:
+        tokens = message.get("token_ids")
+        if isinstance(tokens, torch.Tensor):
+            message["answer_token_mask"] = torch.zeros_like(tokens)
+            message["answer_start_mask"] = torch.zeros_like(tokens)
+
+    flat_tokens = torch.cat([message["token_ids"] for message in message_log])
+    flat_answer_mask = torch.zeros_like(flat_tokens)
+    flat_answer_start_mask = torch.zeros_like(flat_tokens)
+    flat_loss_mask = torch.cat(
+        [
+            message.get(
+                "token_loss_mask",
+                torch.ones_like(message["token_ids"])
+                if message.get("role") == "assistant"
+                else torch.zeros_like(message["token_ids"]),
+            )
+            for message in message_log
+        ]
+    ).bool()
+    cursor = 0
+    answer_texts = [
+        _assistant_text(message)
+        for message in source_messages
+        if message.get("role") == "assistant"
+    ]
+    for answer_text in answer_texts:
+        if not answer_text:
+            continue
+        answer_ids = tokenizer(
+            answer_text, return_tensors="pt", add_special_tokens=False
+        )["input_ids"][0].to(flat_tokens.device)
+        candidates = [
+            start
+            for start in range(cursor, len(flat_tokens) - len(answer_ids) + 1)
+            if torch.equal(flat_tokens[start : start + len(answer_ids)], answer_ids)
+            and bool(flat_loss_mask[start : start + len(answer_ids)].all())
+        ]
+        if not candidates:
+            raise ValueError(
+                f"Could not locate answer {answer_text!r} in supervised tokens "
+                f"for sample {sample_key!r}."
+            )
+        start = candidates[0]
+        flat_answer_mask[start : start + len(answer_ids)] = 1
+        flat_answer_start_mask[start] = 1
+        cursor = start + len(answer_ids)
+
+    offset = 0
+    for message in message_log:
+        length = len(message["token_ids"])
+        message["answer_token_mask"] = flat_answer_mask[offset : offset + length]
+        message["answer_start_mask"] = flat_answer_start_mask[offset : offset + length]
+        offset += length
+
+    dump_path = os.environ.get("NRL_SFT_ASSISTANT_TOKEN_DUMP")
+    if not dump_path:
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(dump_path)), exist_ok=True)
+    try:
+        fd = os.open(dump_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        return
+    assistant_ids = flat_tokens[flat_loss_mask].cpu().tolist()
+    assistant_answer_mask = flat_answer_mask[flat_loss_mask].cpu().tolist()
+    payload = {
+        "sample_key": sample_key,
+        "answers": answer_texts,
+        "decoded_assistant_response": tokenizer.decode(
+            assistant_ids, clean_up_tokenization_spaces=False
+        ),
+        "tokens": [
+            {
+                "assistant_index": index,
+                "token_id": token_id,
+                "token": tokenizer.convert_ids_to_tokens(token_id),
+                "decoded": tokenizer.decode(
+                    [token_id], clean_up_tokenization_spaces=False
+                ),
+                "class": "answer" if is_answer else "template",
+            }
+            for index, (token_id, is_answer) in enumerate(
+                zip(assistant_ids, assistant_answer_mask, strict=True)
+            )
+        ],
+    }
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        json.dump(payload, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+
+
+def log_multimodal_diagnostic(
+    *,
+    processor: Any,
+    sample_key: str,
+    message_log: list[dict[str, Any]],
+    source_image_placeholders: int,
+    planned_image_positions: int | None = None,
+) -> None:
+    """Log token expansion and image geometry for one encoded sample."""
+    tokenizer = processor.tokenizer
+    token_ids = torch.cat(
+        [message["token_ids"].reshape(-1).cpu() for message in message_log]
+    )
+    special_token_counts = {}
+    for name in ("image_token", "image_break_token", "image_end_token"):
+        token = getattr(processor, name, None)
+        token_id = getattr(processor, f"{name}_id", None)
+        if token is not None and isinstance(token_id, int):
+            special_token_counts[token] = {
+                "id": token_id,
+                "count": int((token_ids == token_id).sum().item()),
+            }
+
+    image_sizes: list[list[int]] = []
+    multimodal_shapes: dict[str, list[list[int]]] = {}
+    for message in message_log:
+        for key, value in message.items():
+            if not isinstance(value, PackedTensor):
+                continue
+            tensors = [tensor for tensor in value.tensors if tensor is not None]
+            multimodal_shapes.setdefault(key, []).extend(
+                [list(tensor.shape) for tensor in tensors]
+            )
+            if key in ("imgs_sizes", "image_sizes") and not image_sizes:
+                for tensor in tensors:
+                    image_sizes.extend(
+                        tensor.reshape(-1, 2).to(dtype=torch.int64).tolist()
+                    )
+
+    patch_size = image_patch_dim(processor)
+    spatial_merge_size = int(getattr(processor, "spatial_merge_size", 1))
+    merged_patch_size = patch_size * spatial_merge_size
+    raw_patches = sum(
+        (height // patch_size) * (width // patch_size) for height, width in image_sizes
+    )
+    merged_image_positions = sum(
+        (height // merged_patch_size) * (width // merged_patch_size)
+        for height, width in image_sizes
+    )
+    shown_ids = token_ids[:512].tolist()
+    image_token_id = getattr(processor, "image_token_id", None)
+    if not isinstance(image_token_id, int):
+        image_token_id = tokenizer.convert_tokens_to_ids("<image>")
+    expanded_image_tokens = int((token_ids == image_token_id).sum().item())
+    expected_image_positions = (
+        planned_image_positions
+        if planned_image_positions is not None
+        else merged_image_positions
+    )
+    logger.info(
+        "SFT multimodal diagnostic: %s",
+        json.dumps(
+            {
+                "sample": sample_key,
+                "processor": type(processor).__name__,
+                "processor_name": getattr(processor, "name_or_path", None),
+                "tokenizer_name": getattr(tokenizer, "name_or_path", None),
+                "source_image_placeholders": source_image_placeholders,
+                "processed_images": len(image_sizes),
+                "placeholder_image_match": source_image_placeholders
+                == len(image_sizes),
+                "image_sizes": image_sizes,
+                "patch_size": patch_size,
+                "spatial_merge_size": spatial_merge_size,
+                "raw_vision_patches": raw_patches,
+                "merged_image_positions": merged_image_positions,
+                "planned_image_positions": planned_image_positions,
+                "expanded_image_tokens": expanded_image_tokens,
+                "image_token_patch_match": expanded_image_tokens
+                == expected_image_positions,
+                "special_token_counts": special_token_counts,
+                "multimodal_shapes": multimodal_shapes,
+                "turns": [
+                    {
+                        "role": message["role"],
+                        "token_count": len(message["token_ids"]),
+                        "decoded": tokenizer.decode(
+                            message["token_ids"].tolist(),
+                            skip_special_tokens=False,
+                            clean_up_tokenization_spaces=False,
+                        ),
+                    }
+                    for message in message_log
+                ],
+                "token_count": len(token_ids),
+                "shown_token_count": len(shown_ids),
+                "token_ids": shown_ids,
+                "tokens": tokenizer.convert_ids_to_tokens(shown_ids),
+                "decoded": tokenizer.decode(
+                    shown_ids,
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                ),
+            },
+            default=str,
+        ),
+    )
 
 
 class SFTProcessorAdapter(Protocol):
@@ -165,6 +399,20 @@ def _normalize_messages(
     return messages
 
 
+def _zero_image_content(messages: list[dict[str, Any]]) -> None:
+    """Replace image payloads with same-size black images for diagnostics."""
+    for message in messages:
+        for part in message["content"]:
+            if part.get("type") != "image":
+                continue
+            image = part.get("image")
+            if not isinstance(image, Image.Image):
+                raise TypeError(
+                    "NRL_SFT_ZERO_IMAGES requires decoded PIL image payloads."
+                )
+            part["image"] = Image.new(image.mode, image.size, 0)
+
+
 class HFMultimodalSFTProcessorAdapter:
     """Hugging Face implementation of the generic processor boundary."""
 
@@ -203,6 +451,7 @@ class HFMultimodalSFTProcessorAdapter:
             "utf-8"
         )
         self._fingerprint = hashlib.sha256(encoded).hexdigest()
+        self._logged_multimodal_diagnostic = False
 
     @property
     def fingerprint(self) -> str:
@@ -210,6 +459,8 @@ class HFMultimodalSFTProcessorAdapter:
 
     def encode(self, sample: CanonicalSFTSample) -> EncodedSFTSample:
         messages = _normalize_messages(sample)
+        if os.environ.get("NRL_SFT_ZERO_IMAGES") == "1":
+            _zero_image_content(messages)
         message_log = get_formatted_message_log(
             messages,
             self.processor,
@@ -220,6 +471,30 @@ class HFMultimodalSFTProcessorAdapter:
             tools=sample.tools,
             chat_template_preapplied=sample.chat_template_preapplied,
         )
+        add_answer_diagnostics(
+            message_log=message_log,
+            source_messages=messages,
+            tokenizer=self.processor,
+            sample_key=sample.__key__,
+        )
+        image_parts = sum(
+            part.get("type") == "image"
+            for message in messages
+            if isinstance(message.get("content"), list)
+            for part in message["content"]
+        )
+        if (
+            os.environ.get("NRL_SFT_MULTIMODAL_DIAGNOSTICS") == "1"
+            and not self._logged_multimodal_diagnostic
+            and image_parts
+        ):
+            self._logged_multimodal_diagnostic = True
+            log_multimodal_diagnostic(
+                processor=self.processor,
+                sample_key=sample.__key__,
+                message_log=message_log,
+                source_image_placeholders=image_parts,
+            )
         length = sum(len(message["token_ids"]) for message in message_log)
         loss_multiplier = 1.0
         if length >= self.max_sequence_length:
@@ -231,6 +506,13 @@ class HFMultimodalSFTProcessorAdapter:
                 message["token_ids"] = message["token_ids"][
                     : min(4, self.max_sequence_length // len(message_log))
                 ]
+                if "answer_token_mask" in message:
+                    message["answer_token_mask"] = message["answer_token_mask"][
+                        : len(message["token_ids"])
+                    ]
+                    message["answer_start_mask"] = message["answer_start_mask"][
+                        : len(message["token_ids"])
+                    ]
                 for key, value in list(message.items()):
                     if isinstance(value, PackedTensor):
                         message[key] = PackedTensor.empty_like(value)
@@ -303,11 +585,13 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
     ) -> list[list[EncodedSFTSample]]:
         if self.packer is None:
             raise RuntimeError("Energon packing is not configured.")
-        return select_samples_to_pack(
+        packs = select_samples_to_pack(
             samples,
             packer=self.packer,
             sequence_length_pad_multiple=self.sequence_length_pad_multiple,
         )
+        random.shuffle(packs)
+        return packs
 
     @stateless
     def pack_selected_samples(self, samples: list[EncodedSFTSample]) -> PackedSFTSample:

@@ -233,6 +233,8 @@ class SequencePackingConfig(TypedDict):
     # execute each DP rank's assigned bins largest-first for allocator reuse.
     microbatch_order: NotRequired[Literal["packer", "largest_first"]]
     fuse_loss: NotRequired[bool]
+    # Exclude padding tokens from MoE routing and router auxiliary statistics.
+    mask_padding_from_moe: NotRequired[bool]
     pair_grouping_key: NotRequired[Literal["pair_index"]]
     max_sequences_per_bin: NotRequired[int]
 
@@ -376,7 +378,7 @@ class MegatronConfig(TypedDict):
     # Arbitrary model-provider attributes applied recursively to the Megatron
     # Bridge model config before model instantiation. Keys must match configurable
     # provider fields and must not duplicate first-class megatron_cfg fields.
-    model_overrides: NotRequired[dict[str, Any]]
+    model_overrides: NotRequired[dict[str, Any] | None]
     # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation.
     # Setting to 0 is faster, but you are more likely to run out of GPU memory. In SFT/DPO, the default is 0.
     empty_unused_memory_level: int
@@ -400,6 +402,10 @@ class MegatronConfig(TypedDict):
     # provider's checkpoint/default value.
     radio_force_eval_mode: NotRequired[bool]
     radio_force_cpe_eval_mode: NotRequired[bool]
+    recompute_vision: NotRequired[bool]
+    vision_recompute_granularity: NotRequired[Literal["full", "selective"]]
+    vision_recompute_method: NotRequired[Literal["uniform", "block"]]
+    vision_recompute_num_layers: NotRequired[int]
     # Nemotron Omni tower freeze booleans. Omit any field to retain the model
     # provider's checkpoint/default value.
     freeze_vision_model: NotRequired[bool]
@@ -426,6 +432,8 @@ class MegatronConfig(TypedDict):
     moe_router_fusion: NotRequired[bool]
     moe_router_load_balancing_type: str | list[str]
     moe_router_bias_update_rate: float
+    # Optional so model-provider defaults remain effective when it is unset.
+    moe_aux_loss_coeff: NotRequired[float | list[float]]
     moe_permute_fusion: bool
     expert_tensor_parallel_size: int
     expert_model_parallel_size: int

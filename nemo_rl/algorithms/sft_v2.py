@@ -221,9 +221,16 @@ class SFTSingleControllerActor:
         try:
             with umbrella_span(RLSpanGroup.U_JOB, "rl.sft_v2.job", tracer=self._tracer):
                 self._trainer.prepare_for_training()
+                if (
+                    self._master_config.sft.val_at_start
+                    and self._save_state.total_steps == 0
+                ):
+                    self._log_validation()
                 while self._save_state.total_steps < self._max_steps:
                     metrics = self._run_train_step()
                     self._logger.log_metrics(metrics, self._save_state.total_steps)
+                    if self._should_validate():
+                        self._log_validation()
                     metric = self._checkpoint_metric(metrics)
                     self._timeout.mark_iteration()
                     save_by_timeout = self._timeout.check_save()
@@ -255,17 +262,6 @@ class SFTSingleControllerActor:
             // self._placement_plan.logical_world_size,
             "max_sequence_length": config.data["max_input_seq_length"],
             "placement_fingerprint": self._placement_plan.placement_hash,
-            "packing_algorithm": config.policy["sequence_packing"]["algorithm"]
-            if config.data["energon"].packing_buffer_size is not None
-            else None,
-            # This caps sources per physical pack. Energon's similarly named
-            # max_samples_per_sequence instead controls sequential shard reads.
-            "max_sequences_per_bin": config.policy["sequence_packing"].get(
-                "max_sequences_per_bin"
-            ),
-            "sequence_length_pad_multiple": config.policy[
-                "make_sequence_length_divisible_by"
-            ],
             "only_unmask_final": config.sft.only_unmask_final,
         }
         if self._loader_states is None:
@@ -288,6 +284,30 @@ class SFTSingleControllerActor:
         results = ray.get(futures)
         if results != [True] * self._placement_plan.logical_world_size:
             raise RuntimeError(f"Unexpected SFT loader setup results: {results!r}.")
+        if config.data.get("validation") is not None:
+            val_global_batch_size = config.sft.val_global_batch_size
+            if val_global_batch_size % self._placement_plan.logical_world_size:
+                raise ValueError(
+                    "sft.val_global_batch_size must be divisible by the logical "
+                    f"DP size: {val_global_batch_size} % "
+                    f"{self._placement_plan.logical_world_size} != 0."
+                )
+            futures = self._trainer.worker_group.run_all_workers_single_data(
+                "setup_sft_validation_dataloader",
+                run_rank_0_only_axes=list(REPLICATED_AXES),
+                data_config=config.data,
+                batch_size=(
+                    val_global_batch_size // self._placement_plan.logical_world_size
+                ),
+                max_sequence_length=config.data["max_input_seq_length"],
+                placement_fingerprint=self._placement_plan.placement_hash,
+                only_unmask_final=config.sft.only_unmask_final,
+            )
+            results = ray.get(futures)
+            if results != [True] * self._placement_plan.logical_world_size:
+                raise RuntimeError(
+                    f"Unexpected SFT validation loader setup results: {results!r}."
+                )
 
     def _load_envelopes(self) -> list[StepEnvelope]:
         futures = self._trainer.worker_group.run_all_workers_single_data(
@@ -312,6 +332,7 @@ class SFTSingleControllerActor:
     def _run_train_step(self) -> dict[str, Any]:
         started = time.monotonic()
         envelopes = self._load_envelopes()
+        loader_wait = time.monotonic() - started
         train_started = time.monotonic()
         step_open = False
         try:
@@ -320,15 +341,23 @@ class SFTSingleControllerActor:
                 "rl.sft_v2.policy_training",
                 tracer=self._tracer,
             ):
+                phase_started = time.monotonic()
                 self._trainer.begin_train_step(self._loss_fn)
+                begin_train_step = time.monotonic() - phase_started
                 step_open = True
-                self._trainer.train_placed_microbatches(
+                phase_started = time.monotonic()
+                placed_phases = self._trainer.train_placed_microbatches(
                     [envelope.meta for envelope in envelopes]
                 )
+                train_placed_microbatches = time.monotonic() - phase_started
+                phase_started = time.monotonic()
                 train_results = self._trainer.finish_train_step()
+                finish_train_step = time.monotonic() - phase_started
                 step_open = False
+                phase_started = time.monotonic()
             policy_seconds = time.monotonic() - train_started
             self._owner_call("commit_sft_batch")
+            commit_sft_batch = time.monotonic() - phase_started
         except Exception:
             if step_open:
                 try:
@@ -354,6 +383,12 @@ class SFTSingleControllerActor:
             "loader_latency_mean": statistics.fmean(loader_seconds),
             "loader_copy_imbalance": loader_latency_max - min(loader_seconds),
             POLICY_TIME_KEY: policy_seconds,
+            "begin_train_step": begin_train_step,
+            "train_placed_microbatches": train_placed_microbatches,
+            "finish_train_step": finish_train_step,
+            "commit_sft_batch": commit_sft_batch,
+            "loader_wait": loader_wait,
+            "queue_depth": 1,
             TOTAL_STEP_TIME_KEY: time.monotonic() - started,
             "valid_tokens": valid_tokens,
             "source_samples": sum(len(envelope.source_ids) for envelope in envelopes),
@@ -363,7 +398,144 @@ class SFTSingleControllerActor:
             VALID_TOKENS_PER_SECOND_KEY: valid_tokens
             / max(time.monotonic() - started, 1e-12),
         }
+        if isinstance(placed_phases, dict):
+            for key, value in placed_phases.items():
+                metrics[f"placed_{key}"] = float(value)
+        phase_names = sorted(
+            {phase for envelope in envelopes for phase in envelope.load_phase_seconds}
+        )
+        for phase in phase_names:
+            values = [
+                envelope.load_phase_seconds.get(phase, 0.0) for envelope in envelopes
+            ]
+            metric_phase = phase.replace("-", "_")
+            metrics[f"loader_{metric_phase}_max"] = max(values)
+            metrics[f"loader_{metric_phase}_mean"] = statistics.fmean(values)
         metrics.update(self._policy_metrics(train_results))
+        return metrics
+
+    def _should_validate(self) -> bool:
+        step = self._save_state.total_steps
+        config = self._master_config.sft
+        return bool(
+            (config.val_period > 0 and step % config.val_period == 0)
+            or (config.val_at_end and step == self._max_steps)
+        )
+
+    def _log_validation(self) -> None:
+        step = self._save_state.total_steps
+        print(f"Running SFT validation at step {step}", flush=True)
+        started = time.monotonic()
+        metrics = self._run_validation()
+        self._logger.log_metrics(metrics, step, prefix="validation")
+        self._logger.log_metrics(
+            {"total_time": time.monotonic() - started},
+            step,
+            prefix="timing/validation",
+        )
+        print(
+            "Validation step=%d loss=%.6f answer_token_ce=%.6f "
+            "answer_exact_match_accuracy=%.6f samples=%d"
+            % (
+                step,
+                metrics["loss"],
+                metrics.get("answer_token_ce", float("nan")),
+                metrics.get("answer_exact_match_accuracy", float("nan")),
+                metrics["num_valid_samples"],
+            ),
+            flush=True,
+        )
+        self._trainer.prepare_for_training()
+
+    def _run_validation(self) -> dict[str, Any]:
+        self._owner_call("reset_sft_validation_dataloader")
+        totals = {
+            "loss_nll_sum": 0.0,
+            "num_unmasked_tokens": 0.0,
+            "answer_nll_sum": 0.0,
+            "answer_exact_match_count": 0.0,
+            "num_answer_tokens": 0.0,
+            "num_answer_sequences": 0.0,
+            "num_valid_samples": 0.0,
+        }
+        batch_count = 0
+        while True:
+            if (
+                self._master_config.sft.val_batches > 0
+                and batch_count >= self._master_config.sft.val_batches
+            ):
+                break
+            futures = self._trainer.worker_group.run_all_workers_single_data(
+                "load_next_sft_validation_batch",
+                run_rank_0_only_axes=list(REPLICATED_AXES),
+                only_unmask_final=self._master_config.sft.only_unmask_final,
+                make_sequence_length_divisible_by=self._master_config.policy[
+                    "make_sequence_length_divisible_by"
+                ],
+            )
+            envelopes = ray.get(futures)
+            if all(envelope is None for envelope in envelopes):
+                break
+            if any(envelope is None for envelope in envelopes):
+                self._owner_call("abort_sft_validation_batch")
+                raise RuntimeError(
+                    "SFT validation loaders exhausted on different DP batches."
+                )
+            placed = cast(list[StepEnvelope], envelopes)
+            logical_ranks = [envelope.logical_rank for envelope in placed]
+            expected = list(range(self._placement_plan.logical_world_size))
+            if logical_ranks != expected:
+                self._owner_call("abort_sft_validation_batch")
+                raise RuntimeError(
+                    "SFT validation envelopes arrived for ranks "
+                    f"{logical_ranks}; expected {expected}."
+                )
+            try:
+                result = self._trainer.evaluate_placed_microbatches(
+                    [envelope.meta for envelope in placed],
+                    self._loss_fn,
+                    gbs=sum(len(envelope.meta.sample_ids) for envelope in placed),
+                    mbs=self._master_config.sft.val_micro_batch_size,
+                )
+                batch_metrics = self._policy_metrics(result)
+                tokens = float(batch_metrics["num_unmasked_tokens"])
+                totals["loss_nll_sum"] += float(result["loss"]) * tokens
+                totals["num_unmasked_tokens"] += tokens
+                for key in (
+                    "answer_nll_sum",
+                    "answer_exact_match_count",
+                    "num_answer_tokens",
+                    "num_answer_sequences",
+                ):
+                    totals[key] += float(batch_metrics.get(key, 0.0))
+                # ``num_valid_samples`` from the loss counts physical rows. With
+                # sequence packing, one row can contain several source samples,
+                # so it under-reports validation coverage. The loader envelope
+                # retains the source ids before packing and is authoritative.
+                totals["num_valid_samples"] += sum(
+                    len(envelope.source_ids) for envelope in placed
+                )
+                self._owner_call("commit_sft_validation_batch")
+            except Exception:
+                self._owner_call("abort_sft_validation_batch")
+                raise
+            batch_count += 1
+
+        if totals["num_unmasked_tokens"] == 0:
+            raise RuntimeError("SFT validation produced no supervised tokens.")
+        metrics = {
+            "loss": totals["loss_nll_sum"] / totals["num_unmasked_tokens"],
+            "num_batches": batch_count,
+            **{key: value for key, value in totals.items() if key != "loss_nll_sum"},
+        }
+        if totals["num_answer_tokens"]:
+            metrics["answer_token_ce"] = (
+                totals["answer_nll_sum"] / totals["num_answer_tokens"]
+            )
+        if totals["num_answer_sequences"]:
+            metrics["answer_exact_match_accuracy"] = (
+                totals["answer_exact_match_count"] / totals["num_answer_sequences"]
+            )
         return metrics
 
     @staticmethod
@@ -378,11 +550,23 @@ class SFTSingleControllerActor:
                 metrics[key] = np.mean(values).item()
             else:
                 metrics[key] = np.sum(values).item()
+        answer_tokens = metrics.get("num_answer_tokens", 0)
+        answer_sequences = metrics.get("num_answer_sequences", 0)
+        if answer_tokens:
+            metrics["answer_token_ce"] = metrics["answer_nll_sum"] / answer_tokens
+        if answer_sequences:
+            metrics["answer_exact_match_accuracy"] = (
+                metrics["answer_exact_match_count"] / answer_sequences
+            )
         for key, value in train_results.get("moe_metrics", {}).items():
             metrics[f"moe/{key}"] = value
+        for key, value in train_results.get("mtp_metrics", {}).items():
+            metrics[f"mtp/{key}"] = value
         for key in ("total_flops", "num_ranks", "theoretical_tflops"):
             if key in train_results:
                 metrics[key] = train_results[key]
+        for key, value in train_results.get("step_phases", {}).items():
+            metrics[f"worker_{key}"] = float(value)
         return metrics
 
     def _owner_call(self, method_name: str) -> list[Any]:
@@ -468,8 +652,8 @@ def setup_sft_v2(
         raise ValueError("SFTv2 supports only the Megatron policy backend.")
     sequence_packing = master_config.policy["sequence_packing"]
     dynamic_batching = master_config.policy["dynamic_batching"]
-    energon_packing = master_config.data["energon"].packing_buffer_size is not None
-    if not energon_packing:
+    energon_packing = master_config.data["energon"].task_encoder.packing
+    if energon_packing is None:
         if sequence_packing["enabled"] or dynamic_batching["enabled"]:
             raise ValueError("SFTv2 without Energon packing requires fixed batching.")
     else:
@@ -479,30 +663,22 @@ def setup_sft_v2(
             raise ValueError(
                 "Energon packing requires sequence_packing enabled with fuse_loss."
             )
-        if sequence_packing.get("algorithm") not in {
+        if energon_packing.name not in {
             algorithm.value for algorithm in PackingAlgorithm
         }:
             raise ValueError("Energon SFT requires a supported packing algorithm.")
         if dynamic_batching["enabled"]:
             raise ValueError("Energon packing does not support dynamic batching.")
-    # SFTConfig carries validation knobs that default to on (val_period=10,
-    # val_at_start=True) and this loop has no validation path, so reject them
-    # rather than accepting a config whose validation silently never runs.
-    if (
+    validation_requested = (
         master_config.sft.val_period != 0
         or master_config.sft.val_at_start
         or master_config.sft.val_at_end
-    ):
-        raise ValueError(
-            "SFTv2 has no validation loop. Set sft.val_period=0, "
-            "sft.val_at_start=false and sft.val_at_end=false."
-        )
-    # sft_worker builds its loader with split_role="train" only, so a validation
-    # source would be accepted and never read.
-    if master_config.data.get("validation") is not None:
-        raise ValueError("SFTv2 reads no validation source. Set data.validation=null.")
-    # Same reason: only train metrics exist here, so a val: name would leave
-    # keep_top_k ranking every checkpoint on a metric that is never written.
+    )
+    if validation_requested and master_config.data.get("validation") is None:
+        raise ValueError("SFTv2 validation was requested but data.validation is null.")
+    if master_config.sft.val_period < 0:
+        raise ValueError("sft.val_period must be non-negative.")
+    # Checkpoint ranking still consumes the current training-step metrics.
     metric_name = master_config.checkpointing["metric_name"]
     if metric_name is not None and not metric_name.startswith("train:"):
         raise ValueError(
@@ -513,7 +689,7 @@ def setup_sft_v2(
     max_sequence_length = master_config.data["max_input_seq_length"]
     if max_sequence_length is None:
         raise ValueError("SFTv2 requires data.max_input_seq_length.")
-    if energon_packing:
+    if energon_packing is not None:
         megatron_cfg = master_config.policy["megatron_cfg"]
         if (
             megatron_cfg.get("moe_token_dispatcher_type") == "flex"
@@ -528,7 +704,12 @@ def setup_sft_v2(
                     "moe_hybridep_pad_uneven_dispatch_inputs=true."
                 )
 
-        pad_multiple = master_config.policy["make_sequence_length_divisible_by"]
+        pack_options = energon_packing.options
+        if pack_options.max_sequence_length != max_sequence_length:
+            raise ValueError(
+                "Energon pack capacity must match data.max_input_seq_length."
+            )
+        pad_multiple = pack_options.sequence_length_pad_multiple
         parallel_multiple = get_parallel_token_alignment(megatron_cfg)
         if pad_multiple % parallel_multiple != 0:
             raise ValueError(
@@ -567,6 +748,34 @@ def setup_sft_v2(
     loaded_training_info = checkpoint_probe.load_training_info(latest)
     weights_path, optimizer_path = checkpoint_probe.get_resume_paths(latest)
     checkpoint_probe.shutdown()
+
+    # Resume diagnostics are intentionally controlled by environment variables so
+    # they can be enabled by an isolated launcher without extending the public SFT
+    # configuration schema.  A checkpoint directory that merely looks plausible
+    # must never silently fall back to the pretrained model during a resume test.
+    require_resume = os.environ.get("NEMO_RL_REQUIRE_RESUME", "0") == "1"
+    expected_checkpoint = os.environ.get("NEMO_RL_EXPECTED_RESUME_CHECKPOINT")
+    if require_resume:
+        print(
+            "SFTv2 checkpoint preflight: "
+            f"latest={latest!r} weights_path={str(weights_path) if weights_path else None!r} "
+            f"optimizer_path={str(optimizer_path) if optimizer_path else None!r} "
+            f"require_resume={require_resume} expected_checkpoint={expected_checkpoint!r}",
+            flush=True,
+        )
+        if latest is None or weights_path is None or optimizer_path is None:
+            raise RuntimeError(
+                "Resume gate failed: expected a checkpoint with embedded optimizer "
+                f"state, got latest={latest!r}, weights_path={weights_path!r}, "
+                f"optimizer_path={optimizer_path!r}."
+            )
+        if expected_checkpoint and os.path.realpath(latest) != os.path.realpath(
+            expected_checkpoint
+        ):
+            raise RuntimeError(
+                "Resume gate failed: selected checkpoint differs from the launcher "
+                f"expectation: selected={latest!r}, expected={expected_checkpoint!r}."
+            )
 
     cluster_config = master_config.cluster
     num_nodes = cluster_config.num_nodes

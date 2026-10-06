@@ -1,0 +1,279 @@
+sft:
+  max_num_epochs: 100
+  max_num_steps: 1000000
+  val_period: 0
+  val_batches: 0
+  val_global_batch_size: 32
+  val_micro_batch_size: 1
+  val_at_start: false
+  val_at_end: false
+  seed: 1234
+  only_unmask_final: false
+  max_consecutive_step_failures: 3
+checkpointing:
+  enabled: true
+  checkpoint_dir: /data/nemorl-runs/sft-super67b-n64-dss-generalist-v3
+  metric_name: null
+  higher_is_better: false
+  keep_top_k: 5000
+  save_period: 500
+  checkpoint_must_save_by: 00:03:45:00
+  save_optimizer: true
+policy:
+  model_name: /data/models/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+  tokenizer:
+    name: /data/models/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+    chat_template: default
+    chat_template_kwargs: null
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  max_total_sequence_length: 524288
+  precision: bfloat16
+  offload_optimizer_for_logprob: false
+  dtensor_cfg:
+    _v2: true
+    enabled: false
+    env_vars: {}
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    dp_replicate_size: 1
+    custom_parallel_plan: null
+    automodel_kwargs: {}
+    lora_cfg:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      match_all_linear: true
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: post
+      lora_A_init: xavier
+      use_triton: true
+      restore_from: null
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 524288
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: 524288
+    algorithm: modified_first_fit_decreasing
+    microbatch_order: packer
+    sequence_length_round: 64
+    fuse_loss: true
+  make_sequence_length_divisible_by: 256
+  max_grad_norm: 1.0
+  optimizer: null
+  megatron_cfg:
+    enabled: true
+    checkpoint:
+      async_save: false
+      ckpt_assume_constant_structure: false
+    use_fused_linear_logprobs: false
+    fused_linear_logprobs_chunk_size: 256
+    force_reconvert_from_hf: false
+    env_vars:
+      PYTHONPATH: /root/.cache/huggingface/modules
+      HF_MODULES_CACHE: /root/.cache/huggingface/modules
+      NRL_LOADDIAG: '1'
+      OMP_NUM_THREADS: '16'
+      NVTE_FWD_LAYERNORM_SM_MARGIN: '16'
+      NVTE_BWD_LAYERNORM_SM_MARGIN: '16'
+      CUDA_DEVICE_MAX_CONNECTIONS: '1'
+      UB_TIMEOUT: '720'
+      NCCL_CUMEM_HOST_ENABLE: '0'
+      NRL_DIST_TIMEOUT_MINUTES: '10'
+      TORCH_NCCL_ENABLE_MONITORING: '1'
+      TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: '600'
+      TORCH_NCCL_ASYNC_ERROR_HANDLING: '1'
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    empty_unused_memory_level: 0
+    activation_checkpointing: true
+    cuda_graph_impl: none
+    cuda_graph_modules: []
+    cuda_graph_warmup_steps: 3
+    fine_grained_activation_offloading: false
+    offload_modules: null
+    recompute_granularity: selective
+    recompute_modules:
+    - moe
+    tensor_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 64
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 16
+    pipeline_dtype: bfloat16
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    sequence_parallel: true
+    freeze_moe_router: false
+    moe_router_dtype: fp32
+    moe_router_load_balancing_type: seq_aux_loss
+    moe_router_bias_update_rate: 0.001
+    moe_permute_fusion: true
+    apply_rope_fusion: false
+    bias_activation_fusion: false
+    defer_fp32_logits: true
+    moe_per_layer_logging: false
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: alltoall
+    moe_shared_expert_overlap: false
+    use_gloo_process_groups: false
+    gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: true
+    peft:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: post
+      lora_A_init_method: xavier
+      lora_B_init_method: zero
+      a2a_experimental: false
+      lora_dtype: None
+      restore_from: null
+    optimizer:
+      optimizer: adam
+      lr: 1.0e-05
+      min_lr: 2.0e-06
+      weight_decay: 0.1
+      bf16: true
+      fp16: false
+      params_dtype: bf16
+      adam_beta1: 0.9
+      adam_beta2: 0.95
+      adam_eps: 1.0e-08
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: false
+      clip_grad: 1.0
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+      overlap_cpu_optimizer_d2h_h2d: false
+    scheduler:
+      start_weight_decay: 0.1
+      end_weight_decay: 0.1
+      weight_decay_incr_style: constant
+      lr_decay_style: constant
+      lr_decay_iters: 1000
+      lr_warmup_iters: 3
+      lr_warmup_init: 4.9999e-06
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      data_parallel_sharding_strategy: no_shard
+      use_custom_fsdp: false
+    fp8_cfg:
+      enabled: false
+      fp8: e4m3
+      fp8_recipe: blockwise
+      fp8_param: false
+    freeze_vision_model: false
+    freeze_vision_projection: false
+    freeze_sound_encoder: true
+    freeze_sound_projection: true
+    moe_aux_loss_coeff: 0.0001
+    moe_router_enable_expert_bias: true
+    radio_force_cpe_eval_mode: true
+    mtp_num_layers: 2
+    mtp_loss_scaling_factor: 0.3
+    mtp_use_repeated_layer: true
+    recompute_vision: true
+    vision_recompute_granularity: full
+    vision_recompute_method: block
+    vision_recompute_num_layers: 30
+    radio_force_eval_mode: false
+    attention_backend: auto
+logger:
+  log_dir: logs/sft-super67b-n64-dss-generalist-v3
+  wandb_enabled: true
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: false
+  wandb:
+    project: nemotron-super-sft
+    name: sft-super67b-n64-dss-generalist-v3
+  swanlab:
+    project: sft-dev
+    name: sft-nemotron-omni-30b-clevr-energon-tp4etp4-v2
+  tensorboard:
+    log_dir: logs/sft-super67b-n64-dss-generalist-v3
+  mlflow:
+    experiment_name: sft-dev
+    run_name: sft-nemotron-omni-30b-clevr-energon-tp4etp4-v2
+    tracking_uri: http://localhost:5000
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+cluster:
+  gpus_per_node: 4
+  num_nodes: 128
+  segment_size: null
+data:
+  backend: energon
+  max_input_seq_length: 524288
+  add_bos: false
+  add_eos: false
+  add_generation_prompt: false
+  shuffle: true
+  num_workers: 2
+  energon:
+    model_family: nemotron
+    num_workers: 2   # this was initially 1 which introduced loader wait times. making it 4 leads to cpu oom. setting it to 2 for now.
+    shuffle_buffer_size: 1000
+    processor_adapter: hf_multimodal
+    topology_mapper: default
+    nvdataset_cache_dir: /home/svc-dss/cache/nemotron
+    task_encoder:
+      name: nemotron_multimodal
+      packing:
+        name: balanced_greedy_knapsack
+        buffer_size: 5000
+        options:
+          max_sequence_length: 524288
+          sequence_length_pad_multiple: 256
+          balanced_knapsack_delta: 5
+      options:
+        prompt_format: nemotron6-moe
+        thinking_trace_format: ultra
+        allow_large_videos: true
+        video_max_num_frames: 64
+        video_aug_scale_frames_up: 4
+        video_aug_scale_resolution_only: true
+        video_decode_thread_count: 4
+    cookers:
+    - name: nemotron_conversation
+      has_subflavors:
+        cook: conversation
+    - name: nemotron_general_conversations_jsonl
+      has_subflavors:
+        cook: general_conversations_jsonl
+    - name: nemotron_general_conversations_webdataset
+      has_subflavors:
+        cook: general_conversations_webdataset
+    - name: nemotron_nano_openai_messages_jsonl
+      has_subflavors:
+        cook: openai_messages_jsonl
+    watchdog_timeout_seconds: 1200
+    prefetch_factor: 2
+    cache_pool_num_workers: 2  # reducing from 4 to prevent cpu OOM
+    cache_pool_max_gbytes: 128
+    gc_collect_every_n_steps: 100000
+    seed_offset: 0
+  train:
+    path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/rohitkumarj/code/RL/nemo-rl-energon-sft-prodrun/examples/configs/sft_v2_tests/sft_super35_generalist_full_no_fs12.yaml
+    split: train
+    virtual_epoch_length: 10000000
+  validation: null
+data_plane:
+  enabled: true
+  impl: local
+  max_partitions: 2

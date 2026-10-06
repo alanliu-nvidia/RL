@@ -93,6 +93,15 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         for k, v in r["all_mb_metrics"].items():
             all_mb_metrics[k].extend(v)
     out["all_mb_metrics"] = dict(all_mb_metrics)
+    phase_names = {name for result in results for name in result.get("step_phases", {})}
+    if phase_names:
+        out["step_phases"] = {
+            name: max(
+                float(result.get("step_phases", {}).get(name, 0.0))
+                for result in results
+            )
+            for name in sorted(phase_names)
+        }
     # Only the replica leader ever populates this (see
     # TQWorkerMixin._maybe_assemble_routed_experts), so non-leader entries
     # are always empty and summing every result is safe without an
@@ -684,8 +693,8 @@ class TQPolicy(TQDriverMixin, Policy):
         self,
         dp_metas: list[KVBatchMeta],
         timer: Optional[Timer] = None,
-    ) -> None:
-        """Dispatch one producer-assigned metadata batch per logical DP×GTP rank.
+    ) -> dict[str, float]:
+        """Dispatch one producer-assigned metadata batch per logical DP rank.
 
         The input order is the DP-major/GTP-minor order. Producer field lists
         remain unchanged because an SFT loader can provide a narrower schema
@@ -708,31 +717,87 @@ class TQPolicy(TQDriverMixin, Policy):
             raise ValueError(
                 "Placed packed metadata requires producer microbatch shapes."
             )
+        started = time.monotonic()
         train_metas = [
             replace(meta, task_name="train")
             for meta in self._stamp_placed_pad_seqlen(dp_metas)
         ]
+        stamp_pad = time.monotonic() - started
+        started = time.monotonic()
         self._dispatch_train_microbatches(
             train_metas, timer=timer, in_sharded_axes=data_axes
         )
+        return {
+            "stamp_pad": stamp_pad,
+            "dispatch": time.monotonic() - started,
+        }
+
+    def evaluate_placed_microbatches(
+        self,
+        dp_metas: list[KVBatchMeta],
+        loss_fn: LossFunction,
+        *,
+        gbs: int,
+        mbs: int,
+    ) -> dict[str, Any]:
+        """Evaluate one producer-assigned metadata batch per logical DP rank."""
+        data_axes, logical_world = self._placed_data_layout()
+        if len(dp_metas) != logical_world:
+            raise ValueError(
+                "Placed metadata must contain exactly one batch per logical data "
+                f"rank: got {len(dp_metas)} batches for logical_world={logical_world}."
+            )
+        eval_metas = [
+            replace(meta, task_name="train")
+            for meta in self._stamp_placed_pad_seqlen(dp_metas)
+        ]
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "train_presharded",
+            meta=self._nest_placed_metas(eval_metas, data_axes),
+            in_sharded_axes=data_axes,
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            common_kwargs={
+                "loss_fn": loss_fn,
+                "eval_mode": True,
+                "gbs": gbs,
+                "mbs": mbs,
+            },
+        )
+        return _aggregate_train_results(
+            self.worker_group.get_all_worker_results(futures)
+        )
 
     def _placed_data_layout(self) -> tuple[list[str], int]:
-        """Return the producer data axes and their combined lane count."""
-        axes = ["data_parallel"]
-        world = self.sharding_annotations.get_axis_size("data_parallel")
+        """Return the sharded axes and number of producer data lanes."""
+        data_axes = ["data_parallel"]
+        logical_world = self.sharding_annotations.get_axis_size("data_parallel")
         if GTP_WEIGHT_REMAT_AXIS in self.sharding_annotations.names:
-            axes.append(GTP_WEIGHT_REMAT_AXIS)
-            world *= self.sharding_annotations.get_axis_size(GTP_WEIGHT_REMAT_AXIS)
-        return axes, world
+            data_axes.append(GTP_WEIGHT_REMAT_AXIS)
+            logical_world *= self.sharding_annotations.get_axis_size(
+                GTP_WEIGHT_REMAT_AXIS
+            )
+        return data_axes, logical_world
 
     def _nest_placed_metas(
-        self, metas: list[KVBatchMeta], axes: list[str]
+        self, dp_metas: list[KVBatchMeta], data_axes: list[str]
     ) -> list[KVBatchMeta] | list[list[KVBatchMeta]]:
-        """Nest producer metadata in DP-major/GTP-minor dispatch order."""
-        if GTP_WEIGHT_REMAT_AXIS not in axes:
-            return metas
-        size = self.sharding_annotations.get_axis_size(GTP_WEIGHT_REMAT_AXIS)
-        return [metas[offset : offset + size] for offset in range(0, len(metas), size)]
+        """Nest DP-major/GTP-minor loader output for multi-axis dispatch."""
+        if GTP_WEIGHT_REMAT_AXIS not in data_axes:
+            return dp_metas
+        gtp_size = self.sharding_annotations.get_axis_size(GTP_WEIGHT_REMAT_AXIS)
+        return [
+            dp_metas[offset : offset + gtp_size]
+            for offset in range(0, len(dp_metas), gtp_size)
+        ]
 
     def _stamp_placed_pad_seqlen(
         self, dp_metas: list[KVBatchMeta]

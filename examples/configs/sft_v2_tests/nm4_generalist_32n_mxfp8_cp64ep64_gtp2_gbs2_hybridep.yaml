@@ -1,0 +1,27 @@
+defaults:
+  - nm4_generalist_16n_mxfp8_cp64ep64_gbs1.yaml
+
+policy:
+  train_global_batch_size: 2
+  megatron_cfg:
+    model_overrides:
+      # 128 GPUs with TP=1, CP=64, and GTP=2 gives replicate DP=1
+      # and two logical DP x GTP data lanes. EP=64 gives expert DP=2;
+      # expert GTP stays 1. Each lane keeps the base 512K token budget.
+      gtp_weight_remat_size: 2
+      expert_gtp_weight_remat_size: 1
+
+cluster:
+  num_nodes: 32
+  # Keep each 64-GPU expert group within one NVLink domain.
+  segment_size: 16
+
+logger:
+  log_dir: logs/nm4-generalist-32n-mxfp8-cp64ep64-gtp2-gbs2-hybridep
+  wandb:
+    name: nm4-generalist-32n-mxfp8-cp64ep64-gtp2-gbs2-hybridep
+  tensorboard:
+    log_dir: logs/nm4-generalist-32n-mxfp8-cp64ep64-gtp2-gbs2-hybridep
+
+checkpointing:
+  checkpoint_dir: /data/nemorl-runs/nm4-generalist-32n-mxfp8-cp64ep64-gtp2-gbs2-hybridep

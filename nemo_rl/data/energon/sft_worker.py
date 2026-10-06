@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import os
+import threading
 import time
 from dataclasses import replace
 from typing import Any, Mapping, Optional
@@ -56,8 +58,17 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         self._sft_loader_iterator: Any = None
         self._sft_active_envelope: Optional[StepEnvelope] = None
         self._sft_next_batch_index = 0
+        self._sft_validation_loader: Optional[EnergonSFTDataLoader] = None
+        self._sft_validation_iterator: Any = None
+        self._sft_active_validation_envelope: Optional[StepEnvelope] = None
+        self._sft_next_validation_batch_index = 0
         self._sft_logical_rank: Optional[int] = None
         self._sft_logical_world_size: Optional[int] = None
+        self._ld_on = os.environ.get("NRL_LOADDIAG") == "1"
+        self._ld_phase: Optional[str] = None
+        self._ld_t0 = time.monotonic()
+        self._ld_durations: dict[str, float] = {}
+        self._ld_watchdog: Optional[threading.Thread] = None
         super().__init__(*args, **kwargs)
 
     def setup_sft_dataloader(
@@ -67,9 +78,6 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         batch_size: int,
         max_sequence_length: int,
         placement_fingerprint: str,
-        packing_algorithm: str | None,
-        max_sequences_per_bin: int | None,
-        sequence_length_pad_multiple: int,
         only_unmask_final: bool,
         restored_state: Optional[dict[str, Any]] = None,
     ) -> bool:
@@ -79,7 +87,37 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         if self._sft_loader is not None:
             raise RuntimeError("The SFT Energon loader is already configured.")
         if self._sft_processor is None:
-            raise ValueError("SFTv2 requires a multimodal processor on policy workers.")
+            tokenizer_config = (self.cfg or {}).get("tokenizer")
+            if tokenizer_config is None:
+                raise ValueError(
+                    "SFTv2 requires a multimodal processor on policy workers, and "
+                    "policy.tokenizer was not available to build one locally."
+                )
+            from nemo_rl.algorithms.utils import get_tokenizer
+
+            self._sft_processor = get_tokenizer(tokenizer_config, get_processor=True)
+
+        def _field(obj: Any, key: str) -> Any:
+            if obj is None:
+                return None
+            if isinstance(obj, Mapping):
+                return obj.get(key)
+            return getattr(obj, key, None)
+
+        packing = _field(
+            _field(_field(data_config, "energon"), "task_encoder"), "packing"
+        )
+        if packing is not None:
+            cp_size = parallel_state.get_context_parallel_world_size()
+            pad_multiple = _field(
+                _field(packing, "options"), "sequence_length_pad_multiple"
+            )
+            if cp_size > 1 and pad_multiple % (2 * cp_size):
+                raise ValueError(
+                    "Energon packing sequence_length_pad_multiple "
+                    f"({pad_multiple}) must be divisible by 2 * "
+                    f"context_parallel_size ({2 * cp_size})."
+                )
 
         logical_rank = parallel_state.get_data_parallel_rank()
         logical_world_size = parallel_state.get_data_parallel_world_size()
@@ -93,9 +131,6 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             logical_rank=logical_rank,
             logical_world_size=logical_world_size,
             placement_fingerprint=placement_fingerprint,
-            packing_algorithm=packing_algorithm,
-            max_sequences_per_bin=max_sequences_per_bin,
-            sequence_length_pad_multiple=sequence_length_pad_multiple,
             only_unmask_final=only_unmask_final,
         )
         if restored_state is not None:
@@ -106,6 +141,109 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         return True
 
     @accepts_trace_context
+    def setup_sft_validation_dataloader(
+        self,
+        *,
+        data_config: Mapping[str, Any],
+        batch_size: int,
+        max_sequence_length: int,
+        placement_fingerprint: str,
+        only_unmask_final: bool,
+    ) -> bool:
+        """Build the validation loader on this DP replica's leader."""
+        if not self._is_replica_leader():
+            return False
+        if self._sft_validation_loader is not None:
+            raise RuntimeError("The SFT validation loader is already configured.")
+        if self._sft_processor is None:
+            raise RuntimeError("Configure the SFT train loader before validation.")
+        source = data_config.get("validation")
+        if source is None:
+            raise ValueError("SFT validation requires data.validation.")
+        if self._sft_logical_rank is None or self._sft_logical_world_size is None:
+            raise RuntimeError("The SFT logical loader identity is missing.")
+        self._sft_validation_loader = build_energon_sft_loader(
+            data_config=data_config,
+            source=source,
+            processor=self._sft_processor,
+            batch_size=batch_size,
+            max_sequence_length=max_sequence_length,
+            split_role="validation",
+            logical_rank=self._sft_logical_rank,
+            logical_world_size=self._sft_logical_world_size,
+            placement_fingerprint=placement_fingerprint,
+            only_unmask_final=only_unmask_final,
+        )
+        self._sft_validation_iterator = iter(self._sft_validation_loader)
+        return True
+
+    def reset_sft_validation_dataloader(self) -> None:
+        """Rewind validation so repeated evaluations cover the same split."""
+        if self._sft_validation_loader is None:
+            raise RuntimeError("The SFT validation loader is not configured.")
+        if self._sft_active_validation_envelope is not None:
+            raise RuntimeError("Cannot rewind with an active validation batch.")
+        self._sft_validation_iterator = iter(self._sft_validation_loader)
+
+    def _ld_mark(self, phase: str) -> None:
+        """Close the previous load phase and enter ``phase``."""
+        now = time.monotonic()
+        previous = self._ld_phase
+        elapsed = now - self._ld_t0
+        if previous is not None:
+            self._ld_durations[previous] = elapsed
+            if self._ld_on:
+                print(
+                    "[LOADDIAG] batch=%d %s done in %.3fs -> %s"
+                    % (self._sft_next_batch_index, previous, elapsed, phase),
+                    flush=True,
+                )
+        self._ld_phase = None if phase == "idle" else phase
+        self._ld_t0 = now
+        if self._ld_on and self._ld_watchdog is None:
+            self._ld_watchdog = threading.Thread(
+                target=self._ld_watch,
+                name="sft-loaddiag",
+                daemon=True,
+            )
+            self._ld_watchdog.start()
+
+    def _ld_watch(self) -> None:
+        """Print the in-flight phase every 15 seconds after a 30-second stall."""
+        while True:
+            time.sleep(15)
+            phase = self._ld_phase
+            if phase is None:
+                continue
+            elapsed = time.monotonic() - self._ld_t0
+            if elapsed < 30:
+                continue
+            try:
+                process_ids = os.listdir("/proc")
+            except OSError:
+                workers = -1
+            else:
+                workers = 0
+                for process_id in process_ids:
+                    if not process_id.isdigit():
+                        continue
+                    try:
+                        with open(
+                            f"/proc/{process_id}/comm",
+                            encoding="utf-8",
+                            errors="ignore",
+                        ) as stream:
+                            command = stream.read()
+                    except OSError:
+                        continue
+                    if "pt_data_worker" in command:
+                        workers += 1
+            print(
+                "[LOADDIAG] STUCK batch=%d phase=%s elapsed=%.0fs data_workers=%d"
+                % (self._sft_next_batch_index, phase, elapsed, workers),
+                flush=True,
+            )
+
     def load_next_sft_batch(
         self,
         *,
@@ -113,9 +251,46 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         make_sequence_length_divisible_by: int,
     ) -> StepEnvelope:
         """Load, prepare, and publish one batch into this process's local store."""
-        if self._sft_loader is None or self._sft_loader_iterator is None:
+        envelope = self._load_next_sft_batch(
+            validation=False,
+            only_unmask_final=only_unmask_final,
+            make_sequence_length_divisible_by=make_sequence_length_divisible_by,
+        )
+        assert envelope is not None
+        return envelope
+
+    def load_next_sft_validation_batch(
+        self,
+        *,
+        only_unmask_final: bool,
+        make_sequence_length_divisible_by: int,
+    ) -> Optional[StepEnvelope]:
+        """Load one validation batch, returning ``None`` at split exhaustion."""
+        return self._load_next_sft_batch(
+            validation=True,
+            only_unmask_final=only_unmask_final,
+            make_sequence_length_divisible_by=make_sequence_length_divisible_by,
+        )
+
+    def _load_next_sft_batch(
+        self,
+        *,
+        validation: bool,
+        only_unmask_final: bool,
+        make_sequence_length_divisible_by: int,
+    ) -> Optional[StepEnvelope]:
+        loader = self._sft_validation_loader if validation else self._sft_loader
+        iterator = (
+            self._sft_validation_iterator if validation else self._sft_loader_iterator
+        )
+        active = (
+            self._sft_active_validation_envelope
+            if validation
+            else self._sft_active_envelope
+        )
+        if loader is None or iterator is None:
             raise RuntimeError("The SFT Energon loader is not configured on this rank.")
-        if self._sft_active_envelope is not None:
+        if active is not None:
             raise RuntimeError(
                 "Commit or abort the active SFT batch before loading again."
             )
@@ -123,15 +298,21 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             raise RuntimeError("The SFT logical loader identity is missing.")
 
         started = time.monotonic()
+        self._ld_durations = {}
+        self._ld_phase = None
+        self._ld_t0 = started
+        self._ld_mark("iter")
 
         with managed_span(RLSpanGroup.DATA_PROCESSING, "rl.sft_v2.read_batch"):
-            # Restart when one epoch is exhausted.
+            # restart when one epoch is exhausted
             try:
-                batch = next(self._sft_loader_iterator)
+                batch = next(iterator)
             except StopIteration:
-                self._sft_loader_iterator = iter(self._sft_loader)
+                if validation:
+                    return None
+                self._sft_loader_iterator = iter(loader)
                 batch = next(self._sft_loader_iterator)
-
+        self._ld_mark("prepare")
         with managed_span(RLSpanGroup.DATA_PROCESSING, "rl.sft_v2.prepare_batch"):
             prepared = prepare_sft_batch(
                 batch,
@@ -139,11 +320,16 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 only_unmask_final=only_unmask_final,
                 make_sequence_length_divisible_by=make_sequence_length_divisible_by,
             )
+        self._ld_mark("post-prepare")
         batch_size = prepared.size
         source_ids = self._source_ids(prepared, batch_size=batch_size)
-        partition_id = (
-            f"sft_v2_dp{self._sft_logical_rank}_batch{self._sft_next_batch_index}"
+        batch_index = (
+            self._sft_next_validation_batch_index
+            if validation
+            else self._sft_next_batch_index
         )
+        split = "val" if validation else "train"
+        partition_id = f"sft_v2_{split}_dp{self._sft_logical_rank}_batch{batch_index}"
         sample_ids = [f"{partition_id}_row{row}" for row in range(batch_size)]
         # Source IDs are controller metadata carried by the envelope and tags.
         # Policy workers do not consume them, and replica broadcasts reject
@@ -153,23 +339,38 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             for key, value in prepared.items()
             if key not in {"source_ids", "sample_keys"}
         }
+        self._ld_mark("tensordict")
         fields = local_batch_to_tensordict(policy_batch, batch_size=batch_size)
+
+        self._ld_mark("publish")
+        publish_phase_started = time.monotonic()
         field_names = list(fields.keys())
         client = self._require_dp_client()
+        publish_setup = time.monotonic() - publish_phase_started
+
+        publish_phase_started = time.monotonic()
         client.register_partition(
             partition_id=partition_id,
             fields=field_names,
             num_samples=batch_size,
             consumer_tasks=["train"],
         )
+        publish_register_partition = time.monotonic() - publish_phase_started
+
+        publish_phase_started = time.monotonic()
         tags = self._source_tags(prepared, batch_size=batch_size)
+        publish_source_tags = time.monotonic() - publish_phase_started
+
+        publish_phase_started = time.monotonic()
         published_meta = client.put_samples(
             sample_ids=sample_ids,
             partition_id=partition_id,
             fields=fields,
             tags=tags,
         )
+        publish_put_samples = time.monotonic() - publish_phase_started
 
+        publish_phase_started = time.monotonic()
         lengths_tensor = prepared["input_lengths"]
         lengths = tuple(int(value) for value in lengths_tensor.tolist())
         sample_mask = prepared["sample_mask"]
@@ -184,6 +385,17 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             extra_info[MICRO_BATCH_LENGTHS] = [list(lengths)]
         if make_sequence_length_divisible_by > 1:
             extra_info["pad_to_multiple"] = int(make_sequence_length_divisible_by)
+        publish_batch_metadata = time.monotonic() - publish_phase_started
+        self._ld_mark("idle")
+        self._ld_durations.update(
+            {
+                "publish_setup": publish_setup,
+                "publish_register_partition": publish_register_partition,
+                "publish_source_tags": publish_source_tags,
+                "publish_put_samples": publish_put_samples,
+                "publish_batch_metadata": publish_batch_metadata,
+            }
+        )
         envelope = StepEnvelope(
             meta=replace(
                 published_meta,
@@ -198,9 +410,14 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             # The controller waits for the whole call, including publishing.
             load_seconds=time.monotonic() - started,
             valid_tokens=valid_tokens,
+            load_phase_seconds=dict(self._ld_durations),
         )
-        self._sft_active_envelope = envelope
-        self._sft_next_batch_index += 1
+        if validation:
+            self._sft_active_validation_envelope = envelope
+            self._sft_next_validation_batch_index += 1
+        else:
+            self._sft_active_envelope = envelope
+            self._sft_next_batch_index += 1
         return envelope
 
     def commit_sft_batch(self) -> None:
@@ -218,6 +435,22 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             return
         self.commit_sft_batch()
 
+    def commit_sft_validation_batch(self) -> None:
+        """Release the active validation batch after evaluation."""
+        envelope = self._sft_active_validation_envelope
+        if envelope is None:
+            raise RuntimeError("There is no active SFT validation batch to commit.")
+        self._require_dp_client().clear_samples(
+            sample_ids=envelope.meta.sample_ids,
+            partition_id=envelope.meta.partition_id,
+        )
+        self._sft_active_validation_envelope = None
+
+    def abort_sft_validation_batch(self) -> None:
+        """Release the active validation batch after failed evaluation."""
+        if self._sft_active_validation_envelope is not None:
+            self.commit_sft_validation_batch()
+
     def sft_dataloader_state_dict(self) -> dict[str, Any]:
         """Capture this logical loader state after its batch is committed."""
         if self._sft_loader is None:
@@ -229,8 +462,11 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
     def close_sft_dataloader(self) -> None:
         """Clear local batch state and release the loader reference."""
         self.abort_sft_batch()
+        self.abort_sft_validation_batch()
         self._sft_loader_iterator = None
         self._sft_loader = None
+        self._sft_validation_iterator = None
+        self._sft_validation_loader = None
 
     def _require_active_envelope(self) -> StepEnvelope:
         if self._sft_active_envelope is None:

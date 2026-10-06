@@ -294,6 +294,7 @@ def get_microbatch_iterator(
     if prepacked:
         create_packed_seq_padding_mask = bool(
             cfg["megatron_cfg"].get("moe_router_enable_expert_bias", False)
+            or cfg["sequence_packing"].get("mask_padding_from_moe", False)
         )
         raw_iterator = data.make_microbatch_iterator(1)
         data_iterator_len = data.size
@@ -304,7 +305,7 @@ def get_microbatch_iterator(
     elif cfg["sequence_packing"]["enabled"]:
         create_packed_seq_padding_mask = uses_hybridep_flex_dispatcher(
             cfg["megatron_cfg"]
-        )
+        ) or cfg["sequence_packing"].get("mask_padding_from_moe", False)
         prepad_packed_seq_for_hybridep = create_packed_seq_padding_mask and cfg[
             "megatron_cfg"
         ].get("moe_hybridep_prepad_packed_inputs")
@@ -488,13 +489,16 @@ def _prepare_prepacked(
             else _slice_prepacked_for_cp(full_position_ids, padded)
         )
     params = PackedSeqParams(
-        cu_seqlens_q=cu,
-        cu_seqlens_kv=cu,
+        # Keep the attention output in the physical THD layout. Transformer
+        # Engine otherwise compacts it to the logical token count, which no
+        # longer matches the sequence-parallel residual stream.
+        cu_seqlens_q=padded,
+        cu_seqlens_kv=padded,
         cu_seqlens_q_padded=padded,
         cu_seqlens_kv_padded=padded,
         max_seqlen_q=int(padded_lengths.max()),
         max_seqlen_kv=int(padded_lengths.max()),
-        pad_between_seqs=not torch.equal(cu, padded),
+        pad_between_seqs=False,
         qkv_format="thd",
         total_tokens=input_ids_cp_sharded.shape[1],
     )
@@ -615,11 +619,22 @@ def process_microbatch(
                             mtp_loss_mask, cu_seqlens_padded
                         )
                 if "media_token_validity_mask" in data_dict:
-                    media_token_validity_mask = data_dict["media_token_validity_mask"]
-                    if not model_slices_context_parallel_inputs:
-                        media_token_validity_mask = _slice_prepacked_for_cp(
-                            media_token_validity_mask, cu_seqlens_padded
-                        )
+                    if padding_mask is not None:
+                        # The validity mask may have been attached before Energon
+                        # materialized the physical pack. In that case its row
+                        # length is the source-bin length, not the final THD row.
+                        # A packed padding mask carries the same information in
+                        # the final model layout: every non-padding image token is
+                        # a real media anchor for this caller-packed VLM path.
+                        media_token_validity_mask = ~padding_mask
+                    else:
+                        media_token_validity_mask = data_dict[
+                            "media_token_validity_mask"
+                        ]
+                        if not model_slices_context_parallel_inputs:
+                            media_token_validity_mask = _slice_prepacked_for_cp(
+                                media_token_validity_mask, cu_seqlens_padded
+                            )
                 attention_mask = None
             elif delegate_pack_to_model:
                 has_mtp_loss_mask = "mtp_loss_mask" in data_dict
@@ -882,35 +897,42 @@ def process_microbatch(
                 # per-sample rows it was built from, so it has to travel through
                 # the identical transform rather than be rebuilt afterwards.
                 if "media_token_validity_mask" in data_dict:
-                    (
-                        packed_media_mask,
-                        local_media_mask,
-                        _,
-                        _,
-                        _,
-                    ) = _pack_sequences_for_megatron(
-                        # Pack in the token dtype: padding is filled with 0,
-                        # which is a valid token id but not a valid bool. Read
-                        # the dtype off the unpacked ids, since the local
-                        # input_ids is already the packed tensor here.
-                        data_dict["media_token_validity_mask"].to(
-                            data_dict["input_ids"].dtype
-                        ),
-                        seq_lengths,
-                        pad_individual_seqs_to_multiple_of,
-                        pad_packed_seq_to_multiple_of,
-                        pad_full_seq_to,
-                        cp_rank=get_context_parallel_rank(),
-                        cp_size=get_context_parallel_world_size(),
-                    )
-                    # Mirror the input_ids layout choice above, for the same
-                    # reason the MTP mask does: a model that slices CP itself
-                    # merges media against the full THD row.
-                    media_token_validity_mask = (
-                        packed_media_mask
-                        if model_slices_context_parallel_inputs
-                        else local_media_mask
-                    ).bool()
+                    if padding_mask is not None:
+                        # The source mask may have been attached before runtime
+                        # packing, while padding_mask already has the final THD
+                        # layout. For this VLM path every non-padding image token
+                        # is a real media anchor, so it is also the validity mask.
+                        media_token_validity_mask = ~padding_mask
+                    else:
+                        (
+                            packed_media_mask,
+                            local_media_mask,
+                            _,
+                            _,
+                            _,
+                        ) = _pack_sequences_for_megatron(
+                            # Pack in the token dtype: padding is filled with 0,
+                            # which is a valid token id but not a valid bool. Read
+                            # the dtype off the unpacked ids, since the local
+                            # input_ids is already the packed tensor here.
+                            data_dict["media_token_validity_mask"].to(
+                                data_dict["input_ids"].dtype
+                            ),
+                            seq_lengths,
+                            pad_individual_seqs_to_multiple_of,
+                            pad_packed_seq_to_multiple_of,
+                            pad_full_seq_to,
+                            cp_rank=get_context_parallel_rank(),
+                            cp_size=get_context_parallel_world_size(),
+                        )
+                        # Mirror the input_ids layout choice above, for the same
+                        # reason the MTP mask does: a model that slices CP itself
+                        # merges media against the full THD row.
+                        media_token_validity_mask = (
+                            packed_media_mask
+                            if model_slices_context_parallel_inputs
+                            else local_media_mask
+                        ).bool()
 
                 # PackedSeqParams carries the sequence layout:
                 # attention_mask and position_ids are normally None here.

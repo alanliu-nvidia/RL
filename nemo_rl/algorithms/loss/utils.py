@@ -45,6 +45,33 @@ def rescale_loss_metrics(
     }
 
 
+def _vocab_parallel_argmax(
+    logits: torch.Tensor,
+    *,
+    vocab_parallel_rank: Optional[int],
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    """Return global token IDs for TP-sharded vocabulary logits."""
+    local_values, local_ids = logits.detach().max(dim=-1)
+    if vocab_parallel_group is None:
+        return local_ids
+    assert vocab_parallel_rank is not None
+    global_values = local_values.clone()
+    torch.distributed.all_reduce(
+        global_values, op=torch.distributed.ReduceOp.MAX, group=vocab_parallel_group
+    )
+    global_ids = local_ids + vocab_parallel_rank * logits.shape[-1]
+    global_ids = torch.where(
+        local_values == global_values,
+        global_ids,
+        torch.full_like(global_ids, -1),
+    )
+    torch.distributed.all_reduce(
+        global_ids, op=torch.distributed.ReduceOp.MAX, group=vocab_parallel_group
+    )
+    return global_ids
+
+
 def map_teacher_logits_to_draft_vocab(
     teacher_logits: torch.Tensor,
     d2t: Optional[torch.Tensor],

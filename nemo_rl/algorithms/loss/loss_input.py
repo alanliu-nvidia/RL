@@ -25,6 +25,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.loss.utils import (
     _pack_input_ids,
+    _vocab_parallel_argmax,
     map_teacher_logits_to_draft_vocab,
     reconstruct_opd_full_teacher_logits,
 )
@@ -291,6 +292,29 @@ def prepare_loss_input(
                 )
 
         loss_input = {"next_token_logprobs": logprobs}
+        if "answer_token_mask" in data:
+            if logits.ndim != 3:
+                raise ValueError(
+                    "Answer exact-match diagnostics require full logits; set "
+                    "policy.megatron_cfg.use_fused_linear_logprobs=false."
+                )
+            predictions = _vocab_parallel_argmax(
+                logits,
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+            )
+            cp_size = (
+                1
+                if context_parallel_group is None
+                else torch.distributed.get_world_size(context_parallel_group)
+            )
+            if cp_size > 1:
+                predictions = allgather_cp_sharded_tensor(
+                    predictions, context_parallel_group, seq_dim=1
+                )
+            loss_input["next_token_predictions"] = predictions[
+                :, : data["input_ids"].shape[1] - 1
+            ]
 
     elif loss_fn.input_type == LossInputType.OPD_FULL:
         loss_input = _prepare_opd_full_loss_input(
@@ -539,6 +563,34 @@ def prepare_packed_loss_input(
         target_is_pre_rolled=not input_is_prepacked,
         return_packed_layout=input_is_prepacked,
     )
+
+    if "answer_token_mask" in data:
+        if cp_size != 1:
+            raise NotImplementedError(
+                "Packed answer exact-match diagnostics currently require "
+                "context_parallel_size=1."
+            )
+        predictions = _vocab_parallel_argmax(
+            logits,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+        )
+        if input_is_prepacked:
+            predictions = predictions[:, :-1]
+        else:
+            unpacked_predictions = torch.zeros(
+                (len(cu_seqlens_q) - 1, unpacked_seqlen - 1),
+                dtype=predictions.dtype,
+                device=predictions.device,
+            )
+            for index in range(len(cu_seqlens_q) - 1):
+                start = int(cu_seqlens_q_padded[index].item())
+                end = int(cu_seqlens_q_padded[index + 1].item())
+                length = min(end - start - 1, unpacked_seqlen - 1)
+                unpacked_predictions[index, :length] = predictions[
+                    0, start : start + length
+                ]
+            predictions = unpacked_predictions
 
     # Match prepare_loss_input behavior for top-k/top-p filtered training:
     # use filtered curr_logprobs for actor loss, but keep unfiltered values for KL.

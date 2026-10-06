@@ -199,6 +199,11 @@ def model_forward(
     # metadata rather than model inputs. PackedSeqParams carries them forward.
     multimodal_data.pop("cu_seqlens", None)
     multimodal_data.pop("cu_seqlens_padded", None)
+    # This mask is token-layout metadata, not a model input that can be
+    # forwarded straight from the source batch. process_microbatch has already
+    # packed/CP-sharded it alongside input_ids and passes that aligned copy via
+    # the explicit argument below.
+    multimodal_data.pop("media_token_validity_mask", None)
     # VLM wrappers normally derive their own positions or expand the token sequence,
     # so position_ids are dropped for multimodal batches.
     # A model that consumes caller-packed THD inputs keeps them:
@@ -223,8 +228,10 @@ def model_forward(
         additional_kwargs["padding_mask"] = padding_mask
 
     # Only sent when the model advertises the parameter, so it never reaches a
-    # forward that would swallow it into **kwargs and quietly ignore it.
-    if media_token_validity_mask is not None:
+    # forward that would swallow it into **kwargs and quietly ignore it. A packed
+    # padding mask is already in the final model layout and lets the VLM derive
+    # the same validity information without preferring a stale source-row mask.
+    if media_token_validity_mask is not None and padding_mask is None:
         additional_kwargs["media_token_validity_mask"] = media_token_validity_mask
 
     if defer_fp32_logits:

@@ -54,6 +54,13 @@ def _envelope(rank: int, *, source_count: int = 1) -> StepEnvelope:
         sequence_lengths=(8,),
         load_seconds=0.1 + rank * 0.1,
         valid_tokens=4,
+        load_phase_seconds={
+            "iter": 0.01 + rank * 0.01,
+            "prepare": 0.02,
+            "post-prepare": 0.03,
+            "tensordict": 0.04,
+            "publish": 0.05,
+        },
     )
 
 
@@ -65,6 +72,12 @@ def _controller() -> object:
         "loss": 1.0,
         "grad_norm": 0.5,
         "all_mb_metrics": {},
+        "mtp_metrics": {"mtp_1_loss": 0.25},
+        "step_phases": {"fetch": 0.1, "fwd_bwd": 0.2},
+    }
+    controller._trainer.train_placed_microbatches.return_value = {
+        "stamp_pad": 0.01,
+        "dispatch": 0.02,
     }
     controller._master_config = SimpleNamespace()
     controller._save_state = SFTV2SaveState(0, 0, 0, "hash")
@@ -108,6 +121,18 @@ def _valid_setup_config(
     }
     for section, values in (policy_overrides or {}).items():
         policy[section].update(values)
+    packing = None
+    if data["energon"].packing_buffer_size is not None:
+        packing = SimpleNamespace(
+            name=policy["sequence_packing"].get("algorithm"),
+            options=SimpleNamespace(
+                max_sequence_length=data["max_input_seq_length"],
+                sequence_length_pad_multiple=policy[
+                    "make_sequence_length_divisible_by"
+                ],
+            ),
+        )
+    data["energon"].task_encoder = SimpleNamespace(packing=packing)
     return SimpleNamespace(
         sft=SimpleNamespace(**sft),
         data=data,
@@ -147,6 +172,39 @@ def test_train_step_aborts_policy_and_loader_on_training_failure() -> None:
     controller._trainer.abort_train_step.assert_called_once_with()
     controller._owner_call.assert_called_once_with("abort_sft_batch")
     assert controller._save_state.total_steps == 0
+
+
+def test_validation_counts_source_samples_before_packing(monkeypatch: Any) -> None:
+    controller = _controller()
+    controller._master_config.sft = SimpleNamespace(
+        val_batches=1,
+        only_unmask_final=True,
+        val_micro_batch_size=1,
+    )
+    controller._master_config.policy = {"make_sequence_length_divisible_by": 1}
+    envelopes = [_envelope(0, source_count=3), _envelope(1, source_count=2)]
+    controller._trainer.worker_group.run_all_workers_single_data.return_value = object()
+    controller._trainer.evaluate_placed_microbatches.return_value = {
+        "loss": 2.0,
+        "grad_norm": 0.0,
+        "all_mb_metrics": {
+            "num_unmasked_tokens": [8],
+            # Physical packed rows, deliberately smaller than the five sources.
+            "num_valid_samples": [2],
+            "answer_nll_sum": [3.0],
+            "answer_exact_match_count": [1],
+            "num_answer_tokens": [2],
+            "num_answer_sequences": [2],
+        },
+    }
+    monkeypatch.setattr("nemo_rl.algorithms.sft_v2.ray.get", lambda _: envelopes)
+
+    metrics = controller._run_validation()
+
+    assert metrics["num_valid_samples"] == 5
+    assert metrics["loss"] == 2.0
+    assert metrics["answer_token_ce"] == 1.5
+    assert metrics["answer_exact_match_accuracy"] == 0.5
 
 
 def _save_controller(**checkpointing: Any) -> object:
@@ -297,10 +355,9 @@ def test_checkpoint_metric_rejects_a_metric_no_step_produces() -> None:
             {"policy_overrides": {"dynamic_batching": {"enabled": True}}},
             "fixed batching",
         ),
-        ({"sft_overrides": {"val_period": 10}}, "has no validation loop"),
         (
-            {"data_overrides": {"validation": {"path": "/dataset"}}},
-            "reads no validation source",
+            {"sft_overrides": {"val_period": 10}},
+            "data.validation is null",
         ),
         (
             {"data_overrides": {"max_input_seq_length": None}},
@@ -409,6 +466,9 @@ def test_setup_rejects_invalid_energon_packing_config(
         },
     )
     config.policy["make_sequence_length_divisible_by"] = pad_multiple
+    config.data[
+        "energon"
+    ].task_encoder.packing.options.sequence_length_pad_multiple = pad_multiple
 
     with pytest.raises(ValueError, match=re.escape(message)):
         setup_sft_v2(config, MagicMock())
@@ -446,8 +506,9 @@ def test_setup_loaders_enables_packing_from_energon_buffer() -> None:
     kwargs = (
         controller._trainer.worker_group.run_all_workers_single_data.call_args.kwargs
     )
-    assert kwargs["packing_algorithm"] == "balanced_greedy_knapsack"
-    assert kwargs["max_sequences_per_bin"] == 16
+    assert kwargs["data_config"] is controller._master_config.data
+    assert "packing_algorithm" not in kwargs
+    assert "max_sequences_per_bin" not in kwargs
 
 
 @pytest.mark.parametrize(
@@ -561,6 +622,7 @@ def test_setup_requires_uneven_dispatch_padding_for_packed_hybridep(
         },
     )
     config.policy["make_sequence_length_divisible_by"] = 4
+    config.data["energon"].task_encoder.packing.options.sequence_length_pad_multiple = 4
     # A padded HybridEP request reaches the existing alignment check after this gate.
     message = (
         "max_input_seq_length to be divisible"
