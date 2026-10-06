@@ -115,8 +115,10 @@ def test_loader_identity_records_task_encoder_packing_cap(
 
 
 @pytest.mark.mcore
-def test_task_encoder_rejects_unsupported_balancing_delta(
+@pytest.mark.parametrize("algorithm", ["balanced_greedy_knapsack", "greedy_knapsack"])
+def test_task_encoder_balancing_delta(
     monkeypatch: pytest.MonkeyPatch,
+    algorithm: str,
 ) -> None:
     from nemo_rl.data.energon import sft_dataloader as module
 
@@ -124,7 +126,7 @@ def test_task_encoder_rejects_unsupported_balancing_delta(
         model_family="qwen",
         task_encoder={
             "packing": {
-                "name": "balanced_greedy_knapsack",
+                "name": algorithm,
                 "buffer_size": 10,
                 "options": {
                     "max_sequence_length": 128,
@@ -135,8 +137,9 @@ def test_task_encoder_rejects_unsupported_balancing_delta(
         },
     )
     monkeypatch.setattr(module.TASK_ENCODER_REGISTRY, "resolve_configured", Mock())
-    with pytest.raises(ValueError, match="balanced_knapsack_delta is not supported"):
-        module._task_encoder(
+
+    def build_encoder():
+        return module._task_encoder(
             loader_config=config,
             adapter=object(),
             include_source_ids=True,
@@ -144,3 +147,15 @@ def test_task_encoder_rejects_unsupported_balancing_delta(
             tokenizer=object(),
             only_unmask_final=False,
         )
+
+    if algorithm == "balanced_greedy_knapsack":
+        build_encoder()
+        packer = module.TASK_ENCODER_REGISTRY.resolve_configured.return_value.call_args.kwargs[
+            "packer"
+        ]
+        assert packer.balanced_knapsack_delta == 5
+    else:
+        with pytest.raises(
+            ValueError, match="balanced_knapsack_delta is only supported"
+        ):
+            build_encoder()
