@@ -1,0 +1,21 @@
+defaults:
+  - nm4_generalist_32n_mxfp8_cp64ep64_gtp2_gbs2_hybridep.yaml
+
+policy:
+  megatron_cfg:
+    model_overrides:
+      # 128 GPUs: dense TP=1, CP=64, GTP=1 gives DP=2 and two data lanes.
+      # Expert TP=1, EP=64, EGTP=2 uses the full world: expert DP=1.
+      # Rematerialize expert weights rather than dense weights.
+      gtp_weight_remat_size: 1
+      expert_gtp_weight_remat_size: 2
+
+logger:
+  log_dir: logs/nm4-generalist-32n-mxfp8-cp64ep64-egtp2-gbs2-hybridep
+  wandb:
+    name: nm4-generalist-32n-mxfp8-cp64ep64-egtp2-gbs2-hybridep
+  tensorboard:
+    log_dir: logs/nm4-generalist-32n-mxfp8-cp64ep64-egtp2-gbs2-hybridep
+
+checkpointing:
+  checkpoint_dir: /data/nemorl-runs/nm4-generalist-32n-mxfp8-cp64ep64-egtp2-gbs2-hybridep
