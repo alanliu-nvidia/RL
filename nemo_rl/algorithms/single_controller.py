@@ -27,12 +27,13 @@ Data flow:
                  → _advantage_stage(meta) → dp_client.get_samples(...)
                                         → adv_estimator.compute_advantage(...)
                                         → dp_client.put_samples(...)
-                 → _value_train_epochs(metas) (PPO only)
-                     → value.begin/train_microbatches/finish_train_step
-                     Value → dp_client.get_samples(...)     (via its own client)
                  → trainer.begin/train_microbatches/finish_train_step (split API,
                      driver-side TQPolicy via asyncio.to_thread)
                      Trainer → dp_client.get_samples(...)   (via its own client)
+                 → early policy refit (PPO, separate generation GPUs)
+                 → _value_train_epochs(metas) (PPO only)
+                     → value.begin/train_microbatches/finish_train_step
+                     Value → dp_client.get_samples(...)     (via its own client)
                  → dp_client.clear_samples(...)             ← SC clears after train
   _sync_weights  → WeightSynchronizer.sync_weights()
 """
@@ -371,6 +372,11 @@ class SingleControllerActor:
         self._async_cfg = master_config.async_rl
         self._is_ppo: bool = is_ppo_run(master_config)
         self._value_dedicated: bool = dedicated_value_enabled(master_config)
+        self._streaming_ppo: bool = (
+            self._is_ppo
+            and self._async_cfg.min_groups_for_streaming_train
+            < self._algo_cfg.num_prompts_per_step
+        )
         # GRPO has no epoch knob: it makes one optimizer step per RL step.
         self._ppo_epochs: int = self._algo_cfg.ppo_epochs if self._is_ppo else 1
         self._critic_ppo_epochs: int = (
@@ -2677,6 +2683,68 @@ class SingleControllerActor:
             )
         return target
 
+    def _streaming_ppo_selection_kwargs(self) -> dict[str, int]:
+        """Derive aligned chunks and the tail floor without changing other samplers.
+
+        Both models must accept every selected row. Packed execution requires
+        complete data-parallel shards; static execution also requires complete
+        local microbatches. Reject an incompatible full batch before claiming it.
+        """
+        if not self._streaming_ppo:
+            return {}
+        assert self._value is not None
+        # Both forward paths shard by sample count before packing. Keep
+        # whole prompt groups and leave any unaligned ready tail in the
+        # sampler instead of padding canonical data-plane rows.
+        policy_cfg = self._master_config.policy
+        value_cfg = self._master_config.value
+        assert value_cfg is not None
+        policy_dp_size = self._trainer.sharding_annotations.get_axis_size(
+            "data_parallel"
+        )
+        value_dp_size = self._value.sharding_annotations.get_axis_size("data_parallel")
+
+        # Packed/dynamic batching only needs complete DP shards. Static
+        # batching also needs complete local microbatches to avoid dropping rows.
+        policy_training_mbs = policy_logprob_mbs = 1
+        if not (
+            policy_cfg.get("dynamic_batching", {}).get("enabled", False)
+            or policy_cfg.get("sequence_packing", {}).get("enabled", False)
+        ):
+            policy_training_mbs = policy_cfg["train_micro_batch_size"]
+            policy_logprob_mbs = policy_cfg.get(
+                "logprob_batch_size", policy_training_mbs
+            )
+        value_logprob_mbs = 1
+        if not (
+            value_cfg.get("dynamic_batching", {}).get("enabled", False)
+            or value_cfg.get("sequence_packing", {}).get("enabled", False)
+        ):
+            value_logprob_mbs = value_cfg.get(
+                "logprob_batch_size", value_cfg["train_micro_batch_size"]
+            )
+
+        policy_sample_multiple = policy_dp_size * math.lcm(
+            policy_training_mbs, policy_logprob_mbs
+        )
+        value_sample_multiple = value_dp_size * value_logprob_mbs
+        sample_multiple = math.lcm(policy_sample_multiple, value_sample_multiple)
+        group_multiple = sample_multiple // math.gcd(
+            sample_multiple, self._algo_cfg.num_generations_per_prompt
+        )
+        if self._algo_cfg.num_prompts_per_step % group_multiple:
+            raise ValueError(
+                "Streaming PPO requires ppo.num_prompts_per_step to be a "
+                f"multiple of {group_multiple} prompt groups for the policy "
+                "and value data-parallel layouts."
+            )
+        return {
+            "group_multiple": group_multiple,
+            # Heuristic: half the minimum streaming chunk size, rounded up.
+            "min_remaining_groups": (self._async_cfg.min_groups_for_streaming_train + 1)
+            // 2,
+        }
+
     async def _train_pump(self) -> None:
         """Per-prompt-group streaming train loop.
 
@@ -2685,39 +2753,47 @@ class SingleControllerActor:
             1. Select the rollouts to train on.
                 a. sampler.evict drops stale groups from the buffer and clears their
                     TQ rows.
-                b. sampler.select returns K prompt groups, or None, and removes them from
-                    the buffer. The DP rows survive, already training-shaped because the
-                    buffer wrote them that way at rollout time.
-                c. One _buffer_capacity permit is released per group that left the buffer.
+                b. sampler.select returns K prompt groups, or None, and claims them
+                    for training. The DP rows survive, already training-shaped
+                    because the buffer wrote them that way at rollout time.
+                c. Claimed groups retain their _buffer_capacity permits until
+                    step cleanup; evicted groups release theirs immediately.
             2. Prepare the batch.
-                a. Policy and reference logprobs.
-                b. Value model forward (PPO only), with the policy parked on CPU
-                    so the critic never shares the training GPUs with it.
+                a. Value model forward (PPO only), parking policy parameters and
+                    optimizer on CPU where supported. Pending policy gradients
+                    stay on GPU.
+                b. Policy and reference logprobs.
                 c. _advantage_stage.
             3. Train on the chunk.
-                a. GRPO accumulates policy gradients for each arriving chunk.
-                b. PPO retains prepared chunk metadata until the full batch is
-                    available, computes batch-wide GAE, then replays all chunks
-                    for every critic epoch followed by every policy epoch.
-                    Each epoch finishes exactly one optimizer step.
+                a. Policy model: train_microbatches_from_meta accumulates gradients.
+                b. Full-batch PPO closes each actor epoch here; streaming PPO and
+                    GRPO accumulate across chunks and close the policy step in 5.
+                    Streaming PPO requires ppo.ppo_epochs=1.
             4. Close the chunk. Refresh min_sample_version and the dispatch tally. The
                 consumed rows stay in TQ: staged capture deltas are read by the policy
                 workers during 3, so nothing is cleared until the step closes.
-            5. Train the policy model (GRPO) -- finish_train_step all_reduces the
-                accumulated gradients, rescales, and runs optimizer.step. Then
-                _cleanup_consumed_metas clears every consumed canonical row and its
-                staged capture deltas.
-            6. Refit the model. Sync the new policy weights to generation.
+                Streaming PPO prepares the critic before waiting for the next chunk.
+            5. Finish training the step.
+                a. finish_train_step all_reduces the accumulated policy gradients,
+                    rescales, and runs optimizer.step, unless full-batch PPO already
+                    closed its actor epochs in 3.
+                b. PPO refits separate generation GPUs early, then runs all
+                    ppo.critic_ppo_epochs on the concatenated full batch.
+                c. _cleanup_consumed_metas clears every consumed canonical row and
+                    its staged capture deltas, releasing training claims and capacity.
+            6. Refit the model. Sync the new policy weights to generation unless PPO
+                already refit in 5. Generation sharing the training GPUs stays asleep
+                until critic training finishes.
 
         PPO critic warmup (ppo.policy_training_start_step > 0) changes which of those
-        run. For the first N steps 3a still trains the critic every step, but 3b and 6
-        are skipped, so the policy is neither trained nor refit. The trainer version
-        still advances, and the sampler's lookahead is widened while the policy is
-        frozen.
+        run. For the first N steps 5b still trains the critic every step, but policy
+        training and refit are skipped. The trainer version still advances, and the
+        sampler's lookahead is widened while the policy is frozen.
         """
         policy_training_start_step = (
             self._algo_cfg.policy_training_start_step if self._is_ppo else 0
         )
+        selection_kwargs = self._streaming_ppo_selection_kwargs()
 
         while self._train_steps < self._algo_cfg.max_num_steps:
             version_during_step = self._trainer_version
@@ -2725,14 +2801,18 @@ class SingleControllerActor:
             evicted_stale_prompt_groups = 0
             min_sample_version = None
             step_open = False
+            value_inference_prepared = False
             chunks_dispatched = 0
             calibration_batches: list[BatchedDataDict[Any]] = []
             selected_rollout_metrics: list[dict[str, Any]] = []
-            # PPO replays these chunks each epoch after full-step GAE.
-            ppo_metas: list[KVBatchMeta] = []
-            # Report the final epoch, matching the legacy PPO metric contract.
+            # Only the final epoch's metrics are retained for each model.
             policy_result: Optional[dict[str, Any]] = None
             value_result: Optional[dict[str, Any]] = None
+            value_train_metas: list[KVBatchMeta] = []
+            # PPO requires at least one chunk with valid training tokens per step.
+            step_has_valid_training_tokens = False
+            early_refit_done = False
+            aborted_stale_inflight_groups = 0
             # Always True off the PPO path: the start step is pinned to 0 there.
             is_policy_training_step = self._train_steps >= policy_training_start_step
             consumed_metas: list[KVBatchMeta] = []
@@ -2811,6 +2891,7 @@ class SingleControllerActor:
                             current_train_weight=self._trainer_version,
                             min_prompt_groups=min_prompt_groups,
                             max_prompt_groups=max_prompt_groups,
+                            **selection_kwargs,
                         )
                         training_claim_ids_after = (
                             self._buffer.training_owned_group_ids()
@@ -2924,6 +3005,52 @@ class SingleControllerActor:
                         await asyncio.to_thread(self._gen.finish_generation)
 
                     # ---- 2. Prepare the batch ----
+                    if self._is_ppo:
+                        # Doing value inference first keeps each chunk to one visit
+                        # per model, which is saving the offload/onloading cost.
+                        # Keep accumulated policy gradients resident on dedicated
+                        # GPUs; colocated models use policy offload for the critic.
+                        if not value_inference_prepared:
+                            with (
+                                self._timer.time("value_inference_prep"),
+                                managed_span(
+                                    RLSpanGroup.DATA_PROCESSING,
+                                    "rl.sc.value_inference_prep",
+                                    tracer=self._tracer,
+                                ),
+                            ):
+                                if not self._value_dedicated:
+                                    if step_open:
+                                        await asyncio.to_thread(
+                                            self._trainer.pause_train_step_with_offloading
+                                        )
+                                    else:
+                                        await asyncio.to_thread(
+                                            self._trainer.offload_to_cpu
+                                        )
+                                        if self._gen.blocks_training():
+                                            await asyncio.to_thread(
+                                                self._trainer.finish_inference
+                                            )
+                        with (
+                            self._timer.time("value_inference"),
+                            managed_span(
+                                RLSpanGroup.ADVANTAGE,
+                                "rl.sc.value_inference",
+                                tracer=self._tracer,
+                            ),
+                        ):
+                            train_meta = await self._value_stage(
+                                train_meta,
+                                already_prepared=value_inference_prepared,
+                            )
+                        value_inference_prepared = False
+                        if step_open:
+                            with self._timer.time("training_prep"):
+                                await asyncio.to_thread(
+                                    self._trainer.prepare_for_training
+                                )
+
                     # Compute prev_logprobs / ref_logprobs
                     if (
                         self._policy_logprobs_required
@@ -2964,50 +3091,63 @@ class SingleControllerActor:
                                     self._trainer.get_reference_policy_logprobs_from_meta,
                                     train_meta,
                                 )
-                    elif self._is_ppo and not self._value_dedicated:
-                        # prepare_for_lp_inference is skipped here, and it is the only
-                        # other call that parks the policy optimizer before the critic.
-                        with (
-                            self._timer.time("value_inference_prep"),
-                            managed_span(
-                                RLSpanGroup.DATA_PROCESSING,
-                                "rl.sc.value_inference_prep",
-                                tracer=self._tracer,
-                            ),
-                        ):
-                            await asyncio.to_thread(self._trainer.offload_to_cpu)
+                    # Compute advantages
+                    with (
+                        self._timer.time("advantage_calculation"),
+                        managed_span(
+                            RLSpanGroup.ADVANTAGE,
+                            "rl.sc.advantage_calculation",
+                            tracer=self._tracer,
+                        ),
+                    ):
+                        (
+                            train_meta,
+                            has_valid_training_tokens,
+                        ) = await self._advantage_stage(train_meta)
 
-                    # Value model forward
+                    step_has_valid_training_tokens |= has_valid_training_tokens
                     if self._is_ppo:
-                        with (
-                            self._timer.time("value_inference"),
-                            managed_span(
-                                RLSpanGroup.ADVANTAGE,
-                                "rl.sc.value_inference",
-                                tracer=self._tracer,
-                            ),
-                        ):
-                            if not self._value_dedicated:
-                                await asyncio.to_thread(self._trainer.finish_inference)
-                            train_meta = await self._value_stage(train_meta)
+                        value_train_metas.append(train_meta)
 
-                    if self._is_ppo:
-                        # Freeze old values/logprobs for the complete step before
-                        # either model updates. GAE whitening is batch-wide.
-                        ppo_metas.append(train_meta)
-                    else:
-                        with (
-                            self._timer.time("advantage_calculation"),
-                            managed_span(
-                                RLSpanGroup.ADVANTAGE,
-                                "rl.sc.advantage_calculation",
-                                tracer=self._tracer,
-                            ),
+                    # A full-batch PPO chunk is the whole step. Streaming may
+                    # still receive valid tokens in a later chunk.
+                    if (
+                        self._is_ppo
+                        and not self._streaming_ppo
+                        and not has_valid_training_tokens
+                    ):
+                        raise RuntimeError(
+                            "SingleController has no valid response tokens after "
+                            "filtering. Check seq_logprob_error_threshold, "
+                            "overlong_filtering, and environment mask_sample flags "
+                            "to avoid an optimizer step with an empty batch."
+                        )
+
+                    # ---- 3. Train the model -- train_microbatches_from_meta ----
+                    # Filtering can leave a GRPO streaming chunk with no training
+                    # tokens. Consume that chunk without F/B, then continue the same
+                    # optimizer step with the next chunk.
+
+                    # GRPO and streaming PPO accumulate policy gradients here.
+                    # Full-batch PPO closes each actor epoch here, keeping the
+                    # policy resident until every actor epoch has completed.
+                    # TODO(#2625): value_result, policy_result only record the last epoch's metrics.
+                    # That matches ppo.py for the losses; total_flops is additive and undercounted.
+                    if is_policy_training_step:
+                        if (
+                            self._is_ppo
+                            and groups_dispatched == 0
+                            and self._train_steps == policy_training_start_step
+                            and policy_training_start_step > 0
                         ):
-                            (
-                                train_meta,
-                                has_valid_training_tokens,
-                            ) = await self._advantage_stage(train_meta)
+                            print(
+                                f"  ✓ Critic warmup complete ({policy_training_start_step} "
+                                "steps). Starting policy training.",
+                                flush=True,
+                            )
+                        # Always restore training mode because log-prob inference may have
+                        # switched the model to inference mode. Keep it resident
+                        # across every PPO actor epoch.
                         with (
                             self._timer.time("training_prep"),
                             managed_span(
@@ -3018,24 +3158,34 @@ class SingleControllerActor:
                         ):
                             await asyncio.to_thread(self._trainer.prepare_for_training)
                         if has_valid_training_tokens:
-                            with (
-                                self._timer.time("policy_training"),
-                                managed_span(
-                                    RLSpanGroup.POLICY_UPDATE,
-                                    "rl.sc.policy_training",
-                                    tracer=self._tracer,
-                                ),
-                            ):
-                                if not step_open:
+                            for epoch in range(self._ppo_epochs):
+                                with (
+                                    self._timer.time("policy_training"),
+                                    managed_span(
+                                        RLSpanGroup.POLICY_UPDATE,
+                                        "rl.sc.policy_training",
+                                        tracer=self._tracer,
+                                        **{"rl.ppo_epoch": epoch + 1},
+                                    ),
+                                ):
+                                    if not step_open:
+                                        await asyncio.to_thread(
+                                            self._trainer.begin_train_step,
+                                            self._loss_fn,
+                                        )
+                                        step_open = True
                                     await asyncio.to_thread(
-                                        self._trainer.begin_train_step, self._loss_fn
+                                        self._trainer.train_microbatches_from_meta,
+                                        train_meta,
+                                        train_fields=self._train_fields,
                                     )
-                                    step_open = True
-                                await asyncio.to_thread(
-                                    self._trainer.train_microbatches_from_meta,
-                                    train_meta,
-                                    train_fields=self._train_fields,
-                                )
+                                    if self._is_ppo and not self._streaming_ppo:
+                                        async with self._checkpoint_save_lock:
+                                            self._optimizer_commit_in_progress = True
+                                        policy_result = await asyncio.to_thread(
+                                            self._trainer.finish_train_step
+                                        )
+                                        step_open = False
 
                     if train_meta.sequence_lengths:
                         self._step_log_dict["sequence_lengths"].extend(
@@ -3096,6 +3246,41 @@ class SingleControllerActor:
                         self._algo_cfg.num_prompts_per_step,
                     )
 
+                    if (
+                        self._is_ppo
+                        and self._streaming_ppo
+                        and groups_dispatched
+                        < self._target_groups_for_step(version_during_step)
+                    ):
+                        # Prepare the critic before waiting for the next chunk.
+                        # Account for this worker work separately from waiting;
+                        # generation may already have completed. Empty selections
+                        # reuse this residency without further model switches.
+                        with (
+                            self._timer.time("value_inference_prep"),
+                            managed_span(
+                                RLSpanGroup.DATA_PROCESSING,
+                                "rl.sc.value_inference_prep",
+                                tracer=self._tracer,
+                            ),
+                        ):
+                            if not self._value_dedicated:
+                                if step_open:
+                                    await asyncio.to_thread(
+                                        self._trainer.pause_train_step_with_offloading
+                                    )
+                                else:
+                                    await asyncio.to_thread(
+                                        self._trainer.offload_to_cpu
+                                    )
+                            resident_kwargs = (
+                                {"keep_resident": True} if self._value_dedicated else {}
+                            )
+                            await self._ppo_worker_call(
+                                self._value.prepare_for_inference, **resident_kwargs
+                            )
+                        value_inference_prepared = True
+
                 # The loop can leave a wait open on two exits that continue
                 # the run, where an unended span would stay open over the
                 # training that follows and never be exported. The other
@@ -3106,6 +3291,23 @@ class SingleControllerActor:
                     )
                     starvation_span.end()
 
+                if value_inference_prepared:
+                    # A dropped rollout can shrink the target while selection is
+                    # waiting, closing the step without another critic forward.
+                    # Release its speculative residency and restore policy
+                    # residency before the optimizer update and early refit.
+                    with self._timer.time("value_inference_prep"):
+                        resident_kwargs = (
+                            {"keep_resident": True} if self._value_dedicated else {}
+                        )
+                        await self._ppo_worker_call(
+                            self._value.finish_inference, **resident_kwargs
+                        )
+                    value_inference_prepared = False
+                    if step_open:
+                        with self._timer.time("training_prep"):
+                            await asyncio.to_thread(self._trainer.prepare_for_training)
+
                 # ---- 5. Train the policy model -- finish_train_step ----
                 log.info(
                     "train_pump: step %d closing on %d chunk(s), %d group(s)",
@@ -3115,25 +3317,83 @@ class SingleControllerActor:
                 )
 
                 if self._is_ppo:
-                    # Concatenation joins metadata only; tensors stay in DataPlane.
-                    full_meta = ppo_metas[0].concat(*ppo_metas[1:])
-                    with (
-                        self._timer.time("advantage_calculation"),
-                        managed_span(
-                            RLSpanGroup.ADVANTAGE,
-                            "rl.sc.advantage_calculation",
-                            tracer=self._tracer,
-                        ),
-                    ):
-                        full_meta, valid = await self._advantage_stage(full_meta)
-                    if not valid:
+                    if not step_has_valid_training_tokens:
                         raise RuntimeError(
-                            "SingleController has no valid response tokens after filtering"
+                            "SingleController has no valid response tokens after "
+                            "filtering. Check seq_logprob_error_threshold, "
+                            "overlong_filtering, and environment mask_sample flags "
+                            "to avoid an optimizer step with an empty batch."
                         )
-                    ppo_metas = [
-                        meta.with_fields(full_meta.fields or []) for meta in ppo_metas
-                    ]
-                    self._optimizer_commit_in_progress = True
+                    # Drain any snapshot already preparing/capturing its old
+                    # trainer identity before early refit advances the version.
+                    # Future snapshots see the flag under this same lock and
+                    # skip until the critic and batch consumption finish.
+                    async with self._checkpoint_save_lock:
+                        self._optimizer_commit_in_progress = True
+                    if is_policy_training_step and self._streaming_ppo:
+                        assert step_open
+                        with (
+                            self._timer.time("policy_training"),
+                            managed_span(
+                                RLSpanGroup.POLICY_UPDATE,
+                                "rl.sc.policy_optimizer_step",
+                                tracer=self._tracer,
+                            ),
+                        ):
+                            policy_result = await asyncio.to_thread(
+                                self._trainer.finish_train_step
+                            )
+                        step_open = False
+                    if is_policy_training_step and not self._gen.blocks_training():
+                        # Publish exactly one policy version before full-batch
+                        # critic training, allowing new rollouts during its epochs.
+                        # A generation engine sharing the training GPUs must
+                        # instead remain asleep until the critic has finished.
+                        self._trainer_version += 1
+                        with (
+                            self._timer.time("weight_sync"),
+                            efficiency_span("idle/refit_bubble", tracer=self._tracer),
+                        ):
+                            calibration_data = (
+                                BatchedDataDict.from_batches(calibration_batches)
+                                if calibration_batches
+                                else None
+                            )
+                            aborted_stale_inflight_groups = await self._sync_weights(
+                                calibration_data=calibration_data,
+                            )
+                        self._retune_lookahead_versions()
+                        self._rollout_manager.set_weight_version(self._trainer_version)
+                        early_refit_done = True
+                        log.info(
+                            "PPO: step %d policy update/refit complete at version %d",
+                            version_during_step,
+                            self._trainer_version,
+                        )
+
+                    with self._timer.time("value_training_prep"):
+                        if self._gen.blocks_training() and is_policy_training_step:
+                            # Gather updated parameters before offload's eval()
+                            # refreshes inference caches. Generation stays asleep
+                            # until critic training finishes.
+                            await asyncio.to_thread(
+                                self._trainer.sync_params_before_refit
+                            )
+                        if not self._value_dedicated:
+                            await asyncio.to_thread(self._trainer.offload_to_cpu)
+                        if self._gen.blocks_training():
+                            await asyncio.to_thread(self._trainer.finish_inference)
+                    # GAE has produced the frozen predictions and targets for
+                    # every row. Critic epochs always see the full original batch.
+                    value_train_meta = value_train_metas[0].concat(
+                        *value_train_metas[1:]
+                    )
+                    log.info(
+                        "PPO: step %d critic train: %d samples, %d full-batch epochs",
+                        version_during_step,
+                        value_train_meta.size,
+                        self._critic_ppo_epochs,
+                    )
                     with (
                         self._timer.time("value_training"),
                         managed_span(
@@ -3144,38 +3404,9 @@ class SingleControllerActor:
                         ),
                     ):
                         value_result = await self._value_train_epochs(
-                            ppo_metas,
+                            value_train_metas,
                             num_epochs=self._critic_ppo_epochs,
                         )
-                    if is_policy_training_step:
-                        if (
-                            self._train_steps == policy_training_start_step
-                            and policy_training_start_step > 0
-                        ):
-                            print(
-                                f"  ✓ Critic warmup complete ({policy_training_start_step} "
-                                "steps). Starting policy training.",
-                                flush=True,
-                            )
-                        with (
-                            self._timer.time("training_prep"),
-                            managed_span(
-                                RLSpanGroup.DATA_PROCESSING,
-                                "rl.sc.training_prep",
-                                tracer=self._tracer,
-                            ),
-                        ):
-                            await asyncio.to_thread(self._trainer.prepare_for_training)
-                        with (
-                            self._timer.time("policy_training"),
-                            managed_span(
-                                RLSpanGroup.POLICY_UPDATE,
-                                "rl.sc.policy_training",
-                                tracer=self._tracer,
-                                **{"rl.ppo_epochs": self._ppo_epochs},
-                            ),
-                        ):
-                            policy_result = await self._policy_train_epochs(ppo_metas)
                 else:
                     if not step_open:
                         raise RuntimeError(
@@ -3261,7 +3492,8 @@ class SingleControllerActor:
                         )
                     self._train_data_dump_rows = 0
 
-                self._trainer_version += 1
+                if not early_refit_done:
+                    self._trainer_version += 1
                 self._train_steps += 1
                 self._optimizer_commit_in_progress = False
                 dropped_prompt_groups = self._batch_shortfall.get(
@@ -3332,8 +3564,9 @@ class SingleControllerActor:
                 # ---- 6. Refit the model ----
                 # Critic warmup doesn't need a refit and the version still advances.
                 # But a colocated engine that was stood down still needs to be woken up via reshard.
-                aborted_stale_inflight_groups = 0
-                if is_policy_training_step or self._gen.blocks_training():
+                if not early_refit_done and (
+                    is_policy_training_step or self._gen.blocks_training()
+                ):
                     if defer_refit_for_save:
                         # Refit-deferral (colocated): the engine is about to be saved; let it sleep.
                         # Record `weight_sync` for consistency in reports.
@@ -3358,8 +3591,9 @@ class SingleControllerActor:
                             aborted_stale_inflight_groups = await self._sync_weights(
                                 calibration_data=calibration_data,
                             )
-                self._retune_lookahead_versions()
-                self._rollout_manager.set_weight_version(self._trainer_version)
+                if not early_refit_done:
+                    self._retune_lookahead_versions()
+                    self._rollout_manager.set_weight_version(self._trainer_version)
                 step_metrics.update(
                     {
                         "evicted_stale_prompt_groups": evicted_stale_prompt_groups,
@@ -5167,22 +5401,30 @@ class SingleControllerActor:
         self._rollout_manager.resume_request_deadlines()
         return aborted_stale_inflight_groups
 
-    async def _value_stage(self, meta: KVBatchMeta) -> KVBatchMeta:
+    async def _value_stage(
+        self, meta: KVBatchMeta, *, already_prepared: bool = False
+    ) -> KVBatchMeta:
         """Run the PPO value model's forward pass over the selected chunk.
 
         Tensors never touch SC: workers fetch the sequence columns from
         DataPlane and commit the per-token prediction back under ``values``,
-        which the advantage stage then reads alongside the rewards. The value model
-        is loaded and offloaded around the call in shared mode; dedicated value
-        workers keep it resident on their own GPUs.
+        which the advantage stage then reads alongside the rewards. Shared-GPU
+        workers offload after the forward; dedicated workers remain resident.
+        Streaming may prepare the value model before the chunk becomes ready.
+
+        Args:
+            meta: Selected chunk's metadata.
+            already_prepared: Reuse the critic residency prepared before waiting
+                for this chunk instead of loading the model again.
 
         Returns:
             The batch metadata with the ``values`` column recorded on it.
         """
         resident_kwargs = {"keep_resident": True} if self._value_dedicated else {}
-        await self._ppo_worker_call(
-            self._value.prepare_for_inference, **resident_kwargs
-        )
+        if not already_prepared:
+            await self._ppo_worker_call(
+                self._value.prepare_for_inference, **resident_kwargs
+            )
         try:
             await self._ppo_worker_call(self._value.get_values_from_meta, meta)
         finally:

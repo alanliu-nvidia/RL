@@ -910,8 +910,10 @@ class VllmAsyncGenerationWorkerImpl(
             OpenAIServingChat,
         )
 
-        # vLLM 0.29 moved this out of the openai package (vllm-project/vllm#54492).
-        from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+        try:
+            from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+        except ModuleNotFoundError:
+            from vllm.entrypoints.openai.engine.protocol import ErrorResponse
         from vllm.entrypoints.openai.models.protocol import BaseModelPath
         from vllm.entrypoints.openai.models.serving import OpenAIServingModels
         from vllm.entrypoints.serve.tokenize.protocol import (

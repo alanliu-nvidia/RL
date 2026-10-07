@@ -559,7 +559,13 @@ class BaseVllmGenerationWorker:
         # already shipped one silent-corruption fix for the device path
         # (vllm-project/vllm#55370, encoder cudagraphs). Users can opt back in via
         # policy.generation.vllm_kwargs.mm_device_do_normalize=true.
-        vllm_kwargs.setdefault("mm_device_do_normalize", False)
+        from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
+
+        engine_args_type = (
+            AsyncEngineArgs if self.cfg["vllm_cfg"].get("async_engine") else EngineArgs
+        )
+        if "mm_device_do_normalize" in inspect.signature(engine_args_type).parameters:
+            vllm_kwargs.setdefault("mm_device_do_normalize", False)
         checkpoint_engine_config = checkpoint_engine_refit_config(self.cfg)
         if checkpoint_engine_config is not None:
             from nemo_rl.models.generation.vllm.checkpoint_engine import (
