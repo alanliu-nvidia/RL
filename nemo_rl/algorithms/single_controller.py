@@ -433,6 +433,9 @@ class SingleControllerActor:
             < self._algo_cfg.num_prompts_per_step
         )
         self._value_dedicated: bool = dedicated_value_enabled(master_config)
+        self._stream_value_training: bool = (
+            self._is_ppo and self._algo_cfg.stream_value_training
+        )
         # GRPO has no epoch knob: it makes one optimizer step per RL step.
         self._ppo_epochs: int = self._algo_cfg.ppo_epochs if self._is_ppo else 1
         self._critic_ppo_epochs: int = (
@@ -2958,6 +2961,30 @@ class SingleControllerActor:
         }
 
     async def _train_pump(self) -> None:
+        try:
+            await self._train_pump_impl()
+        except BaseException:
+            if getattr(self, "_stream_value_training", False):
+                try:
+                    value_chunk_task = getattr(self, "_value_chunk_task", None)
+                    if value_chunk_task is not None:
+                        try:
+                            await value_chunk_task
+                        except Exception:
+                            log.exception("Streamed value chunk failed before cleanup")
+                    await self._ppo_worker_call(self._value.abort_train_step)
+                    await self._ppo_worker_call(
+                        self._value.finish_training, keep_resident=True
+                    )
+                except Exception:
+                    log.exception("Failed to clean up streamed value train step")
+                try:
+                    await self._ppo_worker_call(self._trainer.abort_train_step)
+                except Exception:
+                    log.exception("Failed to clean up streamed policy train step")
+            raise
+
+    async def _train_pump_impl(self) -> None:
         """Per-prompt-group streaming train loop.
 
         Per step, with 1-4 running per streaming chunk and 5-6 once the chunk
@@ -3013,6 +3040,7 @@ class SingleControllerActor:
             evicted_stale_prompt_groups = 0
             min_sample_version = None
             step_open = False
+            value_step_open = False
             value_inference_prepared = False
             chunks_dispatched = 0
             calibration_batches: list[BatchedDataDict[Any]] = []
@@ -3263,6 +3291,7 @@ class SingleControllerActor:
                             train_meta = await self._value_stage(
                                 train_meta,
                                 already_prepared=value_inference_prepared,
+                                preserve_train_step=value_step_open,
                             )
                         value_inference_prepared = False
                         if step_open:
@@ -3353,6 +3382,14 @@ class SingleControllerActor:
                     # policy resident until every actor epoch has completed.
                     # TODO(#2625): value_result, policy_result only record the last epoch's metrics.
                     # That matches ppo.py for the losses; total_flops is additive and undercounted.
+                    value_chunk_task = None
+                    if getattr(self, "_stream_value_training", False):
+                        value_chunk_task = asyncio.create_task(
+                            self._stream_value_chunk(
+                                train_meta, first_chunk=not value_step_open
+                            )
+                        )
+                        self._value_chunk_task = value_chunk_task
                     if is_policy_training_step:
                         if (
                             self._is_ppo
@@ -3376,7 +3413,9 @@ class SingleControllerActor:
                                 tracer=self._tracer,
                             ),
                         ):
-                            await asyncio.to_thread(self._trainer.prepare_for_training)
+                            await self._ppo_worker_call(
+                                self._trainer.prepare_for_training
+                            )
                         if has_valid_training_tokens:
                             for epoch in range(self._ppo_epochs):
                                 with (
@@ -3389,12 +3428,12 @@ class SingleControllerActor:
                                     ),
                                 ):
                                     if not step_open:
-                                        await asyncio.to_thread(
+                                        await self._ppo_worker_call(
                                             self._trainer.begin_train_step,
                                             self._loss_fn,
                                         )
                                         step_open = True
-                                    await asyncio.to_thread(
+                                    await self._ppo_worker_call(
                                         self._trainer.train_microbatches_from_meta,
                                         train_meta,
                                         train_fields=self._train_fields,
@@ -3402,10 +3441,25 @@ class SingleControllerActor:
                                     if self._is_ppo and not self._streaming_ppo:
                                         async with self._checkpoint_save_lock:
                                             self._optimizer_commit_in_progress = True
-                                        policy_result = await asyncio.to_thread(
+                                        policy_result = await self._ppo_worker_call(
                                             self._trainer.finish_train_step
                                         )
                                         step_open = False
+
+                    if value_chunk_task is not None:
+                        try:
+                            await asyncio.shield(value_chunk_task)
+                        except BaseException:
+                            if not value_chunk_task.done():
+                                try:
+                                    await value_chunk_task
+                                except Exception:
+                                    log.exception(
+                                        "Streamed value chunk failed during cleanup"
+                                    )
+                            raise
+                        value_step_open = True
+                        self._value_chunk_task = None
 
                     if train_meta.sequence_lengths:
                         self._step_log_dict["sequence_lengths"].extend(
@@ -3496,6 +3550,8 @@ class SingleControllerActor:
                             resident_kwargs = (
                                 {"keep_resident": True} if self._value_dedicated else {}
                             )
+                            if value_step_open:
+                                resident_kwargs["preserve_train_step"] = True
                             await self._ppo_worker_call(
                                 self._value.prepare_for_inference, **resident_kwargs
                             )
@@ -3520,6 +3576,8 @@ class SingleControllerActor:
                         resident_kwargs = (
                             {"keep_resident": True} if self._value_dedicated else {}
                         )
+                        if value_step_open:
+                            resident_kwargs["preserve_train_step"] = True
                         await self._ppo_worker_call(
                             self._value.finish_inference, **resident_kwargs
                         )
@@ -3560,7 +3618,7 @@ class SingleControllerActor:
                                 tracer=self._tracer,
                             ),
                         ):
-                            policy_result = await asyncio.to_thread(
+                            policy_result = await self._ppo_worker_call(
                                 self._trainer.finish_train_step
                             )
                         step_open = False
@@ -3623,10 +3681,24 @@ class SingleControllerActor:
                             **{"rl.critic_epochs": self._critic_ppo_epochs},
                         ),
                     ):
-                        value_result = await self._value_train_epochs(
-                            value_train_metas,
-                            num_epochs=self._critic_ppo_epochs,
-                        )
+                        if value_step_open:
+                            value_result = await self._ppo_worker_call(
+                                self._value.finish_train_step
+                            )
+                            value_step_open = False
+                            await self._ppo_worker_call(
+                                self._value.finish_training, keep_resident=True
+                            )
+                            if self._critic_ppo_epochs > 1:
+                                value_result = await self._value_train_epochs(
+                                    value_train_metas,
+                                    num_epochs=self._critic_ppo_epochs - 1,
+                                )
+                        else:
+                            value_result = await self._value_train_epochs(
+                                value_train_metas,
+                                num_epochs=self._critic_ppo_epochs,
+                            )
                 else:
                     if not step_open:
                         raise RuntimeError(
@@ -5660,7 +5732,11 @@ class SingleControllerActor:
         return aborted_stale_inflight_groups
 
     async def _value_stage(
-        self, meta: KVBatchMeta, *, already_prepared: bool = False
+        self,
+        meta: KVBatchMeta,
+        *,
+        already_prepared: bool = False,
+        preserve_train_step: bool = False,
     ) -> KVBatchMeta:
         """Run the PPO value model's forward pass over the selected chunk.
 
@@ -5679,6 +5755,8 @@ class SingleControllerActor:
             The batch metadata with the ``values`` column recorded on it.
         """
         resident_kwargs = {"keep_resident": True} if self._value_dedicated else {}
+        if preserve_train_step:
+            resident_kwargs["preserve_train_step"] = True
         if not already_prepared:
             await self._ppo_worker_call(
                 self._value.prepare_for_inference, **resident_kwargs
@@ -5688,6 +5766,19 @@ class SingleControllerActor:
         finally:
             await self._ppo_worker_call(self._value.finish_inference, **resident_kwargs)
         return meta.with_fields([self._advantage_cfg.values_field])
+
+    async def _stream_value_chunk(
+        self, meta: KVBatchMeta, *, first_chunk: bool
+    ) -> None:
+        with self._timer.time("value_training_streamed"):
+            if first_chunk:
+                await self._ppo_worker_call(
+                    self._value.prepare_for_training, keep_resident=True
+                )
+                await self._ppo_worker_call(
+                    self._value.begin_train_step, self._value_loss_fn
+                )
+            await self._ppo_worker_call(self._value.train_microbatches_from_meta, meta)
 
     async def _ppo_worker_call(
         self, function: Callable[..., Any], *args: Any, **kwargs: Any
