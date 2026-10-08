@@ -1,0 +1,9 @@
+defaults: generalist_32n_mxfp8_gtp1.yaml
+logger:
+  log_dir: logs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/generalist_32n_mxfp8_muon_padded
+  wandb:
+    name: nm4-ci-generalist_32n_mxfp8_muon_padded-${oc.env:NM4_CI_RUN_TAG}
+  tensorboard:
+    log_dir: logs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/generalist_32n_mxfp8_muon_padded
+checkpointing:
+  checkpoint_dir: /data/nemorl-runs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/generalist_32n_mxfp8_muon_padded

@@ -1,0 +1,12 @@
+defaults: generalist_16n_mxfp8_hybridep.yaml
+policy:
+  megatron_cfg:
+    moe_token_dispatcher_type: alltoall
+logger:
+  log_dir: logs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/generalist_16n_mxfp8_alltoall
+  wandb:
+    name: nm4-ci-generalist_16n_mxfp8_alltoall-${oc.env:NM4_CI_RUN_TAG}
+  tensorboard:
+    log_dir: logs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/generalist_16n_mxfp8_alltoall
+checkpointing:
+  checkpoint_dir: /data/nemorl-runs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/generalist_16n_mxfp8_alltoall

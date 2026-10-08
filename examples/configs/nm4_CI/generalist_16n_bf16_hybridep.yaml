@@ -1,0 +1,23 @@
+defaults: generalist_16n_mxfp8_hybridep.yaml
+policy:
+  megatron_cfg:
+    te_precision_config_file: examples/configs/nm4_CI/bf16_precision.yaml
+    fp8_cfg:
+      enabled: false
+      fp8_param: false
+    model_overrides:
+      fp8: null
+      fp8_recipe: null
+      fp8_param: false
+      fp8_quantizer_factory: null
+      quant_recipe: null
+      moe_router_padding_for_quantization: false
+      moe_router_padding_for_fp8: false
+logger:
+  log_dir: logs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/generalist_16n_bf16_hybridep
+  wandb:
+    name: nm4-ci-generalist_16n_bf16_hybridep-${oc.env:NM4_CI_RUN_TAG}
+  tensorboard:
+    log_dir: logs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/generalist_16n_bf16_hybridep
+checkpointing:
+  checkpoint_dir: /data/nemorl-runs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/generalist_16n_bf16_hybridep

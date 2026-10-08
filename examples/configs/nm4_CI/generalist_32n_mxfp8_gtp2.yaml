@@ -1,0 +1,14 @@
+defaults: generalist_32n_mxfp8_gtp1.yaml
+policy:
+  megatron_cfg:
+    model_overrides:
+      gtp_weight_remat_size: 2
+      expert_gtp_weight_remat_size: 1
+logger:
+  log_dir: logs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/generalist_32n_mxfp8_gtp2
+  wandb:
+    name: nm4-ci-generalist_32n_mxfp8_gtp2-${oc.env:NM4_CI_RUN_TAG}
+  tensorboard:
+    log_dir: logs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/generalist_32n_mxfp8_gtp2
+checkpointing:
+  checkpoint_dir: /data/nemorl-runs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/generalist_32n_mxfp8_gtp2

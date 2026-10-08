@@ -1,0 +1,38 @@
+defaults: ../sft_v2_tests/nm4_generalist_16n_mxfp8_cp64ep64_gbs1.yaml
+sft:
+  max_num_steps: 20
+  max_consecutive_step_failures: 0
+  seed: 42
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+checkpointing:
+  enabled: false
+  save_optimizer: true
+  save_period: 10
+  keep_top_k: 2
+  checkpoint_must_save_by: null
+  pretrained_checkpoint:
+    path: /data/models/nm4_nano_bridge
+    format: megatron_bridge
+policy:
+  megatron_cfg:
+    train_iters: ${sft.max_num_steps}
+    use_layer_wise_param_layout: true
+    optimizer:
+      optimizer: muon
+      use_distributed_optimizer: true
+      use_layer_wise_distributed_optimizer: true
+    checkpoint:
+      async_save: false
+    model_overrides:
+      gtp_weight_remat_size: 1
+      expert_gtp_weight_remat_size: 1
+    te_precision_config_file: examples/configs/sft_v2_tests/nm4_mxfp8_tp4_precision.yaml
+cluster:
+  num_nodes: 16
+  gpus_per_node: 4
+  segment_size: 16
+logger:
+  wandb:
+    project: rohit-sft_v2_up_n4

@@ -1,0 +1,9 @@
+defaults: generalist_16n_mxfp8_hybridep.yaml
+logger:
+  log_dir: logs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/checkpoint_16n_uninterrupted
+  wandb:
+    name: nm4-ci-checkpoint_16n_uninterrupted-${oc.env:NM4_CI_RUN_TAG}
+  tensorboard:
+    log_dir: logs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/checkpoint_16n_uninterrupted
+checkpointing:
+  checkpoint_dir: /data/nemorl-runs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/checkpoint_16n_uninterrupted

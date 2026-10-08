@@ -1,0 +1,12 @@
+defaults: generalist_16n_mxfp8_hybridep.yaml
+sft:
+  max_num_steps: 10
+checkpointing:
+  enabled: true
+  checkpoint_dir: /data/nemorl-runs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/checkpoint-16n-split
+logger:
+  log_dir: logs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/checkpoint_16n_save10
+  wandb:
+    name: nm4-ci-checkpoint_16n_save10-${oc.env:NM4_CI_RUN_TAG}
+  tensorboard:
+    log_dir: logs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/checkpoint_16n_save10

@@ -1,0 +1,13 @@
+defaults: _generalist_common.yaml
+cluster:
+  num_nodes: 32
+policy:
+  train_global_batch_size: 2
+logger:
+  log_dir: logs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/generalist_32n_mxfp8_gtp1
+  wandb:
+    name: nm4-ci-generalist_32n_mxfp8_gtp1-${oc.env:NM4_CI_RUN_TAG}
+  tensorboard:
+    log_dir: logs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/generalist_32n_mxfp8_gtp1
+checkpointing:
+  checkpoint_dir: /data/nemorl-runs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/generalist_32n_mxfp8_gtp1

@@ -1,0 +1,47 @@
+defaults: _generalist_common.yaml
+policy:
+  train_global_batch_size: 4
+  max_total_sequence_length: 2048
+  megatron_cfg:
+    context_parallel_size: 1
+    expert_model_parallel_size: 4
+    freeze_vision_encoder: true
+cluster:
+  num_nodes: 1
+  segment_size: 1
+data:
+  _override_: true
+  backend: energon
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  add_bos: false
+  add_eos: false
+  add_generation_prompt: false
+  shuffle: true
+  num_workers: 0
+  energon:
+    num_workers: 1
+    prefetch_factor: 2
+    cache_pool_num_workers: 4
+    gc_collect_every_n_steps: 100000
+    model_family: nemotron
+    max_samples_per_sequence: 16
+    processor_adapter: hf_multimodal
+    topology_mapper: default
+    task_encoder:
+      name: generic_sft
+      options: {}
+      packing:
+        name: balanced_greedy_knapsack
+        buffer_size: 64
+        options:
+          max_sequence_length: ${policy.max_total_sequence_length}
+          sequence_length_pad_multiple: 64
+          balanced_knapsack_delta: 5
+    cookers:
+    - name: generic_conversation
+      options: {}
+  train:
+    path: /data/nemorl-datasets/clevr
+    split: train
+    virtual_epoch_length: 4375
+  validation: null

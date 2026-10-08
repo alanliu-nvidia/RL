@@ -1,0 +1,134 @@
+{
+  "wandb_path": "nvidia/rohit-sft_v2_up_n4/0ge5vk10",
+  "wandb_url": "https://wandb.ai/nvidia/rohit-sft_v2_up_n4/runs/0ge5vk10",
+  "name": "nm4-generalist-16n-bf16-cp64ep64-gbs1-20261001T210315Z",
+  "checkpoint": {
+    "format": "megatron_bridge",
+    "path": "/data/models/nm4_nano_bridge"
+  },
+  "data": {
+    "add_bos": false,
+    "add_eos": false,
+    "add_generation_prompt": false,
+    "backend": "energon",
+    "energon": {
+      "batch_grouping": "auto",
+      "cache_pool_max_gbytes": null,
+      "cache_pool_num_workers": 2,
+      "checkpoint_every_sec": 60,
+      "cookers": [
+        {
+          "name": "nemotron4_conversation",
+          "options": {},
+          "has_subflavors": {
+            "cook": "conversation"
+          }
+        },
+        {
+          "name": "nemotron4_general_conversations_jsonl",
+          "options": {},
+          "has_subflavors": {
+            "cook": "general_conversations_jsonl"
+          }
+        },
+        {
+          "name": "nemotron4_general_conversations_webdataset",
+          "options": {},
+          "has_subflavors": {
+            "cook": "general_conversations_webdataset"
+          }
+        },
+        {
+          "name": "nemotron4_nano_openai_messages_jsonl",
+          "options": {},
+          "has_subflavors": {
+            "cook": "openai_messages_jsonl"
+          }
+        }
+      ],
+      "gc_collect_every_n_steps": 100000,
+      "max_samples_per_sequence": 16,
+      "model_family": "nemotron",
+      "num_workers": 2,
+      "nvdataset_cache_dir": "/lustre/fsw/portfolios/nemotron/projects/nemotron_common_data/dss_cache",
+      "packing_buffer_size": null,
+      "prefetch_factor": 2,
+      "processor_adapter": "hf_multimodal",
+      "seed_offset": 0,
+      "shuffle_buffer_size": 1000,
+      "task_encoder": {
+        "name": "nemotron4_multimodal",
+        "options": {
+          "allow_large_videos": true,
+          "audio_clip_duration_seconds": 30,
+          "audio_num_mel_bins": 128,
+          "audio_subsampling_factor": null,
+          "max_audio_duration_seconds": 1800,
+          "min_audio_duration_seconds": 0.1,
+          "packing_sequence_length": null,
+          "patch_dim": 14,
+          "prompt_format": "nemotron6-moe",
+          "relax_thinking_trace_check": false,
+          "temporal_patch_size": 1,
+          "thinking_trace_format": "ultra",
+          "tiling_augment_prob": 0.4,
+          "video_aug_scale_frames_up": 4,
+          "video_aug_scale_resolution_only": true,
+          "video_aug_scale_resolution_up": null,
+          "video_decode_thread_count": 8,
+          "video_default_fps": 2,
+          "video_frame_temporal_jitter": false,
+          "video_max_num_frames": 64,
+          "video_min_num_frames": 8
+        },
+        "packing": {
+          "buffer_size": 5000,
+          "name": "balanced_greedy_knapsack",
+          "options": {
+            "balanced_knapsack_delta": 5,
+            "max_sequence_length": 524288,
+            "max_sequences_per_bin": null,
+            "sequence_length_pad_multiple": 128
+          }
+        }
+      },
+      "topology_mapper": "default",
+      "watchdog_timeout_seconds": 1200
+    },
+    "max_input_seq_length": 524288,
+    "num_workers": 0,
+    "shuffle": true,
+    "train": {
+      "limit": null,
+      "path": "/lustre/fsw/portfolios/nemotron/projects/nemotron_n4_post/sft-data/full_generalist/sft_from_super35_dualds_4k_1of8_recover_iter366_radio_v4_h_full_generalist_aga.yaml",
+      "split": "train",
+      "virtual_epoch_length": 10000000
+    },
+    "validation": null
+  },
+  "seed": 42,
+  "historical_dispatcher": "alltoall",
+  "historical_max_steps": 500,
+  "losses": {
+    "1": 0.9013324333014934,
+    "2": 0.9377620166094842,
+    "3": 1.1728838369302763,
+    "4": 1.662651881520811,
+    "5": 0.9678384694757592,
+    "6": 1.3755221494587926,
+    "7": 1.6557499762562922,
+    "8": 1.3326129148025505,
+    "9": 1.538970627302352,
+    "10": 0.9312263168503091,
+    "11": 0.9603021263259972,
+    "12": 0.982038310116044,
+    "13": 0.9056032725807837,
+    "14": 0.7138433567241098,
+    "15": 1.1082145348754853,
+    "16": 0.8046713471054013,
+    "17": 1.2284047153165585,
+    "18": 0.7831423196574524,
+    "19": 1.313475762300134,
+    "20": 1.0587107679686674
+  }
+}

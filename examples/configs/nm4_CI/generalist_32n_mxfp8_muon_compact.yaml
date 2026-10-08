@@ -1,0 +1,15 @@
+defaults: generalist_32n_mxfp8_gtp1.yaml
+policy:
+  megatron_cfg:
+    use_layer_wise_param_layout: false
+    optimizer:
+      use_distributed_optimizer: false
+      use_layer_wise_distributed_optimizer: true
+logger:
+  log_dir: logs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/generalist_32n_mxfp8_muon_compact
+  wandb:
+    name: nm4-ci-generalist_32n_mxfp8_muon_compact-${oc.env:NM4_CI_RUN_TAG}
+  tensorboard:
+    log_dir: logs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/generalist_32n_mxfp8_muon_compact
+checkpointing:
+  checkpoint_dir: /data/nemorl-runs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/generalist_32n_mxfp8_muon_compact
