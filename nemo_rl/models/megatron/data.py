@@ -292,6 +292,15 @@ def get_microbatch_iterator(
         pad_factor = _get_non_packed_sequence_pad_factor(cfg)
 
     if prepacked:
+        (
+            pad_factor,
+            pad_packed_seq_to_multiple_of,
+            pad_full_seq_to,
+        ) = _get_pack_sequence_parameters_for_megatron(
+            cfg["megatron_cfg"],
+            cfg["make_sequence_length_divisible_by"],
+            seq_dim_size,
+        )
         create_packed_seq_padding_mask = bool(
             cfg["megatron_cfg"].get("moe_router_enable_expert_bias", False)
             or cfg["sequence_packing"].get("mask_padding_from_moe", False)
@@ -414,6 +423,8 @@ def _prepare_prepacked(
     model_slices_context_parallel_inputs: bool,
     create_padding_mask: bool = False,
     mtp_enabled: bool = False,
+    pad_packed_seq_to_multiple_of: int = 1,
+    pad_packed_seq_to: Optional[int] = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -440,6 +451,22 @@ def _prepare_prepacked(
         or bool((source_lengths > padded_lengths).any())
     ):
         raise ValueError("Invalid prepacked source boundaries.")
+    cp_size = get_context_parallel_world_size()
+    if cp_size > 1 and bool((padded_lengths % (2 * cp_size) != 0).any()):
+        raise ValueError(
+            "Every prepacked padded source length must be divisible by 2 * "
+            f"context_parallel_size ({2 * cp_size})."
+        )
+    aligned_pack_length = _round_up_to_multiple(
+        max(pack_length, pad_packed_seq_to or 0), pad_packed_seq_to_multiple_of
+    )
+    tail_padding = aligned_pack_length - pack_length
+    if tail_padding:
+        # Extend the final source's physical boundary; logical lengths stay intact.
+        padded = padded.clone()
+        padded[-1] = aligned_pack_length
+        padded_lengths = padded[1:] - padded[:-1]
+        data["cu_seqlens_padded"] = padded.unsqueeze(0)
     batch_size, sequence_length = input_ids.shape[:2]
     for key, value in list(data.items()):
         if (
@@ -450,14 +477,13 @@ def _prepare_prepacked(
             or value.shape[1] != sequence_length
         ):
             continue
-        data[key] = value[:, :pack_length].contiguous()
+        value = value[:, :pack_length]
+        if tail_padding:
+            pad_shape = (batch_size, tail_padding, *value.shape[2:])
+            value = torch.cat((value, value.new_zeros(pad_shape)), dim=1)
+        data[key] = value.contiguous()
+    pack_length = aligned_pack_length
     input_ids = data["input_ids"]
-    cp_size = get_context_parallel_world_size()
-    if cp_size > 1 and bool((padded_lengths % (2 * cp_size) != 0).any()):
-        raise ValueError(
-            "Every prepacked padded source length must be divisible by 2 * "
-            f"context_parallel_size ({2 * cp_size})."
-        )
     local_input_ids = _slice_prepacked_for_cp(input_ids, padded)
     input_ids_cp_sharded = (
         input_ids if model_slices_context_parallel_inputs else local_input_ids
@@ -601,6 +627,8 @@ def process_microbatch(
                     ),
                     create_padding_mask=create_packed_seq_padding_mask,
                     mtp_enabled=mtp_enabled,
+                    pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
+                    pad_packed_seq_to=pad_full_seq_to,
                 )
                 original_seq_length = input_ids.shape[1]
                 routed_experts = data_dict.get("routed_experts")

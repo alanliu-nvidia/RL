@@ -1584,7 +1584,13 @@ class TestGetMicrobatchIterator:
         cfg = {
             "dynamic_batching": {"enabled": False},
             "sequence_packing": {"enabled": True, "fuse_loss": True},
-            "megatron_cfg": {"moe_router_enable_expert_bias": True},
+            "megatron_cfg": {
+                "moe_router_enable_expert_bias": True,
+                "context_parallel_size": 1,
+                "tensor_model_parallel_size": 1,
+                "pipeline_model_parallel_size": 1,
+                "sequence_parallel": False,
+            },
             "make_sequence_length_divisible_by": 1,
         }
 
@@ -2321,3 +2327,125 @@ def test_get_pack_sequence_parameters_for_megatron(get_pack_sequence_parameters_
         # Check that all workers succeeded
         for i, result in enumerate(results):
             assert result["success"], f"Worker {i} failed: {result['error']}"
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("hybridep", [False, True])
+@pytest.mark.parametrize("cp_rank", [0, 1, 63])
+@pytest.mark.parametrize("model_slices_cp", [False, True])
+def test_prepacked_fp8_tail_alignment_preserves_masks_and_boundaries(
+    hybridep: bool, cp_rank: int, model_slices_cp: bool
+) -> None:
+    from nemo_rl.models.megatron.data import (
+        _get_pack_sequence_parameters_for_megatron,
+        process_microbatch,
+    )
+
+    pack_length = 457_088
+    cfg = {
+        "context_parallel_size": 64,
+        "tensor_model_parallel_size": 1,
+        "pipeline_model_parallel_size": 1,
+        "sequence_parallel": False,
+        "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+        "moe_token_dispatcher_type": "flex" if hybridep else "alltoall",
+        "moe_flex_dispatcher_backend": "hybridep",
+    }
+    _, alignment, _ = _get_pack_sequence_parameters_for_megatron(cfg, 128, pack_length)
+    assert alignment == (16_384 if hybridep else 4_096)
+    tokens = torch.arange(pack_length).unsqueeze(0)
+    mask = torch.ones_like(tokens, dtype=torch.float32)
+    data = BatchedDataDict(
+        {
+            "input_ids": tokens.clone(),
+            "input_lengths": torch.tensor([pack_length]),
+            "token_mask": mask.clone(),
+            "mtp_loss_mask": mask.clone(),
+            "answer_token_mask": mask.bool(),
+            "media_token_validity_mask": mask.bool(),
+            "sample_mask": torch.tensor([1.0]),
+            "cu_seqlens": [torch.tensor([0, 125, pack_length - 5], dtype=torch.int32)],
+            "cu_seqlens_padded": [
+                torch.tensor([0, 128, pack_length], dtype=torch.int32)
+            ],
+        }
+    )
+    with (
+        patch(
+            "nemo_rl.models.megatron.data.get_context_parallel_world_size",
+            return_value=64,
+        ),
+        patch(
+            "nemo_rl.models.megatron.data.get_context_parallel_rank",
+            return_value=cp_rank,
+        ),
+    ):
+        result = process_microbatch(
+            data,
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+            pad_packed_seq_to_multiple_of=alignment,
+            create_packed_seq_padding_mask=True,
+            mtp_enabled=True,
+            model_slices_context_parallel_inputs=model_slices_cp,
+        )
+
+    expected_length = 458_752
+    assert result.input_ids.shape == (1, expected_length)
+    assert torch.equal(result.input_ids[:, :pack_length], tokens)
+    for key in [
+        "input_ids",
+        "token_mask",
+        "mtp_loss_mask",
+        "answer_token_mask",
+        "media_token_validity_mask",
+    ]:
+        assert data[key].shape == (1, expected_length)
+        assert not data[key][:, pack_length:].any()
+    assert data["token_mask"].sum() == mask.sum()
+    assert torch.equal(data["cu_seqlens"][0], torch.tensor([0, 125, pack_length - 5]))
+    assert torch.equal(
+        result.cu_seqlens_padded, torch.tensor([0, 128, expected_length])
+    )
+    assert torch.equal(data["cu_seqlens_padded"][0], result.cu_seqlens_padded)
+    expected_local_length = (
+        expected_length if model_slices_cp else expected_length // 64
+    )
+    assert result.input_ids_cp_sharded.shape == (1, expected_local_length)
+    assert result.mtp_loss_mask.shape == (1, expected_local_length)
+    assert result.padding_mask.shape == (1, expected_local_length)
+    assert result.position_ids.shape == (1, expected_local_length)
+    assert result.packed_seq_params.max_seqlen_q == expected_length - 128
+    assert result.packed_seq_params.total_tokens == expected_local_length
+    assert (expected_length // 64) % 32 == 0
+
+
+@pytest.mark.mcore
+def test_prepacked_iterator_forwards_fp8_alignment() -> None:
+    from nemo_rl.models.megatron.data import get_microbatch_iterator
+
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.zeros(1, 384, dtype=torch.long),
+            "input_lengths": torch.tensor([384]),
+            "cu_seqlens": [torch.tensor([0, 383], dtype=torch.int32)],
+            "cu_seqlens_padded": [torch.tensor([0, 384], dtype=torch.int32)],
+        }
+    )
+    cfg = {
+        "dynamic_batching": {"enabled": False},
+        "sequence_packing": {"enabled": True, "fuse_loss": True},
+        "make_sequence_length_divisible_by": 128,
+        "megatron_cfg": {
+            "context_parallel_size": 64,
+            "tensor_model_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "sequence_parallel": False,
+            "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+        },
+    }
+    with patch(
+        "nemo_rl.models.megatron.data.make_processed_microbatch_iterator"
+    ) as make:
+        get_microbatch_iterator(data, cfg, 1, MagicMock())
+    assert make.call_args.kwargs["pad_packed_seq_to_multiple_of"] == 4096

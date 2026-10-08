@@ -20,6 +20,11 @@ import pytest
 
 pytest.importorskip("megatron.energon")
 
+from megatron.energon.errors import ErrorContext, FatalSampleError
+
+from nemo_rl.data.energon.multimodal.task_encoders.nemotron4_multimodal import (
+    Nemotron4MultiModalTaskEncoder,
+)
 from nemo_rl.data.energon.multimodal.task_encoders.nemotron4_visual import (
     _NemotronVisualProcessorAdapter,
 )
@@ -100,3 +105,38 @@ def test_normal_image_budget_keeps_expected_grid(
 
     assert plans[0].patch_sizes == ((12, 4),)
     assert plans[0].num_embeddings == 12
+
+
+def test_nm4_sample_errors_are_skipped_without_consecutive_limit() -> None:
+    logged_errors: list[Exception] = []
+
+    def log_error(exception: Exception, sample: object, sources: object) -> None:
+        logged_errors.append(exception)
+
+    context = ErrorContext(
+        name="nm4.cook",
+        handler=log_error,
+        tolerance=Nemotron4MultiModalTaskEncoder.__default_failure_tolerance__,
+    )
+    for _ in range(101):
+        with context.handle_errors({"__key__": "empty-conversation"}):
+            raise ValueError(
+                "Nemotron fragment conversations require a non-empty list."
+            )
+    assert len(logged_errors) == 101
+    with context.handle_errors({"__key__": "valid"}):
+        pass
+
+
+def test_nm4_system_errors_remain_fatal() -> None:
+    def log_error(exception: Exception, sample: object, sources: object) -> None:
+        pytest.fail("System errors must bypass the sample-error handler.")
+
+    context = ErrorContext(
+        name="nm4.cook",
+        handler=log_error,
+        tolerance=Nemotron4MultiModalTaskEncoder.__default_failure_tolerance__,
+    )
+    with pytest.raises(FatalSampleError, match="system exception"):
+        with context.handle_errors({"__key__": "sample"}):
+            raise ImportError("Missing runtime dependency")

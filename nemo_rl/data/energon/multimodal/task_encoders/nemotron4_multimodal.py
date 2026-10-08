@@ -890,6 +890,9 @@ class Nemotron4MultiModalProcessorAdapter(_NemotronVisualProcessorAdapter):
 class Nemotron4MultiModalTaskEncoder(GenericSFTTaskEncoder):
     """Run the reference Nemotron image, video, and optional audio lifecycle."""
 
+    # Skip malformed samples without a consecutive-failure limit.
+    __default_failure_tolerance__ = 0
+
     # Keep WebDataset payloads lazy until postencode selects the sample.
     decoder = None
 

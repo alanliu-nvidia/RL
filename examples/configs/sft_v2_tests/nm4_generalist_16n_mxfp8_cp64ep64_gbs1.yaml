@@ -27,7 +27,7 @@ policy:
     chat_template_kwargs: null
   train_global_batch_size: 1
   train_micro_batch_size: 1
-  max_total_sequence_length: 524288
+  max_total_sequence_length: 131072
   precision: bfloat16
   logprob_chunk_size: 32
   offload_optimizer_for_logprob: false
@@ -333,7 +333,7 @@ data:
     watchdog_timeout_seconds: 1200
     seed_offset: 0
   train:
-    path: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_post/sft-data/full_generalist/sft_from_super35_dualds_4k_1of8_recover_iter366_radio_v4_h_full_generalist_aga.yaml
+    path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/rohitkumarj/code/RL/nemo-rl-sft_v2_upstream/examples/configs/sft_v2_tests/sft_super35_generalist_full_cmh.yaml
     split: train
     virtual_epoch_length: 10000000
   validation: null
