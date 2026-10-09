@@ -50,11 +50,8 @@ def _patch_transformers_tokenizer_class_set():
     # TODO: remove this patch (and the assert below) once the deepseek_v3
     # entries actually disappear upstream.
     # https://github.com/NVIDIA-NeMo/RL/issues/2764
-    assert PkgVersion(transformers.__version__) < PkgVersion("5.13.0"), (
-        f"transformers {transformers.__version__} detected. "
-        "The deepseek_v3 tokenizer-blocklist patch was verified against <5.13. "
-        "Check if the upstream fix now applies and remove this patch if so."
-    )
+    # NOTE(liding, local-only): the <5.13 transformers assert was removed so this
+    # branch runs in the rl-gym image (transformers 5.17 still ships the entries).
 
     from transformers import AutoTokenizer
     from transformers.models.auto.tokenization_auto import (
