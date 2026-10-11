@@ -275,3 +275,218 @@ def test_conversion_requires_all_metadata_referenced_shards(
     else:
         (iteration / "__0_0.distcp").write_bytes(b"")
     assert not module.megatron_conversion_is_complete(str(tmp_path))
+
+
+def _gtp_provider(**fields):
+    provider = SimpleNamespace(
+        tensor_model_parallel_size=1,
+        expert_tensor_parallel_size=1,
+        tensor_parallel_num_weight_shards=1,
+        expert_tensor_parallel_num_weight_shards=1,
+        gtp_weight_remat_size=1,
+        expert_gtp_weight_remat_size=1,
+    )
+    for key, value in fields.items():
+        setattr(provider, key, value)
+    return provider
+
+
+def test_apply_gtp_weight_sharding_sets_shards_from_parallel_size(monkeypatch):
+    module = _load_community_import_module(monkeypatch)
+    provider = _gtp_provider(expert_tensor_parallel_size=2)
+
+    module._apply_gtp_weight_sharding(
+        provider,
+        {
+            "model_overrides": {
+                "gtp_weight_remat_size": 1,
+                "expert_gtp_weight_remat_size": 4,
+            }
+        },
+    )
+
+    # shards = parallel size x GTP on each axis; the GTP fields follow.
+    assert provider.tensor_parallel_num_weight_shards == 1
+    assert provider.gtp_weight_remat_size == 1
+    assert provider.expert_tensor_parallel_num_weight_shards == 8
+    assert provider.expert_gtp_weight_remat_size == 4
+
+
+def test_apply_gtp_weight_sharding_ignores_absent_overrides(monkeypatch):
+    module = _load_community_import_module(monkeypatch)
+    provider = _gtp_provider()
+
+    module._apply_gtp_weight_sharding(provider, {})
+    module._apply_gtp_weight_sharding(provider, {"model_overrides": None})
+
+    assert provider.expert_tensor_parallel_num_weight_shards == 1
+    assert provider.expert_gtp_weight_remat_size == 1
+
+
+@pytest.mark.parametrize("bad", [0, -1, "4", 2.0])
+def test_apply_gtp_weight_sharding_rejects_invalid_sizes(monkeypatch, bad):
+    module = _load_community_import_module(monkeypatch)
+    with pytest.raises(ValueError, match="positive integer"):
+        module._apply_gtp_weight_sharding(
+            _gtp_provider(), {"model_overrides": {"expert_gtp_weight_remat_size": bad}}
+        )
+
+
+def test_apply_gtp_weight_sharding_requires_provider_support_above_one(monkeypatch):
+    module = _load_community_import_module(monkeypatch)
+    plain = SimpleNamespace(tensor_model_parallel_size=1, expert_tensor_parallel_size=1)
+
+    # GTP 1 is the default layout and needs no provider field.
+    module._apply_gtp_weight_sharding(
+        plain, {"model_overrides": {"expert_gtp_weight_remat_size": 1}}
+    )
+    with pytest.raises(ValueError, match="does not support GTP weight sharding"):
+        module._apply_gtp_weight_sharding(
+            plain, {"model_overrides": {"expert_gtp_weight_remat_size": 4}}
+        )
+
+
+def test_import_model_from_hf_name_forwards_gtp_and_cp_from_megatron_config(
+    monkeypatch, tmp_path
+):
+    module = _load_community_import_module(monkeypatch)
+    _install_runtime_stubs_for_hf_import(monkeypatch)
+    monkeypatch.setitem(
+        sys.modules, "megatron.core.dist_checkpointing.strategies.torch", None
+    )
+
+    class FakeProvider:
+        def __init__(self):
+            self.tensor_model_parallel_size = 1
+            self.pipeline_model_parallel_size = 1
+            self.context_parallel_size = 1
+            self.expert_model_parallel_size = 1
+            self.expert_tensor_parallel_size = 1
+            self.tensor_parallel_num_weight_shards = 1
+            self.expert_tensor_parallel_num_weight_shards = 1
+            self.gtp_weight_remat_size = 1
+            self.expert_gtp_weight_remat_size = 1
+            self.num_layers_in_first_pipeline_stage = None
+            self.num_layers_in_last_pipeline_stage = None
+            self.pipeline_dtype = "fp32"
+            self.linear_cp_mode = "headwise"
+            self.linear_cp_layout = "zigzag"
+            self.attention_cp_layout = "zigzag"
+            self.fp8 = None
+            self.fp8_param = False
+            self.finalized_with = None
+
+        def finalize(self):
+            # The trainer-facing layout must be set before finalize derives GTP.
+            self.finalized_with = (
+                self.expert_tensor_parallel_num_weight_shards,
+                self.expert_gtp_weight_remat_size,
+                self.context_parallel_size,
+                self.linear_cp_mode,
+                self.linear_cp_layout,
+                self.attention_cp_layout,
+            )
+
+        def initialize_model_parallel(self, seed):
+            pass
+
+        def provide_distributed_model(self, wrap_with_ddp, post_wrap_hook):
+            assert self.linear_cp_mode == "chunkwise"
+            assert self.linear_cp_layout == "contiguous"
+            assert self.attention_cp_layout == "zigzag"
+            assert self.context_parallel_size == 64
+            assert self.fp8 is None
+            assert self.fp8_param is False
+            chunks = [SimpleNamespace(config=self)]
+            for hook in self._pre_wrap_hooks:
+                hook(chunks)
+            return chunks
+
+    class FakeBridge:
+        def __init__(self):
+            self.provider = FakeProvider()
+
+        def to_megatron_provider(self, load_weights):
+            assert load_weights is True
+            # Bridge registers its HF loader on the original provider instance.
+            self.provider._pre_wrap_hooks = [
+                lambda chunks: setattr(chunks[0], "weights_loaded", True)
+            ]
+            return self.provider
+
+        def save_megatron_model(self, megatron_model, output_path):
+            assert megatron_model[0].weights_loaded
+            _stage_conversion(output_path)
+
+    fake_bridge = FakeBridge()
+    monkeypatch.setattr(
+        module,
+        "AutoBridge",
+        SimpleNamespace(from_hf_pretrained=lambda *a, **k: fake_bridge),
+    )
+    megatron_config = {
+        "tensor_model_parallel_size": 1,
+        "pipeline_model_parallel_size": 1,
+        "context_parallel_size": 64,
+        "expert_model_parallel_size": 1,
+        "expert_tensor_parallel_size": 1,
+        "num_layers_in_first_pipeline_stage": None,
+        "num_layers_in_last_pipeline_stage": None,
+        "pipeline_dtype": "bf16",
+        "sequence_parallel": False,
+        "gradient_accumulation_fusion": False,
+        "model_overrides": {
+            "gtp_weight_remat_size": 1,
+            "expert_gtp_weight_remat_size": 4,
+            "linear_cp_mode": "chunkwise",
+            "linear_cp_layout": "contiguous",
+            "attention_cp_layout": "zigzag",
+            "fp8": "e4m3",
+            "fp8_param": True,
+        },
+    }
+
+    module.import_model_from_hf_name(
+        "fake/hf-model", str(tmp_path / "out"), megatron_config
+    )
+
+    provider = fake_bridge.provider
+    assert provider.finalized_with == (4, 4, 64, "chunkwise", "contiguous", "zigzag")
+    # The restore step resets parallel sizes but must keep the weight-shard layout.
+    assert provider.context_parallel_size == 1
+    assert provider.expert_tensor_parallel_size == 1
+    assert provider.expert_tensor_parallel_num_weight_shards == 4
+    assert provider.expert_gtp_weight_remat_size == 4
+
+
+@pytest.mark.parametrize(
+    "config", [{}, {"model_overrides": None}, {"model_overrides": {}}]
+)
+def test_context_parallel_overrides_preserve_provider_defaults(monkeypatch, config):
+    module = _load_community_import_module(monkeypatch)
+    provider = SimpleNamespace(
+        linear_cp_mode="headwise",
+        linear_cp_layout="zigzag",
+        attention_cp_layout="zigzag",
+    )
+    expected = vars(provider).copy()
+    module._apply_context_parallel_overrides(provider, config)
+    assert vars(provider) == expected
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("linear_cp_mode", "chunkwise"),
+        ("linear_cp_layout", "contiguous"),
+        ("attention_cp_layout", "zigzag"),
+    ],
+)
+def test_context_parallel_overrides_reject_unsupported_provider(
+    monkeypatch, key, value
+):
+    module = _load_community_import_module(monkeypatch)
+    with pytest.raises(ValueError, match=key):
+        module._apply_context_parallel_overrides(
+            SimpleNamespace(), {"model_overrides": {key: value}}
+        )

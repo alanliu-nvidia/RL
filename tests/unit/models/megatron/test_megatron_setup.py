@@ -5900,7 +5900,9 @@ class TestPeftWarmStart:
             ),
             optimizer=SimpleNamespace(use_distributed_optimizer=False),
             rng=SimpleNamespace(data_parallel_random_init=False),
-            ddp=SimpleNamespace(use_megatron_fsdp=False),
+            ddp=SimpleNamespace(
+                use_megatron_fsdp=False, fp8_param_gather=False, fp4_param_gather=False
+            ),
         )
         state = SimpleNamespace(
             cfg=cfg,

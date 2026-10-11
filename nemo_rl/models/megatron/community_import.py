@@ -158,6 +158,82 @@ def publish_megatron_conversion(
         ).start()
 
 
+_GTP_OVERRIDE_FIELDS = (
+    # (model_overrides key, provider parallel-size field, provider shard-count field)
+    (
+        "gtp_weight_remat_size",
+        "tensor_model_parallel_size",
+        "tensor_parallel_num_weight_shards",
+    ),
+    (
+        "expert_gtp_weight_remat_size",
+        "expert_tensor_parallel_size",
+        "expert_tensor_parallel_num_weight_shards",
+    ),
+)
+
+
+def _apply_gtp_weight_sharding(
+    model_provider: Any, megatron_config: MegatronConfig
+) -> None:
+    """Import HF weights directly at the training GTP weight-shard topology.
+
+    Megatron Bridge refuses to reshard a native checkpoint across GTP layouts, so a
+    checkpoint written at GTP 1 cannot be loaded by a recipe that trains with
+    ``model_overrides.gtp_weight_remat_size`` or ``expert_gtp_weight_remat_size``
+    above 1. Set the Bridge's public shard counts (``shards = parallel size x GTP``)
+    on the provider so ``finalize()`` derives the matching rematerialization sizes
+    and the saved ``run_config.yaml`` records the layout the trainer will request.
+    """
+    overrides = megatron_config.get("model_overrides") or {}
+    for key, parallel_field, shards_field in _GTP_OVERRIDE_FIELDS:
+        if key not in overrides:
+            continue
+        gtp_size = overrides[key]
+        if not isinstance(gtp_size, int) or gtp_size < 1:
+            raise ValueError(
+                f"megatron_cfg.model_overrides.{key} must be a positive integer, "
+                f"got {gtp_size!r}"
+            )
+        if not hasattr(model_provider, shards_field):
+            if gtp_size == 1:
+                continue
+            raise ValueError(
+                f"megatron_cfg.model_overrides.{key}={gtp_size} but "
+                f"{type(model_provider).__name__} has no '{shards_field}' field; "
+                "this provider does not support GTP weight sharding."
+            )
+        parallel_size = getattr(model_provider, parallel_field, None) or 1
+        setattr(model_provider, shards_field, parallel_size * gtp_size)
+        if hasattr(model_provider, key):
+            setattr(model_provider, key, gtp_size)
+
+
+def _apply_context_parallel_overrides(
+    model_provider: Any, megatron_config: MegatronConfig
+) -> None:
+    """Apply recipe CP controls needed to construct the HF import model.
+
+    Context-parallel mode and layout affect model construction, so apply them
+    before finalize() during import as well as training. Leave training-only
+    overrides such as FP8 out of weight conversion.
+    """
+    overrides = megatron_config.get("model_overrides")
+    if not overrides:
+        return
+    for key in ("linear_cp_mode", "linear_cp_layout", "attention_cp_layout"):
+        if key not in overrides:
+            continue
+        if not hasattr(model_provider, key):
+            raise ValueError(
+                f"megatron_cfg.model_overrides set '{key}' but "
+                f"{type(model_provider).__name__} has no such field; this "
+                "provider does not support that context-parallel control."
+            )
+        # Preserve the HF weight-loading hook registered on this provider.
+        setattr(model_provider, key, overrides[key])
+
+
 def import_model_from_hf_name(
     hf_model_name: str,
     output_path: str,
@@ -248,6 +324,8 @@ def import_model_from_hf_name(
         model_provider.gradient_accumulation_fusion = megatron_config[
             "gradient_accumulation_fusion"
         ]
+        _apply_context_parallel_overrides(model_provider, megatron_config)
+        _apply_gtp_weight_sharding(model_provider, megatron_config)
     if transformer_layer_spec is not None:
         model_provider.transformer_layer_spec = transformer_layer_spec
     if mamba_stack_spec is not None:
@@ -286,6 +364,8 @@ def import_model_from_hf_name(
     config.num_layers_in_first_pipeline_stage = orig_num_layers_in_first_pipeline_stage
     config.num_layers_in_last_pipeline_stage = orig_num_layers_in_last_pipeline_stage
     config.pipeline_dtype = orig_pipeline_dtype
+    # GTP shard counts are deliberately kept: they describe the saved weight layout,
+    # and the trainer must load this checkpoint at the same layout.
 
     # Stage the save next to the final path, then atomically rename into place
     # so concurrent readers of the shared cache never see a partial checkpoint.

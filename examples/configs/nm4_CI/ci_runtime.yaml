@@ -4,10 +4,6 @@ policy:
     attention_backend: auto
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
-    model_overrides:
-      saved_args:
-        attention_backend: auto
-        mimo_vision_encoder_attention_backend: auto
 logger:
   wandb_enabled: false
   tensorboard_enabled: true

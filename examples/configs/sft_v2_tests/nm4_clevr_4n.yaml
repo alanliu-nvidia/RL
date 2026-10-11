@@ -195,7 +195,6 @@ policy:
     freeze_vision_encoder: true
     freeze_vision_projector: false
     attention_backend: flash
-    flash_attention_version: 4
     model_overrides:
       moe_router_score_function: sigmoid
       moe_router_topk: 10
@@ -209,11 +208,6 @@ policy:
       moe_router_skip_muon: true
       linear_cp_mode: chunkwise
       linear_cp_layout: contiguous
-      saved_args:
-        attention_backend: flash
-        flash_attention_version: 4
-        mimo_vision_encoder_attention_backend: flash
-        mimo_vision_encoder_flash_attention_version: 4
     train_iters: ${sft.max_num_steps}
     moe_aux_loss_coeff: 0.0
     mtp_num_layers: 2

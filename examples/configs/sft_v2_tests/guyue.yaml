@@ -218,9 +218,6 @@ policy:
       gdp_cutedsl_kernel: true
       residual_stream_recompute_num_layers: 4
       use_transformer_engine_op_fuser: false
-      flash_attention_version: 4
-      mimo_vision_encoder_attention_backend: flash
-      mimo_vision_encoder_flash_attention_version: 2
       moe_router_score_function: sigmoid
       moe_router_topk_scaling_factor: 3.16
       moe_router_quantile_balancing_estimation_scope: global_batch
@@ -232,9 +229,6 @@ policy:
       quant_recipe:
       moe_router_padding_for_quantization: true
       moe_router_padding_for_fp8: false
-      saved_args:
-        mimo_vision_encoder_attention_backend: flash
-        mimo_vision_encoder_flash_attention_version: 4
 logger:
   log_dir: logs/sft-nemorl-nemotron-4-derisk-full-generalist-cp64-ep64-128n-20260921
   wandb_enabled: true

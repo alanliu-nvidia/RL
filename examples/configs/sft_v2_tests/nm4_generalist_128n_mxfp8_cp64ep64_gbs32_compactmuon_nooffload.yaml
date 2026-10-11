@@ -205,7 +205,6 @@ policy:
     freeze_vision_encoder: false
     freeze_vision_projector: false
     attention_backend: auto
-    flash_attention_version: 4
     high_priority_stream_groups:
     - ep
     model_overrides:
@@ -226,11 +225,6 @@ policy:
       attention_cp_layout: zigzag
       residual_stream_recompute_num_layers: 1
       use_transformer_engine_op_fuser: false
-      saved_args:
-        attention_backend: auto
-        flash_attention_version: 4
-        mimo_vision_encoder_attention_backend: auto
-        mimo_vision_encoder_flash_attention_version: 4
       fp8: e4m3
       fp8_recipe: mxfp8
       fp8_param: true
