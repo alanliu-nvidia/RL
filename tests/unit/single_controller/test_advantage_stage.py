@@ -26,11 +26,15 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
+    GAEConfig,
+    GeneralizedAdvantageEstimator,
     GRPOAdvantageEstimator,
     OPDAdvantageEstimator,
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossConfig
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     SHARD_INVARIANT_ESTIMATORS,
@@ -734,6 +738,56 @@ def test_training_dump_is_complete_however_the_stage_was_split(
     # The serialization is timed wherever it ran, and reported back as a
     # number so the controller's metric survives the move onto the pool.
     assert len(ctrl._timer.get_elapsed("train_data_dump")) == max(num_actors, 1)
+
+
+def test_ppo_training_dump_captures_value_inputs_and_returns(tmp_path: Path) -> None:
+    rows = _rows()
+    for row in rows.values():
+        row["values"] = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5])
+    store = _RowStore(rows)
+    algo = PPOConfig(
+        num_generations_per_prompt=GROUP_SIZE,
+        adv_estimator=GAEConfig(
+            gae_lambda=1.0,
+            gae_lambda_policy=1.0,
+            gae_lambda_value=1.0,
+            normalize_advantages=False,
+        ),
+    )
+    config = AdvantageStageConfig(
+        advantage=AdvantageConfig(),
+        algo=algo,
+        is_ppo=True,
+        policy_logprobs_required=False,
+        reference_logprobs_required=False,
+        teacher_logprobs_required=False,
+        message_level_advantage_penalties_enabled=False,
+        shardable=False,
+        train_data_dump_dir=str(tmp_path),
+    )
+    computer = AdvantageComputer(
+        store,
+        config=config,
+        advantage_estimator=GeneralizedAdvantageEstimator(
+            algo.adv_estimator, ClippedPGLossConfig()
+        ),
+    )
+
+    outcome = asyncio.run(computer.run(AdvantageRequest(_pool_meta(), train_step=0)))
+    TrainDataDump(str(tmp_path)).finish_step(0, outcome.train_data_dump_rows)
+    dumped_rows = [
+        json.loads(line)
+        for line in (tmp_path / "train_data_step1.jsonl").read_text().splitlines()
+    ]
+
+    assert len(dumped_rows) == NUM_GROUPS * GROUP_SIZE
+    for dumped_row in dumped_rows:
+        sample_id = dumped_row["sample_id"][0]
+        assert dumped_row["values"] == [rows[sample_id]["values"].tolist()]
+        assert dumped_row["returns"] == [store.rows[sample_id]["returns"].tolist()]
+        assert dumped_row["advantages"] == [
+            store.rows[sample_id]["advantages"].tolist()
+        ]
 
 
 def test_unshardable_estimator_sends_the_whole_batch_to_one_actor() -> None:
