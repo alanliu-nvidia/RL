@@ -33,39 +33,43 @@ docker buildx build --build-context nemo-rl=. -f docker/Dockerfile \
 > [!NOTE]
 > The `--tag <registry>/nemo-rl:latest --push` flags are not necessary if you just want to build locally.
 
-## Skipping vLLM or SGLang Dependencies
+## Skipping vLLM, SGLang, or TRT-LLM Dependencies
 
-If you don't need vLLM, SGLang, or TRT-LLM support, you can skip building those dependencies to reduce build time and image size. Use the `SKIP_VLLM_BUILD`, `SKIP_SGLANG_BUILD`, and/or `SKIP_TRTLLM_BUILD` build arguments:
+You can control which of vLLM, SGLang, or TRT-LLM get built to manage build time and image size. Use the `SKIP_VLLM_BUILD`, `SKIP_SGLANG_BUILD`, and/or `SKIP_TRTLLM_BUILD` build arguments. **SGLang and TRT-LLM are skipped by default** (`SKIP_SGLANG_BUILD`/`SKIP_TRTLLM_BUILD` default to `1`); vLLM is built by default.
 
 ```sh
-# Skip vLLM dependencies:
+# Default build: vLLM only (SGLang and TRT-LLM are skipped automatically):
+docker buildx build -f docker/Dockerfile \
+    --tag <registry>/nemo-rl:latest \
+    .
+
+# Skip vLLM dependencies too:
 docker buildx build -f docker/Dockerfile \
     --build-arg SKIP_VLLM_BUILD=1 \
     --tag <registry>/nemo-rl:latest \
     .
 
-# Skip SGLang dependencies:
+# Build SGLang back in (the skip check tests for an empty value, not "0"):
 docker buildx build -f docker/Dockerfile \
-    --build-arg SKIP_SGLANG_BUILD=1 \
+    --build-arg SKIP_SGLANG_BUILD= \
     --tag <registry>/nemo-rl:latest \
     .
 
-# Skip TRT-LLM dependencies:
+# Build TRT-LLM back in:
 docker buildx build -f docker/Dockerfile \
-    --build-arg SKIP_TRTLLM_BUILD=1 \
+    --build-arg SKIP_TRTLLM_BUILD= \
     --tag <registry>/nemo-rl:latest \
     .
 
-# Skip all three:
+# Build all three:
 docker buildx build -f docker/Dockerfile \
-    --build-arg SKIP_VLLM_BUILD=1 \
-    --build-arg SKIP_SGLANG_BUILD=1 \
-    --build-arg SKIP_TRTLLM_BUILD=1 \
+    --build-arg SKIP_SGLANG_BUILD= \
+    --build-arg SKIP_TRTLLM_BUILD= \
     --tag <registry>/nemo-rl:latest \
     .
 ```
 
-When these build arguments are set, the corresponding `uv sync --extra` commands are skipped, and the virtual environment prefetching will exclude actors that depend on those packages.
+When these build arguments are non-empty, the corresponding `uv sync --extra` commands are skipped, and the virtual environment prefetching will exclude actors that depend on those packages.
 
 > [!NOTE]
 > If you skip vLLM, SGLang, or TRT-LLM during the build but later try to use those backends at runtime, the dependencies will be fetched and built on-demand. This may add significant setup time on first use.

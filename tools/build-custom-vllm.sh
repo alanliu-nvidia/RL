@@ -158,7 +158,16 @@ PY
 
 # Ensure build deps and re-lock
 uv pip install setuptools_scm
-uv lock
+# Skippable for the Docker build specifically: the TensorRT-LLM workspace
+# path-dependency isn't copied into that build context until a later layer,
+# so `uv lock` here would fail trying to build its metadata from an absent
+# directory. The Dockerfile sets SKIP_UV_LOCK=1 and runs the real `uv lock`
+# itself once the full workspace is present.
+if [[ -n "${SKIP_UV_LOCK:-}" ]]; then
+  echo "SKIP_UV_LOCK is set; leaving uv.lock for the caller to regenerate."
+else
+  uv lock
+fi
 
 # Write to a file that a docker build will use to set the necessary env vars
 cat <<EOF >$BUILD_DIR/nemo-rl.env

@@ -18,12 +18,22 @@
 #   To skip custom setup:
 #     docker buildx build --build-arg CUSTOM_SETUP_FNAME= -f docker/Dockerfile ...
 #
-# Optional build args to skip vLLM or SGLang dependencies:
-#   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
-#   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
-#   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
+# Optional build args to skip vLLM, SGLang, or TRT-LLM dependencies. The skip
+# checks below test for an empty value, not "1" vs "0" -- SGLang and TRT-LLM
+# are skipped by default, so build them back in with an explicit empty value:
+#   --build-arg SKIP_VLLM_BUILD=1     # Skip vLLM dependencies
+#   --build-arg SKIP_SGLANG_BUILD=    # Build SGLang dependencies (skipped by default)
+#   --build-arg SKIP_TRTLLM_BUILD=    # Build TRT-LLM dependencies (skipped by default)
 # Optional isolated managed Dynamo runtime (Dynamo + vLLM only):
 #   --build-arg BUILD_DYNAMO=1
+#
+# transformer-engine and nvidia-cudnn-frontend resolve from internal ADLR GitLab
+# forks over HTTPS (see [tool.uv.sources] in pyproject.toml), and custom wheels
+# (e.g. gdp-attn-fused, nvidia-cutlass-dsl) from the gitlab-internal-pypi index
+# (see [[tool.uv.index]] in pyproject.toml). Supply a GitLab CI_JOB_TOKEN as a
+# build secret (never a build-arg) to authenticate both; builds without it fail
+# at the `uv sync`/`uv lock --check` steps that need it:
+#   docker buildx build --secret id=CI_JOB_TOKEN,env=CI_JOB_TOKEN -f docker/Dockerfile ...
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
 # Unprivileged runtime identity (for example the NeMo CI agent workloads) that owns the shared
@@ -190,11 +200,20 @@ ARG BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION
 ARG BUILD_CUSTOM_FLASHINFER
 ARG BUILD_CUSTOM_FLASHINFER_URL
 ARG BUILD_CUSTOM_FLASHINFER_REF
+# Opt-in: set to any non-empty value to replace the Megatron-LM checkout nested
+# inside the Megatron-Bridge submodule with MCORE_REPO_URL@MCORE_REPO_REF
+# (nv-mistralai-megatron is private, so this needs the GitHub token secret
+# below). Unset by default: the Megatron-LM pinned by the Bridge is used as-is.
+ARG BUILD_CUSTOM_MCORE
+ARG MCORE_REPO_URL=https://github.com/NVIDIA-NeMo/nv-mistralai-megatron.git
+ARG MCORE_REPO_REF=269795078d956005cda850e7cbffe57232c433d9
 
-# Skip building vLLM, SGLang, or TRT-LLM dependencies (set to any non-empty value to skip)
+# Skip building vLLM, SGLang, or TRT-LLM dependencies (set to any non-empty
+# value to skip). SGLang and TRT-LLM default to skipped; pass an explicit
+# empty value (e.g. --build-arg SKIP_SGLANG_BUILD=) to build them in.
 ARG SKIP_VLLM_BUILD
-ARG SKIP_SGLANG_BUILD
-ARG SKIP_TRTLLM_BUILD
+ARG SKIP_SGLANG_BUILD=1
+ARG SKIP_TRTLLM_BUILD=1
 ARG BASE_IMAGE
 ARG UV_VERSION
 ARG TARGETARCH
@@ -208,7 +227,8 @@ ENV UV_LINK_MODE=copy
 
 # Build native DeepEP kernels for the Blackwell GPUs targeted by the Nemotron-4
 # training environment. Keep this aligned with the mcore package-specific build
-# variables in pyproject.toml.
+# variables in pyproject.toml. mcore inference's unified memory API also invokes a
+# torch API that requires this to be set.
 ARG TORCH_CUDA_ARCH_LIST="10.0 10.3 10.3a"
 ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
 
@@ -250,13 +270,24 @@ COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py nemo_rl/transfor
 COPY --from=nemo-rl nemo_rl/distributed/actor_environments.py ./nemo_rl/distributed/
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
 COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
+COPY --from=nemo-rl tools/build-custom-mcore.sh ./tools/build-custom-mcore.sh
+COPY --from=nemo-rl tools/patch-megatron-bridge-flashinfer.sh ./tools/patch-megatron-bridge-flashinfer.sh
+# Moved here from its old position late in the TRT-LLM layer (previously
+# excluded above for caching: a TRT-LLM ref bump wouldn't bust this layer).
+# No longer deferred -- we don't care about that caching optimization, and
+# `uv lock` needs tensorrt-llm's path-dependency metadata present to
+# succeed, which otherwise forced the relock itself to also stay deferred to
+# the TRT-LLM layer, which in turn meant the worker-venv prefetch below
+# (which builds the actual venvs used at runtime) ran against a stale,
+# pre-relock lock for any BUILD_CUSTOM_* swap. Now everything uses one
+# consistent, up-to-date lock from the start.
+COPY --from=nemo-rl tools/build-custom-trtllm.sh ./tools/build-custom-trtllm.sh
 COPY --from=nemo-rl --link research/ ./research/
-COPY --from=nemo-rl --link \
-    --exclude=TensorRT-LLM-workspace \
-    --exclude=TensorRT-LLM-workspace/** \
-    3rdparty/ ./3rdparty/
+COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
 RUN --mount=type=ssh \
+    --mount=type=secret,id=CI_JOB_TOKEN \
+    --mount=type=secret,id=MCORE_GITHUB_TOKEN \
     --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed <<"EOF" bash -exu
 CACHE_KEY=$(echo "${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE}" | md5sum | cut -c1-12)
 SEED_KEY=$(cat /tmp/uv-cache-seed/.cache-key 2>/dev/null || echo "")
@@ -268,23 +299,84 @@ elif [ -n "$SEED_KEY" ]; then
     rsync -a --exclude='.cache-key' /tmp/uv-cache-seed/ "${UV_CACHE_DIR}/" 2>/dev/null || true
 fi
 
+# transformer-engine and nvidia-cudnn-frontend resolve from internal ADLR
+# GitLab forks over HTTPS (see [tool.uv.sources] in pyproject.toml). uv shells
+# out to the system `git` for these, so authenticate it with a short-lived git
+# credential helper fed from the CI_JOB_TOKEN build secret. The token is never
+# a build-arg (would persist in image history) and never embedded in a git URL
+# (would persist in uv.lock and in the uv-cache-seed export below); `set +x`
+# brackets only the line that expands the token so it never hits the build log.
+# The same secret also authenticates the gitlab-internal-pypi index (custom
+# wheels, e.g. gdp-attn-fused/nvidia-cutlass-dsl; see [[tool.uv.index]] in
+# pyproject.toml) via uv's documented UV_INDEX_<NAME>_USERNAME/PASSWORD env
+# vars -- these are plain shell exports, not a file, so unlike the git
+# credentials above they need no cleanup: each RUN instruction is a fresh
+# shell, and env vars never persist into the image layer the way a file would.
+if [[ -f /run/secrets/CI_JOB_TOKEN ]]; then
+    { set +x; \
+      git config --global credential.helper store; \
+      echo "https://gitlab-ci-token:$(cat /run/secrets/CI_JOB_TOKEN)@gitlab-master.nvidia.com" > ~/.git-credentials; \
+      export UV_INDEX_GITLAB_INTERNAL_PYPI_USERNAME=gitlab-ci-token; \
+      export UV_INDEX_GITLAB_INTERNAL_PYPI_PASSWORD=$(cat /run/secrets/CI_JOB_TOKEN); \
+      set -x; }
+    chmod 600 ~/.git-credentials
+fi
+
+# nv-mistralai-megatron is a private repo; needs its own GitHub token --
+# the APPTAINER_GITHUB_TOKEN secret does not have access to it ("Write
+# access to repository not granted", a 403 on clone). Token fed from a
+# build secret, never a build-arg or embedded in a URL. Appended to the
+# same ~/.git-credentials file so it's cleaned up by the teardown at the
+# end of this RUN instruction.
+if [[ -n "${BUILD_CUSTOM_MCORE:-}" && -f /run/secrets/MCORE_GITHUB_TOKEN ]]; then
+    { set +x; \
+      git config --global credential.helper store; \
+      echo "https://x-access-token:$(cat /run/secrets/MCORE_GITHUB_TOKEN)@github.com" >> ~/.git-credentials; \
+      set -x; }
+    chmod 600 ~/.git-credentials
+fi
+
+# Unconditional, not gated by any BUILD_CUSTOM_* flag: the root
+# pyproject.toml's vllm/mcore extras always pin a flashinfer-python/-cubin
+# build from gitlab-internal-pypi (not an opt-in customization), which
+# conflicts with Megatron-Bridge's own unconditional "flashinfer" index claim
+# for the same packages. See tools/patch-megatron-bridge-flashinfer.sh for
+# why this can't be scoped away instead.
+bash tools/patch-megatron-bridge-flashinfer.sh
+
 uv venv --seed
 # Fail with a useful diagnostic if the named build context did not provide the
 # root NeMo-RL project file. Using --project below also prevents uv from
 # accidentally selecting a nested third-party pyproject.
 pwd
 grep -n '^mcore = \[' /opt/nemo-rl/pyproject.toml
-# The custom build scripts will alter the pyproject.toml and uv.lock
+# The custom build scripts will alter the pyproject.toml and uv.lock.
+# SKIP_UV_LOCK=1 skips each script's own `uv lock` call -- relocking three
+# times in a row (once per script) would be wasteful; a single explicit
+# `uv lock` runs once below, after all three have made their changes.
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
-    UV_LINK_MODE=hardlink bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL:-} ${BUILD_CUSTOM_VLLM_REF:-} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION:-}
+    SKIP_UV_LOCK=1 UV_LINK_MODE=hardlink bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL:-} ${BUILD_CUSTOM_VLLM_REF:-} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION:-}
     source 3rdparty/vllm/nemo-rl.env
 fi
 if [[ -n "${BUILD_CUSTOM_FLASHINFER:-}" ]]; then
-    bash tools/build-custom-flashinfer.sh ${BUILD_CUSTOM_FLASHINFER_URL:-} ${BUILD_CUSTOM_FLASHINFER_REF:-}
+    SKIP_UV_LOCK=1 bash tools/build-custom-flashinfer.sh ${BUILD_CUSTOM_FLASHINFER_URL:-} ${BUILD_CUSTOM_FLASHINFER_REF:-}
 fi
-# The TRT-LLM workspace is copied later. --frozen consumes the committed lock
-# without evaluating that absent local source; the late layer runs uv lock
-# --check with the complete workspace before starting the TRT-LLM build.
+if [[ -n "${BUILD_CUSTOM_MCORE:-}" ]]; then
+    SKIP_UV_LOCK=1 bash tools/build-custom-mcore.sh ${MCORE_REPO_URL:-} ${MCORE_REPO_REF:-}
+fi
+# Moved here from the old late TRT-LLM layer: the full workspace (including
+# tensorrt-llm's path-dependency metadata) is now present from the COPY
+# above, so the relock can happen before the worker-venv prefetch below
+# instead of after it -- the whole point of moving it. For a custom build,
+# the committed lock is known-stale by design (each script above ran with
+# SKIP_UV_LOCK=1); regenerate it for real. Otherwise just validate, so an
+# accidentally-stale committed lock still fails loudly instead of shipping
+# silently (same contract the old late-layer check enforced).
+if [[ -n "${BUILD_CUSTOM_VLLM:-}${BUILD_CUSTOM_FLASHINFER:-}${BUILD_CUSTOM_MCORE:-}" ]]; then
+    uv lock
+else
+    uv lock --check
+fi
 
 # Sync each training + inference backend one at a time (since they may conflict)
 # to warm the uv cache, then at the end just sync the default dependencies.
@@ -354,12 +446,12 @@ while IFS=$'\t' read -r venv_name stage extras; do
     uv venv --allow-existing "$venv_path"
     UV_PROJECT_ENVIRONMENT="$venv_path" UV_LINK_MODE=hardlink uv sync --project /opt/nemo-rl --frozen $extras --no-install-project
     if [[ " $extras " == *" --extra mcore "* ]]; then
-        # nvidia-cutlass-dsl 4.6 split the Python cutlass.cute package into
-        # libs-core while libs-cu13 contains the CUDA runtime. The root uv
-        # workaround excludes libs-base for older CUTLASS releases; that also
-        # removes its dependency edge to libs-core, so restore core explicitly.
-        uv pip install --python "$venv_path/bin/python" --no-deps \
-            nvidia-cutlass-dsl-libs-core==4.6.0
+        # nvidia-cutlass-dsl 4.6 split the Python cutlass.cute package across
+        # libs-base/libs-core (Python + MLIR) and libs-cu13 (CUDA runtime). The
+        # root pyproject no longer excludes libs-base, so the lock carries the whole
+        # family at one version and the sync above installs it. Do not re-pin
+        # libs-core here: a version that differs from libs-base breaks the import.
+        uv pip list --python "$venv_path/bin/python" | grep -i cutlass || true
         "$venv_path/bin/python" -c \
             "import cutlass.cute, flash_attn.cute, transformer_engine.pytorch, deep_ep; print('MCore FA4 runtime imports passed')"
     fi
@@ -373,6 +465,11 @@ rm -rf /var/lib/apt/lists/*
 # The ray install will include the older aiohttp version in its cache
 find "${UV_CACHE_DIR}" -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
 
+# Same layer as the credential setup above, so the token never appears in this
+# layer's diff -- a file written and removed within one RUN leaves no trace.
+rm -f ~/.git-credentials
+git config --global --unset credential.helper || true
+
 echo "${CACHE_KEY}" > "${UV_CACHE_DIR}/.cache-key"
 
 # Hand the cache and the venvs built from it to the runtime UID in the layer that creates them.
@@ -383,25 +480,25 @@ echo "${CACHE_KEY}" > "${UV_CACHE_DIR}/.cache-key"
 chown -R "${RUNTIME_UID}:${RUNTIME_GID}" "${UV_CACHE_DIR}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}"
 EOF
 
-# Keep the frequently changing TRT-LLM build inputs after the other backend
-# warmups so TRT-only changes can reuse expensive wheels such as Transformer
-# Engine from the preceding layer.
-COPY --from=nemo-rl tools/build-custom-trtllm.sh ./tools/build-custom-trtllm.sh
-COPY --from=nemo-rl --link 3rdparty/TensorRT-LLM-workspace/ ./3rdparty/TensorRT-LLM-workspace/
-
 RUN --mount=type=ssh \
+    --mount=type=secret,id=CI_JOB_TOKEN \
     --mount=type=bind,from=trtllm-ccache-seed,source=.,target=/tmp/trtllm-ccache-seed \
     --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked \
     --mount=type=cache,id=trtllm-ccache-${TARGETARCH}-${BASE_IMAGE},target=/root/.cache/ccache,sharing=locked <<"EOF" bash -exu
-# Lock/pyproject consistency is verified LATE here, for the whole image. The
-# dependency syncs above run --frozen (read-only on uv.lock: they neither update
-# nor validate it), so this uv lock --check is the ONLY place a stale lock is
-# caught. It can't move earlier: it needs the full workspace, but the tensorrt-llm
-# path-source member isn't copied until the COPY just above (kept late so a
-# TRT-LLM ref bump doesn't bust the cached TE/backend build).
-# WARNING: removing this check (or this layer) without also reverting --frozen
-# above would let an out-of-date lock ship silently. Keep it before the SKIP exit.
-uv lock --check
+# Lock/pyproject consistency is now verified early, in the dependency layer
+# above (tensorrt-llm's workspace moved there too, so the relock no longer
+# needs to wait for this layer -- see the comment on that COPY). The
+# credential helper here is still needed for this layer's own fetches during
+# the actual TRT-LLM build below (internal ADLR forks, gitlab-internal-pypi).
+if [[ -f /run/secrets/CI_JOB_TOKEN ]]; then
+    { set +x; \
+      git config --global credential.helper store; \
+      echo "https://gitlab-ci-token:$(cat /run/secrets/CI_JOB_TOKEN)@gitlab-master.nvidia.com" > ~/.git-credentials; \
+      export UV_INDEX_GITLAB_INTERNAL_PYPI_USERNAME=gitlab-ci-token; \
+      export UV_INDEX_GITLAB_INTERNAL_PYPI_PASSWORD=$(cat /run/secrets/CI_JOB_TOKEN); \
+      set -x; }
+    chmod 600 ~/.git-credentials
+fi
 
 if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
     echo "SKIP_TRTLLM_BUILD is set; skipping the isolated TRT-LLM build"
@@ -490,6 +587,9 @@ rm -rf /tmp/trtllm-build-venv
 # cleanup performed in the preceding dependency layer.
 find "${UV_CACHE_DIR}" -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
 
+rm -f ~/.git-credentials
+git config --global --unset credential.helper || true
+
 # Hand this layer's new cache and venv entries to the runtime UID. Entries from the dependency
 # layer already belong to it, so only files created here change owner and none is copied up.
 find "${UV_CACHE_DIR}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
@@ -548,8 +648,25 @@ RUN printf '%s\n' /opt/amazon/ofi-nccl/lib /opt/amazon/efa/lib \
 ENV LD_LIBRARY_PATH="/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:${LD_LIBRARY_PATH}"
 
 # Copy in source from build context (defaults to cloned repo, can be overridden)
-# Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
-COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
+# Exclude pyproject.toml and uv.lock since those may be altered by
+# build-custom-vllm.sh/build-custom-flashinfer.sh, and uv.lock alone may
+# additionally be altered by build-custom-mcore.sh. Also exclude the
+# Megatron-LM submodule path: build-custom-mcore.sh swaps it for a plain
+# git clone (a real .git directory), and this pristine, un-swapped context
+# has a submodule-style .git *file* there instead -- copying over it either
+# fails outright ("cannot replace to directory ... with file") or, if it
+# didn't, would silently revert the custom source back to stock. Also
+# exclude Megatron-Bridge's own pyproject.toml: patched in place by
+# tools/patch-megatron-bridge-flashinfer.sh (unconditional, see the comment
+# there); copying over it would silently revert that patch and reintroduce
+# the flashinfer-python/-cubin index conflict, just at runtime instead of
+# build time. Harmless to always exclude these: for a stock build, the
+# earlier 3rdparty/ COPY already put identical content there.
+COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock \
+    --exclude=3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM \
+    --exclude=3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM/** \
+    --exclude=3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/pyproject.toml \
+    . /opt/nemo-rl
 
 # Keep Dynamo's Python 3.12 dependency graph isolated from NeMo-RL's normal
 # Ray/vLLM environments. Default image builds do not create this environment.

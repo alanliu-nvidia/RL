@@ -6,7 +6,17 @@ build-backend = "setuptools.build_meta"
 packages = ["nemo_rl"]
 
 [tool.setuptools.dynamic]
-version = { attr = "nemo_rl.__version__" }                      # any module attribute compatible with ast.literal_eval
+# Points at the submodule, not the package (nemo_rl.__version__), so
+# setuptools' attr resolution loads nemo_rl/package_info.py directly without
+# first executing nemo_rl/__init__.py (which imports the rest of the
+# application, e.g. nemo_rl.transformers_compat) -- verified directly:
+# setuptools.config.expand.read_attr for a dotted submodule path does not
+# execute the parent package's __init__.py. Needed because some Docker
+# layers build nemo-rl's own metadata (e.g. a real `uv lock`, not just
+# `--frozen` syncs) with only pyproject.toml/uv.lock and a couple of
+# standalone nemo_rl files present, deliberately, long before the rest of
+# the source tree is copied in.
+version = { attr = "nemo_rl.package_info.__version__" }
 readme = { file = "README.md", content-type = "text/markdown" }
 
 [project]
@@ -147,7 +157,9 @@ automodel = [
   "mamba-ssm",
   "causal-conv1d",
   "nv-grouped-gemm",
-  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@v2.14.1",
+  # Source (the internal ADLR fork) comes from [tool.uv.sources]; a URL requirement
+  # here would conflict with that source entry.
+  "transformer-engine[pytorch,core_cu13]",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@58397eac493b075b0baea5861ac6e9793d8d7a21",
 ]
 vllm = [
@@ -161,15 +173,33 @@ vllm = [
   # deep_ep also needs libibverbs-dev
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@58397eac493b075b0baea5861ac6e9793d8d7a21",
   # PyPI publishes the default cu130 wheels for both supported architectures.
   # https://github.com/vllm-project/vllm/releases/tag/v0.29.0
-  "vllm==0.29.0",
+  # Custom build from gitlab-internal-pypi (see [tool.uv.sources]). vllm only
+  # appears in this extra, so no cross-extra version conflict to reconcile --
+  # pinned directly here rather than via override-dependencies.
+  "vllm==0.29.0+gd1e80546846c.cu132",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.18",
-  "flashinfer-cubin==0.6.18",
-  "flashinfer-jit-cache==0.6.18",
-  "nvidia-cutlass-dsl[cu13]==4.6.2",
+  # Custom builds from gitlab-internal-pypi, paired with the vllm build
+  # above. No [tool.uv.sources] entry for these -- Megatron-Bridge's own
+  # pyproject.toml unconditionally claims flashinfer-python/-cubin for the
+  # "flashinfer" index, and a competing claim from here is a hard conflict
+  # regardless of markers. Declaring no source lets uv auto-discover these
+  # from gitlab-internal-pypi (now a non-explicit index); versions pinned in
+  # override-dependencies, which also reconciles Megatron-Bridge's own
+  # flashinfer-python==0.6.18.post1 pin and sglang's own
+  # nvidia-cutlass-dsl[cu13]==4.6.0 pin (incompatible with this build's
+  # nvidia-cutlass-dsl>=4.6.2a0 floor) -- see override-dependencies.
+  "flashinfer-python",
+  "flashinfer-cubin",
+  "flashinfer-jit-cache",
+  # flashinfer-jit-cache's own transitive dependency, never otherwise a
+  # direct requirement anywhere -- needs to be declared directly for its
+  # [tool.uv.sources] index routing to actually apply (uv otherwise reports
+  # "not found in the package registry" despite it being published there).
+  "flashinfer-jit-cache-sm100f",
+  "nvidia-cutlass-dsl[cu13]",
 ]
 sglang = [
   # sglang-miles (3003d70f) and sglang-kernel 0.4.5 are built against torch 2.11;
@@ -185,9 +215,12 @@ sglang = [
   "sglang-kernel==0.4.5",                                                       # Direct dep for explicit version control; required by sglang-miles
   "sglang-router",                                                              # Used by nemo_rl.models.generation.sglang.sglang_router for multi-engine routing
   "kernels>=0.14.1,<0.15",
-  "flashinfer-python==0.6.14",
-  "flashinfer-cubin==0.6.14",
-  "flashinfer-jit-cache==0.6.14",
+  # Version pinned in override-dependencies (same build as vllm/mcore -- see
+  # the comment there for why sglang isn't kept on an independent version).
+  "flashinfer-python",
+  "flashinfer-cubin",
+  "flashinfer-jit-cache",
+  "flashinfer-jit-cache-sm100f",
   "transformers==5.12.1",
   "tilelang==0.1.11; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
@@ -217,8 +250,12 @@ mcore = [
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn==2.8.1",
+  # FlashAttention-4: Megatron-Core gates it behind flash_attention_version=4
+  # (megatron/core/transformer/attention.py HAVE_FA4 check), so it's additive
+  # alongside the FA2 pin above rather than a replacement.
   "flash-attn-4[cu13]==4.0.0b19 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-  "quack-kernels==0.6.4 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  # quack-kernels 0.6.5 does not work with flash-attn-4; keep in sync with override-dependencies.
+  "quack-kernels==0.6.1 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # mamba-ssm/causal-conv1d LOOK redundant (megatron-bridge[ssm] pulls them), but do not
   # remove them: [tool.uv.sources] git pins only attach to direct requirements, and the
   # conflicting extras resolve in separate forks — without these direct deps the mcore fork
@@ -226,12 +263,32 @@ mcore = [
   "mamba-ssm",
   "causal-conv1d",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@58397eac493b075b0baea5861ac6e9793d8d7a21",
-  # The NM4 Bridge fork pins this FlashInfer pair; keep its JIT cache aligned.
-  "flashinfer-python==0.6.8.post1",
-  "flashinfer-cubin==0.6.8.post1",
-  "flashinfer-jit-cache==0.6.8.post1",
+  # Same custom build as the vllm extra -- version pinned in
+  # override-dependencies (see the vllm extra's comment for why).
+  "flashinfer-python",
+  "flashinfer-cubin",
+  "flashinfer-jit-cache",
+  "flashinfer-jit-cache-sm100f",
   "flash_mla ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-  "nvidia-cutlass-dsl[cu13]==4.6.2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  # Real PyPI release, same as every other extra. A floor is now pinned in
+  # override-dependencies (see there for why); otherwise unconstrained here,
+  # so the resolver still picks whatever compatible real release satisfies
+  # flash-attn-4/flashinfer-python/megatron-core's various floors.
+  "nvidia-cutlass-dsl[cu13] ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  # Custom fused GDP attention kernels, from gitlab-internal-pypi (see
+  # [tool.uv.sources]; not on PyPI). Version is pinned in override-dependencies.
+  "gdp-attn-fused ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  # cutlass.tensor_utils, which no published nvidia-cutlass-dsl release
+  # provides (gdp-attn-fused needs it). Coexists with the real
+  # nvidia-cutlass-dsl above via a .pth shim the wheel ships -- do NOT drop
+  # the real one thinking this replaces it: flash-attn-4 does a runtime
+  # importlib.metadata lookup for the literal name "nvidia-cutlass-dsl" and
+  # crashes with "No package metadata was found" if that distribution isn't
+  # actually installed, even though its imported cutlass module content
+  # comes from this package instead (verified in Dockerfile.training, the
+  # nv-mistralai-megatron reference this pattern is copied from). Not
+  # published yet as of this writing.
+  "nvidia-cutlass-dsl-internal ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "torch-memory-saver>=0.0.9.post1",
   "nvshmem4py-cu13>=0.2.1",
   "cupy-cuda13x",
@@ -241,6 +298,9 @@ mcore = [
   # tests/unit/test_dependency_pins.py fails if Megatron-LM's own pin moves, so a
   # Megatron-Bridge bump forces a re-check of this floor.
   "megatron-energon[av-decode]~=7.3", # for energon backend
+  # av is needed for Nemotron but we should not include in public container
+  # because it includes ffmpeg
+  "av==18.1.0",
 ]
 # TRT-LLM is built from source via 3rdparty/TensorRT-LLM-workspace's custom PEP 517
 # backend (_backend.py). The path source lets uv lock resolve the dep graph
@@ -263,7 +323,7 @@ trtllm = [
 ]
 modelopt = ["nvidia-modelopt"]
 nvrx = [
-  "nvidia-resiliency-ext==0.6.0",
+  "nvidia-resiliency-ext @ git+https://github.com/NVIDIA/nvidia-resiliency-ext.git@d23f0a11310ab7fd2e73a578511cdf7ccfd60fc7",
 ] # for ft_launcher (fault-tolerant training launcher)
 nemo_gym = ["nemo_gym"]
 
@@ -364,9 +424,44 @@ flash_mla = { git = "https://github.com/deepseek-ai/FlashMLA", rev = "b7643bd545
 # real-quant dist-checkpoint sharding validation (`Invalid access pattern for
 # ShardedTensor(... experts.N.linear_fc1.weight_quantizer._amax`).
 nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "43fd41a58d52c4e6e5dec1d1ff5989ecc737ae1a" }
-nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.6.0" }
-flashinfer-cubin = { index = "flashinfer" }
-flashinfer-jit-cache = { index = "flashinfer-cu130" }
+nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", rev = "d23f0a11310ab7fd2e73a578511cdf7ccfd60fc7" }
+# Custom builds from gitlab-internal-pypi, paired together (the custom vllm
+# build needs this specific flashinfer-python). Megatron-Bridge's own
+# pyproject.toml unconditionally claims flashinfer-python/-cubin for its
+# "flashinfer" index -- uv's index-conflict check is workspace-global, not
+# fork-aware (verified: even a source scoped to an extra that never
+# co-resolves with Megatron-Bridge still conflicts), so there is no way to
+# have mcore stay on stock flashinfer while vllm uses this custom build.
+# tools/patch-megatron-bridge-flashinfer.sh patches Megatron-Bridge's own
+# pyproject.toml to point at gitlab-internal-pypi too, so both sides agree.
+# Versions pinned in override-dependencies, forced across every extra that
+# declares these packages (including sglang, which otherwise has its own,
+# incompatible nvidia-cutlass-dsl pin -- see override-dependencies).
+# flashinfer-jit-cache-sm100f is flashinfer-jit-cache's own transitive
+# dependency (not declared anywhere else), also only published here.
+vllm = { index = "gitlab-internal-pypi" }
+flashinfer-python = { index = "gitlab-internal-pypi" }
+flashinfer-cubin = { index = "gitlab-internal-pypi" }
+flashinfer-jit-cache = { index = "gitlab-internal-pypi" }
+flashinfer-jit-cache-sm100f = { index = "gitlab-internal-pypi" }
+# nvidia-cutlass-dsl deliberately has NO entry here: it stays a normal PyPI
+# dependency everywhere (vllm, mcore, transitively via flash-attn-4/
+# flashinfer-python/megatron-core). nvidia-cutlass-dsl-internal below is an
+# ADDITIVE, separately-named package (not a same-name replacement), so it
+# coexists with the real nvidia-cutlass-dsl in mcore's venv via a .pth shim
+# rather than fighting it for a single version -- see the mcore extra's
+# comment for why the real one still has to stay installed too.
+gdp-attn-fused = { index = "gitlab-internal-pypi" }
+nvidia-cutlass-dsl-internal = { index = "gitlab-internal-pypi" }
+# Internal ADLR forks (nemotron4 branch), not upstream. Fetched over HTTPS with
+# credentials supplied by a git credential helper set up in docker/Dockerfile
+# from a CI_JOB_TOKEN build secret -- never embed the token in these URLs
+# directly, since it would end up recorded in uv.lock and in the exported uv
+# cache seed image. cudnn-frontend must resolve before transformer-engine,
+# which needs its headers at build time; that ordering falls out of
+# transformer-engine's own dependency graph, not from anything declared here.
+transformer-engine = { git = "https://gitlab-master.nvidia.com/ADLR/transformer_engine.git", rev = "1ac66e5a2e9666b36dc5e0b6e8ce1a4ce3a5a86f" }
+nvidia-cudnn-frontend = { git = "https://gitlab-master.nvidia.com/ADLR/cudnn_frontend.git", rev = "d844f3053f924fccf9f7ada0084c012eba1d20a9" }
 
 [tool.uv.workspace]
 members = [
@@ -402,6 +497,26 @@ name = "flashinfer-cu130"
 url = "https://flashinfer.ai/whl/cu130"
 explicit = true
 
+# Custom internal wheels (gdp-attn-fused, nvidia-cutlass-dsl-internal, vllm,
+# flashinfer-python/-cubin/-jit-cache), authenticated via CI_JOB_TOKEN in
+# docker/Dockerfile. gdp-attn-fused is published; nvidia-cutlass-dsl-internal
+# is not yet as of this writing -- `uv lock` will fail until it is.
+# authenticate = "always" because GitLab-hosted indexes silently fall back to
+# an unauthenticated (empty) response instead of erroring, which uv's own
+# docs call out by name as a footgun for this exact provider.
+# explicit = true, like every other custom index here: a non-explicit index
+# gets auto-searched for EVERY package in the workspace, not just the ones
+# that opt in via [tool.uv.sources] -- tried that to dodge Megatron-Bridge's
+# conflicting flashinfer-python/-cubin source claim, and it silently routed
+# 500+ unrelated packages through this private index instead of PyPI. Fixed
+# properly by patching Megatron-Bridge's own pyproject.toml instead (see
+# tools/build-custom-flashinfer.sh) so its source claim matches ours.
+[[tool.uv.index]]
+name = "gitlab-internal-pypi"
+url = "https://gitlab-master.nvidia.com/api/v4/projects/65523/packages/pypi/simple"
+explicit = true
+authenticate = "always"
+
 [tool.uv]
 managed = true
 environments = [
@@ -411,6 +526,12 @@ environments = [
 preview = true # Enable preview features like extra-build-dependencies
 no-build-isolation-package = [
   "transformer-engine-torch",
+  # Building from the internal ADLR fork (see [tool.uv.sources]) instead of the
+  # prebuilt PyPI wheel; needs torch present at build time, same as -torch above.
+  # nvidia-cudnn-frontend deliberately stays OUT of this list: its build needs
+  # cmake/ninja/pybind11, which the base image doesn't carry, so it keeps normal
+  # build isolation (a fresh env with those declared as its own build deps).
+  "transformer-engine",
   "flash-attn",
   "mamba-ssm",
   "causal-conv1d",
@@ -438,14 +559,45 @@ link-mode = "copy"
 # vllm defaults to opencv for video IO but falls back to torchcodec.
 # The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
-  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@ea1a165decdd09c1ef98b273d965796c89c47473",
+  # megatron-bridge[ssm] pins mamba-ssm==2.3.1, which doesn't exist at the git rev
+  # in [tool.uv.sources]. Force that exact (untagged) commit here; keep the rev in
+  # sync with [tool.uv.sources] and the mamba-ssm dependency-metadata version.
+  "mamba-ssm @ git+https://github.com/state-spaces/mamba.git@e9594ce1c732d97440f0332fdc43170a2294dbfa",
+  # transformer-engine and nvidia-cudnn-frontend versions are no longer pinned
+  # to an exact release here: both now come from the internal ADLR forks in
+  # [tool.uv.sources], whose commit (not a released version) is the actual
+  # pin; see the comment there. A bare, versionless override IS still needed
+  # for nvidia-cudnn-frontend: megatron-core[dev] (transitive via
+  # megatron-bridge) hard-pins nvidia-cudnn-frontend[cutedsl]==1.26.0, which
+  # demands nvidia-cutlass-dsl[cu13]==4.5.0. This strips that rigid version
+  # constraint (the fork's own cutedsl extra only floors at
+  # nvidia-cutlass-dsl[cu13]>=4.5.0), which matters regardless of what
+  # nvidia-cutlass-dsl itself resolves to.
+  "nvidia-cudnn-frontend",
+  # Also bare/versionless: megatron-core's own "te" extra (activated via
+  # megatron-bridge[te], which the mcore extra's "megatron-bridge[te,ssm]"
+  # turns on) hard-pins transformer-engine to a DIRECT git URL
+  # (github.com/NVIDIA/TransformerEngine.git), which bypasses [tool.uv.sources]
+  # entirely -- source redirection only applies to plain-name requirements.
+  # This override strips that embedded URL so resolution falls through to
+  # [tool.uv.sources]'s ADLR fork instead.
+  "transformer-engine",
+  # gitlab-internal-pypi is a mutable PyPI-style index (no immutable git rev
+  # to anchor it, unlike the ADLR forks above), so pin its packages' exact
+  # versions here -- without it, a future upload silently changes what mcore
+  # resolves to on the next `uv lock`. Centralized rather than inline on the
+  # mcore extra's requirement lines, which intentionally carry no version.
+  "gdp-attn-fused==0.5.0+cp.dkg4408763",
+  # nvidia-cutlass-dsl-internal not yet pinned here: not published yet (see
+  # [tool.uv.index]), so its real version string isn't known. Add a
+  # "nvidia-cutlass-dsl-internal==..." entry here once it is, following the
+  # gdp-attn-fused pattern above.
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
-  "nvidia-cudnn-frontend==1.26.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous;
   # 2.30.7 additionally fixes hangs in the NCCL m2n reshard (<link to NCCL release note / internal bug>).
-  # Keep NCCL shared with the isolated Dynamo environment across torch upgrades.
-  "nvidia-nccl-cu13==2.30.7",
+  # An override is required because torch 2.11.0+cu130 pins nvidia-nccl-cu13==2.28.9.
+  "nvidia-nccl-cu13==2.31.2",
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform != 'darwin'",
   "opencv-python-headless; sys_platform == 'never'",
   "timm<=1.0.22",
@@ -489,12 +641,11 @@ override-dependencies = [
   # which requires `numpy<2.5` and refuses to import against 2.5.x
   # ("Numba needs NumPy 2.4 or less"), leaving a broken numba in the vLLM venv.
   "numpy>=2.1.0,<2.5",
-  # av (PyAV) bundles FFmpeg-derived codecs that may incur royalties. Exclude it from the
-  # shipped container; audio/video tests install it via tools/install_audio_deps.sh.
-  "av; sys_platform == 'never'",
   # decord2 is pulled transitively by sglang → qwen-vl-utils[decord] on aarch64 Linux.
   # NeMo-RL no longer calls any decord API (replaced by torchvision/torchaudio).
   "decord2; sys_platform == 'never'",
+  "emerging-optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.4.0",
+  "nvidia-resiliency-ext @ git+https://github.com/NVIDIA/nvidia-resiliency-ext.git@d23f0a11310ab7fd2e73a578511cdf7ccfd60fc7",
   # megatron-core still pins lens v0.2.0 in its own [tool.uv.sources]; without an
   # override the two git URLs are a hard conflict, since the workspace resolves a
   # single nemo-lens. We need the newer rev for `SpanRegistry` (which replaced the
@@ -502,6 +653,38 @@ override-dependencies = [
   # (`MetricSpec`/`register_metric_group`), both of which landed after v0.2.0. Drop
   # this once Megatron-LM bumps to the same or newer rev.
   "nemo-lens[sdk,aiohttp] @ git+https://github.com/NVIDIA-NeMo/Lens.git@b0f977d414b2f89938604a0b7eaa78ee08bc8700",
+  # Custom build from gitlab-internal-pypi, paired with the vllm extra's
+  # custom vllm build (see the vllm extra's comment and the
+  # [tool.uv.sources] comment for why no source is declared for these).
+  # Forced workspace-wide: this is what reconciles Megatron-Bridge's own
+  # flashinfer-python==0.6.18.post1 pin (in its own pyproject.toml, not ours)
+  # with the version we actually want for vllm/mcore. It also sweeps sglang
+  # onto this build, since override-dependencies can't be scoped per-extra.
+  "flashinfer-python==0.7.0+g07a99a54b25e.cu132",
+  "flashinfer-cubin==0.7.0+g07a99a54b25e.cu132",
+  "flashinfer-jit-cache==0.7.0+g07a99a54b25e.cu132",
+  # Floor required by the flashinfer-python build above
+  # (nvidia-cutlass-dsl>=4.6.2a0). sglang's own pin is the exact, older
+  # nvidia-cutlass-dsl[cu13]==4.6.0 -- this override replaces that pin
+  # workspace-wide (including for sglang) rather than leaving the two
+  # incompatible. Unverified: whether sglang's own code is actually
+  # compatible with cutlass-dsl past 4.6.0, or only pinned there out of
+  # caution -- this resolves cleanly but carries a real, un-tested runtime
+  # risk for sglang specifically.
+  "nvidia-cutlass-dsl[cu13]>=4.6.2a0",
+  # The custom vllm build above requires mcp>=2.0.0 (unlike stock
+  # vllm==0.29.0, which resolves mcp fine at 1.30.0 -- see git history for
+  # the investigation). mcp 2.0.0 is a deliberate, documented breaking
+  # rework of the SDK; nemo-gym's own mcp>=1.28.1,<2 pin matches upstream's
+  # own recommendation to stay on v1 until migrated. Forcing 1.30.0 here
+  # reuses the version already known to work with both stock vllm and
+  # nemo-gym; the residual risk is whether the custom vllm build's actual
+  # code changes depend on an mcp v2-only API that 1.30.0 doesn't have.
+  "mcp==1.30.0",
+  # Nemotron 4 needs transformers 5.17.0
+  "transformers==5.17.0",
+  # quack-kernels 0.6.5 does not work with flash-attn-4
+  "quack-kernels==0.6.1",
 ]
 
 # CVE fixes
@@ -510,7 +693,7 @@ constraint-dependencies = [
   # whose [tool.uv.sources] pins them to git. uv requires such URL deps to also appear as a
   # direct requirement or constraint of the root project. Keep these URLs/revs in sync with
   # Megatron-LM's [tool.uv.sources] (uv errors loudly on mismatch after a submodule bump).
-  "emerging-optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.3.0",
+  "emerging-optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.4.0",
   "fast-hadamard-transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git@f134af63deb2df17e1171a9ec1ea4a7d8604d5ca",
   # Same story for megatron-fsdp, which nemo-automodel (r0.6.0) resolves from a
   # Megatron-LM fork via its own [tool.uv.sources] instead of PyPI. Keep this URL/rev
@@ -579,6 +762,7 @@ flash-attn = [{ requirement = "torch", match-runtime = true }]
 deep_ep = [{ requirement = "torch", match-runtime = true }]
 deep_gemm = [{ requirement = "torch", match-runtime = true }]
 transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
+transformer-engine = [{ requirement = "torch", match-runtime = true }]
 mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
 fast-hadamard-transform = [{ requirement = "torch", match-runtime = true }]
@@ -601,7 +785,7 @@ transformer-engine-torch = { NVTE_CUDA_ARCHS = "100a;103a", NVTE_FRAMEWORK = "py
 deep_ep = { TORCH_CUDA_ARCH_LIST = "10.0 10.3 10.3a", MAX_JOBS = "8" }
 
 # CUTLASS DSL 4.5.x publishes overlapping base and cu13 wheels. Override the
-# affected metadata so those versions use the self-contained cu13 wheel, while
+# affected metadata so those versions use thec self-contained cu13 wheel, while
 # 4.6.x retains libs-base/libs-core for its common Python and MLIR modules.
 [[tool.uv.dependency-metadata]]
 name = "nvidia-cutlass-dsl"
@@ -640,6 +824,44 @@ requires-dist = ["numpy", "typing-extensions", "cuda-python>=12.8"]
 [[tool.uv.dependency-metadata]]
 name = "flash-attn"
 requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
+
+# The internal ADLR fork (see [tool.uv.sources]) uses the legacy setuptools
+# backend with no static [project] table, so uv can't read its metadata
+# without a real build; that's what makes extra-build-dependencies'
+# match-runtime = true unresolvable without this. Unlike flash-attn above, a
+# version IS required here: uv only allows omitting it for registry deps, not
+# direct git/URL deps. build_tools/te_version.py reads build_tools/VERSION.txt
+# ("2.20.0.dev0" at this commit) and appends "+<short-commit>" (this repo's
+# default git abbrev is 8 chars, confirmed via `git rev-parse --short`). Must
+# be re-derived if TRANSFORMER_ENGINE_REF in [tool.uv.sources] ever moves.
+# requires-dist sourced from setup.py's setup_requirements(): the common list
+# (pydantic, importlib-metadata, packaging) plus build_tools/pytorch.py's
+# install_requirements() for NVTE_FRAMEWORK=pytorch.
+[[tool.uv.dependency-metadata]]
+name = "transformer-engine"
+version = "2.20.0.dev0+1ac66e5a"
+requires-dist = [
+  "pydantic",
+  "importlib-metadata>=1.0",
+  "packaging",
+  "torch>=2.1",
+  "einops",
+  "onnxscript",
+  "onnx",
+  "nvdlfw-inspect",
+  "nvidia-cudnn-frontend>=1.25.0",
+]
+
+# Uses a normal (non-legacy) setuptools backend with build isolation left on
+# (its cmake/ninja/pybind11 build deps aren't present in the base image), so
+# unlike transformer-engine above it isn't blocked by match-runtime -- uv can
+# build it in an isolated env to get real metadata. This entry just spares
+# every future `uv lock` that build: version and the (empty) dependency list
+# are copied from the real resolution's own uv.lock output, not guessed.
+[[tool.uv.dependency-metadata]]
+name = "nvidia-cudnn-frontend"
+version = "1.28.0"
+requires-dist = []
 
 [[tool.uv.dependency-metadata]]
 name = "flash-mla"
@@ -739,6 +961,11 @@ name = "drain3"
 version = "0.9.11"
 requires-dist = ["jsonpickle", "cachetools>=4.2.1"]
 
+[[tool.uv.dependency-metadata]]
+name = "nvidia-resiliency-ext"
+version = "0.8.0+d23f0a1"
+requires-dist = []
+
 [tool.black]
 line-length = 120
 include = '\.pyi?$'
@@ -799,13 +1026,6 @@ convention = "google"
 "*_test.py" = ["D"]
 # Ignore F401 (import but unused) in __init__.py
 "__init__.py" = ["F401"]
-
-# The Git build with NVTE_FRAMEWORK=pytorch compiles both common and Torch
-# extensions into this package; PyPI metapackage extras do not apply.
-[[tool.uv.dependency-metadata]]
-name = "transformer-engine"
-version = "2.20.0.dev0+ea1a165d"
-requires-dist = ["torch>=2.1", "pydantic", "importlib-metadata>=1.0", "packaging", "einops", "onnxscript", "onnx", "nvdlfw-inspect", "nvidia-cudnn-frontend>=1.25.0"]
 
 # FlashInfer cache wheels contain precompiled artifacts and no runtime requirements.
 # Reuse the metadata recorded in the production lock instead of streaming large
