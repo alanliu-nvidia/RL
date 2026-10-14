@@ -159,11 +159,11 @@ version = "1.0.0+b7643bd"
 
 [[manifest.dependency-metadata]]
 name = "flashinfer-cubin"
-version = "0.6.18.post1"
+version = "0.6.8.post1"
 
 [[manifest.dependency-metadata]]
 name = "flashinfer-jit-cache"
-version = "0.6.18.post1+cu130"
+version = "0.6.8.post1+cu130"
 
 [[manifest.dependency-metadata]]
 name = "logsage"
