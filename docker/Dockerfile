@@ -272,6 +272,7 @@ COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
 COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
 COPY --from=nemo-rl tools/build-custom-mcore.sh ./tools/build-custom-mcore.sh
 COPY --from=nemo-rl tools/patch-megatron-bridge-flashinfer.sh ./tools/patch-megatron-bridge-flashinfer.sh
+COPY --from=nemo-rl tools/diagnose_cutlass_tree.py ./tools/diagnose_cutlass_tree.py
 # Moved here from its old position late in the TRT-LLM layer (previously
 # excluded above for caching: a TRT-LLM ref bump wouldn't bust this layer).
 # No longer deferred -- we don't care about that caching optimization, and
@@ -451,9 +452,21 @@ while IFS=$'\t' read -r venv_name stage extras; do
         # root pyproject no longer excludes libs-base, so the lock carries the whole
         # family at one version and the sync above installs it. Do not re-pin
         # libs-core here: a version that differs from libs-base breaks the import.
+        #
+        # nvidia-cutlass-dsl-internal ships its own cutlass under the same
+        # nvidia_cutlass_dsl/ paths as the PyPI libs-* wheels, with different content
+        # for the shared files. uv unpacks packages in parallel, so which wheel wins a
+        # shared path can vary between builds (a hybrid tree fails with e.g.
+        # "cannot import name 'DSLUserCodeRuntimeError'"). Reinstall only the internal
+        # wheel so its files deterministically win every shared path, matching the
+        # nv-mistralai-megatron Dockerfile, which installs it last.
+        UV_PROJECT_ENVIRONMENT="$venv_path" UV_LINK_MODE=hardlink uv sync --project /opt/nemo-rl --frozen $extras --no-install-project --reinstall-package nvidia-cutlass-dsl-internal
         uv pip list --python "$venv_path/bin/python" | grep -i cutlass || true
-        "$venv_path/bin/python" -c \
-            "import cutlass.cute, flash_attn.cute, transformer_engine.pytorch, deep_ep; print('MCore FA4 runtime imports passed')"
+        if ! "$venv_path/bin/python" -c \
+            "import cutlass.cute, flash_attn.cute, transformer_engine.pytorch, deep_ep; print('MCore FA4 runtime imports passed')"; then
+            "${UV_PROJECT_ENVIRONMENT}/bin/python" tools/diagnose_cutlass_tree.py "$venv_path" || true
+            exit 1
+        fi
     fi
 done < /opt/actor_venvs.tsv
 
