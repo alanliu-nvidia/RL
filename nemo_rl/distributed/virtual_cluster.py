@@ -231,6 +231,13 @@ then to hostname digits when SLURM is unavailable. Values are always ``>= 1`` so
 Ray does not drop the custom resource (Ray drops value-0 custom resources).
 Used to sort nodes within and across NVLink domains so rank assignment follows physical topology."""
 
+NODE_BLOCK_PREFIX = "node_block_"
+"""Ray resource key prefix for an ordered block of nodes that gets one contiguous range of ranks.
+Each GPU node of block ``n`` registers ``node_block_<n>: 1``. ray.sub sets ``n`` to the node's
+Slurm heterogeneous-job component; a Kubernetes launcher can set it per KubeRay worker group
+(``rayStartParams.resources``). Not ``node_group_<n>``: Ray parses ``<name>_group_<hex>`` as a
+placement-group resource."""
+
 NVLINK_DOMAIN_UNKNOWN = "unknown"
 """Sentinel returned when no NVLink domain info is available for a node."""
 
@@ -774,6 +781,11 @@ def prepare_segment_topology(
         - *topology*: the topology dict used (empty dict when ``segment_size`` is
           ``None``, for safe sub-topology slicing by callers).
     """
+    if ray.is_initialized() and get_node_block_counts():
+        logger.warning(
+            "Found node_block_<n> resources, but this algorithm ignores node "
+            "blocks and places ranks as in a normal job."
+        )
     if segment_size is None:
         return None, [], {}
 
@@ -802,6 +814,68 @@ def prepare_segment_topology(
         flush=True,
     )
     return node_resource_constraints, remaining_node_ids, topology
+
+
+def get_node_block_counts() -> dict[int, int]:
+    """Count the alive Ray GPU nodes of each node block.
+
+    Returns:
+        ``{block: node_count}`` sorted by block; empty unless the launcher registered
+        ``node_block_<n>`` resources (ray.sub does so in a Slurm heterogeneous job).
+    """
+    counts: dict[int, int] = {}
+    for node in ray.nodes():
+        if not node.get("Alive", False):
+            continue
+        for key in node.get("Resources", {}):
+            if key.startswith(NODE_BLOCK_PREFIX):
+                block = int(key.removeprefix(NODE_BLOCK_PREFIX))
+                counts[block] = counts.get(block, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def node_block_constraints(
+    block_node_counts: dict[int, int],
+    num_nodes: int,
+    blocks: Sequence[int] | None = None,
+) -> list[dict[str, float]]:
+    """Pin this cluster's logical nodes to node blocks, in the order given.
+
+    Logical node ``i`` hosts global ranks ``[i * gpus_per_node, (i + 1) * gpus_per_node)``,
+    so each block receives a contiguous range of global ranks.
+
+    Args:
+        block_node_counts: ``{block: node_count}`` from ``get_node_block_counts()``.
+        num_nodes: Number of logical nodes of this cluster.
+        blocks: Blocks this cluster uses, in rank order. ``None`` uses every block
+            in ascending order, for a job with one cluster (SFT v2). A job with
+            several clusters (e.g. a student and its teachers) passes each
+            cluster its own blocks.
+
+    Returns:
+        Per-logical-node constraints for ``RayVirtualCluster``.
+
+    Raises:
+        ValueError: If ``blocks`` repeats a block or names one that does not exist,
+            or if ``num_nodes`` differs from the node total of the used blocks.
+    """
+    blocks = sorted(block_node_counts) if blocks is None else list(blocks)
+    unknown = [b for b in blocks if b not in block_node_counts]
+    if unknown or len(set(blocks)) != len(blocks):
+        raise ValueError(
+            f"node blocks {blocks} must be distinct and exist in {block_node_counts}."
+        )
+    used = {b: block_node_counts[b] for b in blocks}
+    if sum(used.values()) != num_nodes:
+        raise ValueError(
+            f"cluster.num_nodes ({num_nodes}) must equal the number of GPU nodes in "
+            f"node blocks {blocks} (nodes per block: {used})."
+        )
+    return [
+        {f"{NODE_BLOCK_PREFIX}{block}": 0.001}
+        for block in blocks
+        for _ in range(block_node_counts[block])
+    ]
 
 
 def _sort_bundle_indices_by_topology(

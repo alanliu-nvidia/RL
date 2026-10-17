@@ -274,6 +274,110 @@ SEGMENT_SIZE=2     # nodes per NVLink-domain segment; -> sbatch --segment
 # ===== END CONFIG =====
 ```
 
+### Heterogeneous Jobs (MIMO Encoder and LLM Allocations)
+
+`ray.sub` also runs as a Slurm [heterogeneous job](https://slurm.schedmd.com/heterogeneous_jobs.html).
+It starts one Ray cluster over all components (the head on the first node of
+component 0) and registers the Ray resource `node_block_<n>` on every GPU
+node of component `n` (the component index is the node block). SFT v2 places
+logical nodes component by component:
+component 0 gets the first block of global ranks, component 1 the next block, and
+so on. Inside a component, Ray picks the physical node of each logical node. To
+keep the ranks of a component in one NVLink domain, make the component exactly one
+segment (`--nodes` equal to `--segment`). For example, a MIMO encoder on 2 nodes
+anywhere and the LLM on 16 nodes in one NVLink domain (needs MIMO SFT v2):
+
+```sh
+# Options of one component; the colon starts the next component.
+COMPONENT="--account=YOUR_ACCOUNT --partition=YOUR_PARTITION --time=4:0:0 --gres=gpu:4 --exclusive"
+
+COMMAND="uv run ./examples/run_sft_v2.py --config YOUR_MIMO_RECIPE cluster.num_nodes=18 cluster.segment_size=null" \
+CONTAINER=YOUR_CONTAINER \
+MOUNTS="$PWD:$PWD" \
+GPUS_PER_NODE=4 \
+sbatch $COMPONENT --nodes=2 --segment=2 : $COMPONENT --nodes=16 --segment=16 ray.sub
+```
+
+- `cluster.num_nodes` is the GPU-node total of all components, and
+  `cluster.segment_size` must be `null`.
+- With `DEDICATED_RAY_HEAD=1`, give the head its own 1-node component first and
+  leave it out of `cluster.num_nodes`:
+  `sbatch $COMPONENT --nodes=1 : $COMPONENT --nodes=2 --segment=2 : $COMPONENT --nodes=16 --segment=16 ray.sub`.
+  That head component may use a CPU partition; `ray.sub` then probes the GPU
+  node type from component 1.
+- For MIMO, order the components like the modules' `rank_offset` values, so that
+  each component holds the ranks of one module (here `images` with
+  `rank_offset: 0` and 8 ranks, `language` with `rank_offset: 8`).
+- A module can span several components, for example one component per rack:
+  `... : $COMPONENT --nodes=16 --segment=16 : $COMPONENT --nodes=16 --segment=16`.
+- Every GPU component must use the same node type (same GPUs and CPUs per node):
+  `ray.sub` reads the CPU count and GPU GRES from one component only.
+- The sandbox sidecar and the `attach.sh` worker shells cover component 0 only.
+- Only SFT v2 places ranks by node block (one block per component). Other
+  algorithms (GRPO, DPO, distillation, ...) run on a heterogeneous job but place
+  ranks as in a normal job, and log a warning that the node blocks are ignored.
+
+#### Choosing a layout
+
+`ray.sub` has no separate mode setting: the `sbatch` line and `DEDICATED_RAY_HEAD`
+pick the layout. The Ray head is always the first node of component 0. Set
+`cluster.num_nodes` to the number of nodes that run GPU work, which is not always
+the number of nodes you ask Slurm for. All four commands use:
+
+```sh
+COMPONENT="--account=YOUR_ACCOUNT --partition=YOUR_PARTITION --time=4:0:0 --gres=gpu:4 --exclusive"
+export CONTAINER=YOUR_CONTAINER MOUNTS="$PWD:$PWD" GPUS_PER_NODE=4
+```
+
+**1. One allocation, the head also trains (default).**
+
+```sh
+COMMAND="uv run ./examples/run_sft_v2.py --config YOUR_RECIPE cluster.num_nodes=8" \
+sbatch $COMPONENT --nodes=8 ray.sub
+```
+
+`cluster.num_nodes` equals `--nodes` (8).
+
+**2. One allocation, GPU-free head (`DEDICATED_RAY_HEAD=1`).**
+
+```sh
+COMMAND="uv run ./examples/run_sft_v2.py --config YOUR_RECIPE cluster.num_nodes=8" \
+DEDICATED_RAY_HEAD=1 \
+sbatch $COMPONENT --nodes=9 ray.sub
+```
+
+The head is taken from `--nodes`, so `cluster.num_nodes` is `--nodes` minus 1 (9 - 1 = 8).
+Leaving it at 9 starts the cluster, then the driver fails minutes later with
+`Maximum number of retries reached`.
+
+**3. MIMO components, the head also trains.**
+
+```sh
+COMMAND="uv run ./examples/run_sft_v2.py --config YOUR_MIMO_RECIPE cluster.num_nodes=18 cluster.segment_size=null" \
+sbatch $COMPONENT --nodes=2 --segment=2 : $COMPONENT --nodes=16 --segment=16 ray.sub
+```
+
+`cluster.num_nodes` is the sum of all components (2 + 16 = 18). The head is the
+first encoder node and also holds ranks.
+
+**4. MIMO components, GPU-free head in its own component.**
+
+```sh
+COMMAND="uv run ./examples/run_sft_v2.py --config YOUR_MIMO_RECIPE cluster.num_nodes=18 cluster.segment_size=null" \
+DEDICATED_RAY_HEAD=1 \
+sbatch $COMPONENT --nodes=1 : $COMPONENT --nodes=2 --segment=2 : $COMPONENT --nodes=16 --segment=16 ray.sub
+```
+
+`cluster.num_nodes` is the sum of the GPU components only (2 + 16 = 18). Slurm
+allocates 19 nodes; the 1-node head component is not counted. The head component
+may use a different (CPU) partition: `ray.sub` probes the GPU node type from
+component 1 and launches the head without GPU GRES.
+
+For MIMO, two other layouts fail at setup because the GPU node count no longer
+fits the modules' rank spans: `DEDICATED_RAY_HEAD=1` with a multi-node component 0
+(the head takes one of its GPU nodes), and `DEDICATED_RAY_HEAD=0` with a 1-node
+component 0 meant as the head (it becomes a GPU worker).
+
 ## Kubernetes
 
 This guide outlines the process of migrating NemoRL training jobs from a Slurm environment to a Kubernetes cluster utilizing Ray orchestration and NVIDIA GPUs.

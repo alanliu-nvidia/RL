@@ -23,6 +23,9 @@ from nemo_rl.distributed.virtual_cluster import (
     TOPO_RANK_UNKNOWN,
     ResourceInsufficientError,
     _sort_bundle_indices_by_topology,
+    get_node_block_counts,
+    node_block_constraints,
+    prepare_segment_topology,
     select_segment_nodes,
 )
 
@@ -491,3 +494,81 @@ class TestSegmentTrimming:
             bundle_data, segment_size=8, gpus_per_node=8
         )
         assert len(result) == 64
+
+
+# ---------------------------------------------------------------------------
+# Node blocks (ray.sub: one block per Slurm heterogeneous-job component)
+# ---------------------------------------------------------------------------
+
+
+class TestNodeBlocks:
+    def test_counts_alive_gpu_nodes_per_block(self, monkeypatch):
+        nodes = [
+            # Dedicated Ray head: no node-block resource.
+            {"Alive": True, "Resources": {"CPU": 72.0, "ray_head": 1.0}},
+            {"Alive": True, "Resources": {"GPU": 4.0, "node_block_1": 1.0}},
+            {"Alive": True, "Resources": {"GPU": 4.0, "node_block_0": 1.0}},
+            {"Alive": True, "Resources": {"GPU": 4.0, "node_block_1": 1.0}},
+            {"Alive": False, "Resources": {"GPU": 4.0, "node_block_1": 1.0}},
+        ]
+        monkeypatch.setattr(
+            "nemo_rl.distributed.virtual_cluster.ray.nodes", lambda: nodes
+        )
+        counts = get_node_block_counts()
+        assert counts == {0: 1, 1: 2}
+        assert list(counts) == [0, 1]
+
+    def test_homogeneous_cluster_has_no_node_blocks(self, monkeypatch):
+        nodes = [{"Alive": True, "Resources": {"GPU": 4.0, "topo_rank": 2.0}}]
+        monkeypatch.setattr(
+            "nemo_rl.distributed.virtual_cluster.ray.nodes", lambda: nodes
+        )
+        assert get_node_block_counts() == {}
+
+    def test_constraints_follow_block_order(self):
+        # Encoder block (2 nodes) then LLM block (16 nodes): logical nodes
+        # 0-1 (ranks 0-7 at 4 GPUs/node) land on block 0, the rest on 1.
+        constraints = node_block_constraints({1: 16, 0: 2}, num_nodes=18)
+        assert (
+            constraints
+            == [{"node_block_0": 0.001}] * 2 + [{"node_block_1": 0.001}] * 16
+        )
+
+    def test_constraints_require_all_block_nodes(self):
+        with pytest.raises(ValueError, match="must equal the number of GPU nodes"):
+            node_block_constraints({0: 1, 1: 4}, num_nodes=4)
+
+    def test_explicit_blocks_set_the_order_and_subset(self):
+        # A cluster that uses blocks 2 then 1 of a three-block job: block 2's
+        # nodes take the first ranks, block 0 is left for another cluster.
+        counts = {0: 4, 1: 2, 2: 16}
+        constraints = node_block_constraints(counts, num_nodes=18, blocks=[2, 1])
+        assert (
+            constraints
+            == [{"node_block_2": 0.001}] * 16 + [{"node_block_1": 0.001}] * 2
+        )
+
+    @pytest.mark.parametrize("blocks", [[0, 0], [0, 3]])
+    def test_explicit_blocks_must_be_distinct_and_exist(self, blocks):
+        with pytest.raises(ValueError, match="must be distinct and exist"):
+            node_block_constraints({0: 1, 1: 1}, num_nodes=2, blocks=blocks)
+
+    def test_prepare_segment_topology_warns_when_node_blocks_are_ignored(
+        self, monkeypatch, caplog
+    ):
+        # Algorithms other than SFT v2 go through prepare_segment_topology() and
+        # never read node blocks; they must say so instead of placing silently.
+        nodes = [{"Alive": True, "Resources": {"GPU": 4.0, "node_block_0": 1.0}}]
+        monkeypatch.setattr(
+            "nemo_rl.distributed.virtual_cluster.ray.is_initialized", lambda: True
+        )
+        monkeypatch.setattr(
+            "nemo_rl.distributed.virtual_cluster.ray.nodes", lambda: nodes
+        )
+        with caplog.at_level("WARNING", logger="nemo_rl.distributed.virtual_cluster"):
+            assert prepare_segment_topology(None, num_nodes=1) == (None, [], {})
+        assert "ignores node blocks" in caplog.text
+
+    def test_explicit_blocks_check_num_nodes_against_used_blocks_only(self):
+        with pytest.raises(ValueError, match=r"node blocks \[1\]"):
+            node_block_constraints({0: 1, 1: 4}, num_nodes=5, blocks=[1])

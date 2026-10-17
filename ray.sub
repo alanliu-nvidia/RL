@@ -41,13 +41,14 @@ trap _nrl_log_exit EXIT TERM HUP INT
 # Function to detect if SLURM cluster uses GRES
 ########################################################
 maybe_gres_arg() {
-  # Check if any nodes in the partition have GRES configured
-  # Assumes a homogeneous allocation (not a heterogeneous job)
-  if sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep -q "gpu:"; then
+  # Check if any nodes in the probed partition have GRES configured. Reads one
+  # partition (GPU_PROBE_PARTITION: component 0, or component 1 when component 0
+  # is a 1-node dedicated head), so every GPU component must use the same node type.
+  if sinfo -p $GPU_PROBE_PARTITION -h -o "%G" | grep -q "gpu:"; then
     # Do a quick assert here that gpus:8 == gpus:$GPUS_PER_NODE. It is probably a user error if someone isn't using GPUS_PER_NODE=8 on our clusters if it supports --gres=gpu:8 or gpu:a100:8
     # Some clusters append socket specs like "(S:0-3)" to the GRES string.
-    if [[ $GPUS_PER_NODE -ne $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:" | cut -d'(' -f1 | awk -F: '{print $NF}') ]]; then
-      echo "Error: GPUS_PER_NODE=$GPUS_PER_NODE but GRES detected is $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:") meaning GPUS_PER_NODE is not set to fully claim the GPUs on the nodes." >&2
+    if [[ $GPUS_PER_NODE -ne $(sinfo -p $GPU_PROBE_PARTITION -h -o "%G" | grep "gpu:" | cut -d'(' -f1 | awk -F: '{print $NF}') ]]; then
+      echo "Error: GPUS_PER_NODE=$GPUS_PER_NODE but GRES detected is $(sinfo -p $GPU_PROBE_PARTITION -h -o "%G" | grep "gpu:") meaning GPUS_PER_NODE is not set to fully claim the GPUs on the nodes." >&2
       exit 1
     fi
     echo "--gres=gpu:${GPUS_PER_NODE}"
@@ -62,23 +63,25 @@ maybe_gres_arg() {
 # Function to detect the number of CPUs per node from SLURM
 ########################################################
 detect_cpus_per_node() {
-  # Query SLURM for the total number of CPUs (CPUTot) on the first allocated
-  # node. With --exclusive whole-node allocations (the default for this script)
+  # Query SLURM for the total number of CPUs (CPUTot) on the first node of the
+  # given nodelist (default: the probed GPU component, GPU_PROBE_NODELIST).
+  # With --exclusive whole-node allocations (the default for this script)
   # this is the full CPU count of the node, which is what we want to claim per
   # worker so Ray sees every CPU.
   #
-  # ASSUMPTION: all allocated nodes have the same CPU count (homogeneous
-  # allocation), so reading a single node is sufficient. We deliberately do
-  # NOT query every node: each `scontrol show node` is an RPC to the SLURM
-  # controller, and issuing one per node across many jobs launched in a burst
-  # (e.g. CI) can overwhelm the controller. If your allocation is
-  # heterogeneous, set CPUS_PER_WORKER explicitly instead. On any failure we
-  # exit (no heuristic fallback); set CPUS_PER_WORKER explicitly to override.
+  # ASSUMPTION: all GPU nodes have the same CPU count, so reading a single
+  # node is sufficient. In a heterogeneous job this reads one node of the
+  # probed GPU component only, so every GPU component must use the same node
+  # type. We deliberately do NOT query every node: each `scontrol show node`
+  # is an RPC to the SLURM controller, and issuing one per node across many
+  # jobs launched in a burst (e.g. CI) can overwhelm the controller. If your
+  # GPU nodes differ, set CPUS_PER_WORKER explicitly instead. On any failure
+  # we exit (no heuristic fallback); set CPUS_PER_WORKER explicitly to override.
   local nodelist first_node raw cpus
   # `scontrol show hostnames` expands the compressed nodelist string locally
   # (no controller RPC). Take the first line with parameter expansion (no
   # head/grep pipeline, to avoid `set -e`/`pipefail` foot-guns).
-  nodelist=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
+  nodelist=$(scontrol show hostnames "${1:-$GPU_PROBE_NODELIST}")
   first_node=${nodelist%%$'\n'*}
   # Parse "CPUTot=<n>" out of the single-line (`-o`) node description using
   # pure bash parameter expansion.
@@ -252,6 +255,20 @@ case "$DEDICATED_RAY_HEAD" in
     ;;
 esac
 
+# ray.sub probes the node type (GPU GRES, CPU count) from one component. With
+# DEDICATED_RAY_HEAD=1 in a heterogeneous job whose component 0 is a single node,
+# that node is the Ray head only and may sit on a CPU partition, so probe the
+# first GPU component (1) instead. Every GPU component must use the same node type.
+GPU_PROBE_PARTITION=$SLURM_JOB_PARTITION
+GPU_PROBE_NODELIST=$SLURM_JOB_NODELIST
+HEAD_OWN_COMPONENT=0
+if [[ -n "${SLURM_HET_SIZE:-}" && "${SLURM_HET_SIZE}" -gt 1 && "$DEDICATED_RAY_HEAD" == "1" && "${SLURM_JOB_NUM_NODES_HET_GROUP_0:-}" == "1" ]]; then
+  HEAD_OWN_COMPONENT=1
+  GPU_PROBE_PARTITION=${SLURM_JOB_PARTITION_HET_GROUP_1:-$SLURM_JOB_PARTITION}
+  GPU_PROBE_NODELIST=$SLURM_JOB_NODELIST_HET_GROUP_1
+  echo "[INFO] Heterogeneous job with a 1-node dedicated head component: probing GRES and CPUs from component 1 ($GPU_PROBE_PARTITION)."
+fi
+
 # Detect GRES support and set GRES_ARG
 log_phase "detecting GRES support (sinfo)"
 GRES_ARG=$(maybe_gres_arg)
@@ -273,14 +290,15 @@ COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
 # Number of CPUs per worker node. If the user did not set CPUS_PER_WORKER
 # explicitly, auto-detect it from SLURM so we claim every CPU the node actually
 # has (instead of the old GPUS_PER_NODE * 16 heuristic, which under-claims on
-# nodes with more cores). Detection queries a single node and assumes a
-# homogeneous allocation; set CPUS_PER_WORKER explicitly to override.
+# nodes with more cores). Detection queries a single node of the probed GPU
+# component and assumes all GPU nodes match; set CPUS_PER_WORKER explicitly
+# to override.
 if [[ -n "${CPUS_PER_WORKER:-}" ]]; then
   echo "[INFO] Using user-provided CPUS_PER_WORKER=$CPUS_PER_WORKER."
 else
   log_phase "auto-detecting CPUs per node (scontrol show node)"
   CPUS_PER_WORKER=$(detect_cpus_per_node)
-  echo "[INFO] Auto-detected CPUS_PER_WORKER=$CPUS_PER_WORKER from SLURM (CPUTot of first allocated node)."
+  echo "[INFO] Auto-detected CPUS_PER_WORKER=$CPUS_PER_WORKER from SLURM (CPUTot of the first probed GPU node)."
 fi
 
 # ---------------------------------------------------------------------------
@@ -415,17 +433,37 @@ export RAY_process_group_cleanup_enabled="${RAY_process_group_cleanup_enabled:-1
 num_retries=3
 WORKER_NUM_RETRIES=20
 
+# Getting the node names in the SLURM allocation. A heterogeneous job
+# (#SBATCH hetjob) runs one Ray cluster across all of its components, but
+# SLURM_JOB_NODELIST and SLURM_JOB_NUM_NODES describe only component 0. List
+# every component and record each node's component in NODE_HET_COMPONENT.
+declare -A NODE_HET_COMPONENT
+if [[ -n "${SLURM_HET_SIZE:-}" ]]; then
+  nodes=""
+  for (( _g = 0; _g < SLURM_HET_SIZE; _g++ )); do
+    _nodelist_var=SLURM_JOB_NODELIST_HET_GROUP_$_g
+    for _node in $(scontrol show hostnames "${!_nodelist_var}"); do
+      nodes+="$_node"$'\n'
+      NODE_HET_COMPONENT[$_node]=$_g
+    done
+  done
+else
+  nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
+fi
+nodes_array=($nodes)
+NUM_NODES=${#nodes_array[@]}
+
 # Total Ray worker_units expected once every schedulable GPU node has
 # registered. In dedicated-head mode the first physical node runs only the Ray
 # control plane and driver, and intentionally contributes no GPU worker units.
-NUM_RAY_GPU_NODES=$((SLURM_JOB_NUM_NODES - DEDICATED_RAY_HEAD))
+NUM_RAY_GPU_NODES=$((NUM_NODES - DEDICATED_RAY_HEAD))
 if (( NUM_RAY_GPU_NODES <= 0 )); then
   echo "Error: dedicated Ray head requires at least one additional GPU worker node." >&2
   exit 1
 fi
 NUM_ACTORS=$((GPUS_PER_NODE * NUM_RAY_GPU_NODES))
 if (( DEDICATED_RAY_HEAD == 1 )); then
-  echo "[INFO] DEDICATED_RAY_HEAD=1: $NUM_RAY_GPU_NODES of $SLURM_JOB_NUM_NODES allocated nodes are GPU compute nodes."
+  echo "[INFO] DEDICATED_RAY_HEAD=1: $NUM_RAY_GPU_NODES of $NUM_NODES allocated nodes are GPU compute nodes."
   echo "[INFO] Size your driver COMMAND to $NUM_RAY_GPU_NODES nodes (cluster.num_nodes, plus env.nemo_gym.num_gpu_nodes when set); ray.sub cannot validate this for you."
 fi
 
@@ -446,9 +484,7 @@ check_srun_processes() {
   done
 }
 
-# Getting the node names and IP addresses in the SLURM allocation
-nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
-nodes_array=($nodes)
+# Getting the IP addresses of the nodes in the SLURM allocation
 ip_addresses_array=()
 
 log_phase "resolving ${#nodes_array[@]} node hostname(s) to IPs"
@@ -494,15 +530,17 @@ for node in $nodes; do
     ip_addresses_array+=("$ip_address")
 done
 
-# Sort nodes alphabetically for deterministic startup order.
+# Sort nodes alphabetically for deterministic startup order (component by
+# component in a heterogeneous job, so the head is the first node of component 0).
 _sorted_pairs=()
 for (( _si = 0; _si < ${#nodes_array[@]}; _si++ )); do
-  _sorted_pairs+=("${nodes_array[$_si]}|${ip_addresses_array[$_si]}")
+  _sorted_pairs+=("${NODE_HET_COMPONENT[${nodes_array[$_si]}]:-0}|${nodes_array[$_si]}|${ip_addresses_array[$_si]}")
 done
-IFS=$'\n' _sorted_pairs=($(printf '%s\n' "${_sorted_pairs[@]}" | sort)); unset IFS
+IFS=$'\n' _sorted_pairs=($(printf '%s\n' "${_sorted_pairs[@]}" | sort -t'|' -k1,1n -k2)); unset IFS
 nodes_array=()
 ip_addresses_array=()
 for _pair in "${_sorted_pairs[@]}"; do
+  _pair=${_pair#*|}
   nodes_array+=("${_pair%%|*}")
   ip_addresses_array+=("${_pair##*|}")
 done
@@ -555,11 +593,14 @@ if [[ -n "\${SLURM_TOPOLOGY_ADDR:-}" && "\${SLURM_TOPOLOGY_ADDR_PATTERN:-}" == "
 elif [[ -n "\${SLURM_PROCID:-}" ]]; then
   # Head srun and worker srun each start their own SLURM_PROCID counter at 0.
   # Head hardcoded to 1; workers get +2 so worker[0]=2, worker[62]=64 -- keeps
-  # all nodes at unique values >=1 (Ray drops value-0 custom resources).
+  # all nodes at unique values >=1 (Ray drops value-0 custom resources). In a
+  # heterogeneous job each srun --het-group restarts SLURM_PROCID at 0, so the
+  # launcher adds NRL_TOPO_RANK_OFFSET (node count of the earlier components) to
+  # keep topo_rank unique across components; 0 in a homogeneous job.
   if [[ "\$SLURMD_NODENAME" == "$head_node" ]]; then
     TOPO_RANK=1
   else
-    TOPO_RANK=\$(( 10#\$SLURM_PROCID + 2 ))
+    TOPO_RANK=\$(( 10#\$SLURM_PROCID + 2 + \${NRL_TOPO_RANK_OFFSET:-0} ))
   fi
 else
   _hostname_digits=\$(hostname | tr -dc '0-9')
@@ -597,9 +638,12 @@ else
 fi
 
 # Use \\\" so that when --resources="\$RAY_RESOURCES" expands, we pass valid JSON to ray
-# IMPORTANT: The key names "nvlink_domain_" and "topo_rank" below must stay in sync
-# with the constants NVLINK_DOMAIN_PREFIX and TOPO_RANK_KEY defined in
-# nemo_rl/distributed/virtual_cluster.py.
+# IMPORTANT: The key names "nvlink_domain_", "topo_rank" and "node_block_" below
+# must stay in sync with the constants NVLINK_DOMAIN_PREFIX, TOPO_RANK_KEY and
+# NODE_BLOCK_PREFIX defined in nemo_rl/distributed/virtual_cluster.py
+# (tests/unit/distributed/test_virtual_cluster.py checks this).
+# NRL_SLURM_HET_COMPONENT is the node's component in a heterogeneous job (set per
+# srun); it becomes the node's block index in the scheduler-neutral node_block_<n> key.
 # NRL_DEDICATED_RAY_HEAD=1 is exported only by the head under DEDICATED_RAY_HEAD=1.
 # That node runs the control plane and driver only, so it advertises no compute
 # resources: without worker_units and the topology keys, neither a GPU actor nor a
@@ -615,6 +659,9 @@ else
   fi
   if [[ -n "\$TOPO_RANK" ]]; then
     RAY_RESOURCES+=', \"topo_rank\": '\$TOPO_RANK
+  fi
+  if [[ -n "\${NRL_SLURM_HET_COMPONENT:-}" ]]; then
+    RAY_RESOURCES+=', \"node_block_'\${NRL_SLURM_HET_COMPONENT}'\": 1'
   fi
 fi
 RAY_RESOURCES+='}'
@@ -1075,31 +1122,74 @@ else
   echo "[INFO] SANDBOX_CONTAINER or SANDBOX_COMMAND not defined, skipping sandbox startup"
 fi
 
-# Start the Ray head.
+# Start the Ray head. In a heterogeneous job every srun targets one component
+# (--het-group), and NRL_SLURM_HET_COMPONENT passes that component to topology_probe.sh.
 log_phase "launching Ray head + worker sruns"
-srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
+_het_component=""
+_het_args=""
+if [[ -n "${SLURM_HET_SIZE:-}" ]]; then
+  _het_component=0
+  _het_args="--het-group=0"
+fi
+HEAD_SRUN_ARGS=$COMMON_SRUN_ARGS
+HEAD_CPUS_PER_TASK=$CPUS_PER_WORKER
+if (( HEAD_OWN_COMPONENT == 1 )); then
+  # The head's own component may be a CPU partition: request no GPU GRES for
+  # the head step and claim the head node's own CPU count.
+  HEAD_SRUN_ARGS=${COMMON_SRUN_ARGS#"$GRES_ARG"}
+  HEAD_CPUS_PER_TASK=$(detect_cpus_per_node "$head_node")
+  echo "[INFO] Dedicated head component: head srun without $GRES_ARG, --cpus-per-task=$HEAD_CPUS_PER_TASK."
+fi
+NRL_SLURM_HET_COMPONENT=$_het_component srun $_het_args $HEAD_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$HEAD_CPUS_PER_TASK -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
 SRUN_PIDS["ray-head"]=$!
 
-# Start the Ray workers (all nodes except the head) with a single batched srun, so
-# the number of srun/slurmctld RPCs stays constant regardless of node count. In
-# single-node mode there are no workers: the head already registers its GPUs as Ray
-# resources.
-_num_workers=$((SLURM_JOB_NUM_NODES - 1))
-if [[ $_num_workers -gt 0 ]]; then
-  # srun -o with %t produces per-task log files; zero-pad to the worker-count
-  # width so ray-worker-*.log filenames sort naturally (e.g. ray-worker-007.log).
-  _task_digits=${#_num_workers}
-  srun $COMMON_SRUN_ARGS --container-name=ray-worker --exact \
-    --nodes=$_num_workers \
-    --ntasks=$_num_workers \
-    --ntasks-per-node=1 \
-    --cpus-per-task=$CPUS_PER_WORKER \
-    --kill-on-bad-exit=0 \
-    --exclude="$head_node" \
-    -o "$LOG_DIR/ray-worker-%0${_task_digits}t.log" \
-    bash -x -c "$worker_cmd" &
-  SRUN_PIDS["ray-workers"]=$!
-else
+# Start the Ray workers (all nodes except the head) with a single batched srun per
+# component, so the number of srun/slurmctld RPCs stays constant regardless of node
+# count. In single-node mode there are no workers: the head already registers its
+# GPUs as Ray resources.
+_topo_rank_offset=0
+for (( _g = 0; _g < ${SLURM_HET_SIZE:-1}; _g++ )); do
+  _name=ray-workers
+  _num_workers=$NUM_NODES
+  if [[ -n "${SLURM_HET_SIZE:-}" ]]; then
+    _name+=-het$_g
+    _num_nodes_var=SLURM_JOB_NUM_NODES_HET_GROUP_$_g
+    _num_workers=${!_num_nodes_var}
+    _het_component=$_g
+    _het_args="--het-group=$_g"
+  fi
+  # Node count of this component before the head is subtracted: the topo_rank
+  # fallback (SLURM_PROCID + 2) restarts per srun, so later components are
+  # offset by the nodes of the earlier ones to keep topo_rank unique.
+  _component_nodes=$_num_workers
+  # The head runs on the first node of component 0.
+  _exclude_args=""
+  if (( _g == 0 )); then
+    _num_workers=$((_num_workers - 1))
+    _exclude_args="--exclude=$head_node"
+  fi
+  if [[ $_num_workers -gt 0 ]]; then
+    # srun -o with %t produces per-task log files; zero-pad to the worker-count
+    # width so ray-worker-*.log filenames sort naturally (e.g. ray-worker-007.log).
+    _log="ray-worker-%0${#_num_workers}t.log"
+    if [[ -n "${SLURM_HET_SIZE:-}" ]]; then
+      # In a heterogeneous job %t is off by one (task 0 -> 4294967295); name by node.
+      _log="ray-worker-het$_g-%N.log"
+    fi
+    NRL_SLURM_HET_COMPONENT=$_het_component NRL_TOPO_RANK_OFFSET=$_topo_rank_offset srun $_het_args $COMMON_SRUN_ARGS --container-name=ray-worker --exact \
+      --nodes=$_num_workers \
+      --ntasks=$_num_workers \
+      --ntasks-per-node=1 \
+      --cpus-per-task=$CPUS_PER_WORKER \
+      --kill-on-bad-exit=0 \
+      $_exclude_args \
+      -o "$LOG_DIR/$_log" \
+      bash -x -c "$worker_cmd" &
+    SRUN_PIDS[$_name]=$!
+  fi
+  _topo_rank_offset=$(( _topo_rank_offset + _component_nodes ))
+done
+if (( NUM_NODES == 1 )); then
   echo "[INFO] Single-node mode: head node is the only compute node, no workers to launch"
 fi
 
@@ -1122,7 +1212,8 @@ if [[ -n "$COMMAND" ]]; then
   # here because it also watches the head, whose exit is the normal success path.
   set +e
   while kill -0 "${SRUN_PIDS["ray-head"]}" 2>/dev/null; do
-    for _name in ray-workers sandbox; do
+    for _name in "${!SRUN_PIDS[@]}"; do
+      [[ "$_name" != ray-head ]] || continue
       _pid="${SRUN_PIDS[$_name]:-}"
       if [[ -n "$_pid" ]] && ! kill -0 "$_pid" 2>/dev/null; then
         echo "[ERROR] Background srun '$_name' (pid=$_pid) exited before the head; failing fast." >&2

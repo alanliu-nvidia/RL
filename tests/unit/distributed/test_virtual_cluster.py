@@ -44,10 +44,13 @@ from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW,
     DEFAULT_VLLM_PORT_RANGE_LOW,
     DEFAULT_VLLM_PORTS_PER_ENGINE,
+    NODE_BLOCK_PREFIX,
+    NVLINK_DOMAIN_PREFIX,
     PY_EXECUTABLES,
     RAY_CLUSTER_EXTERNAL,
     RAY_CLUSTER_REUSED_LOCAL,
     RAY_CLUSTER_STARTED_LOCAL,
+    TOPO_RANK_KEY,
     RayVirtualCluster,
     ResourceInsufficientError,
     _bind_socket_in_range,
@@ -61,8 +64,11 @@ from nemo_rl.utils.venvs import create_local_venv
 from tests.unit.conftest import TEST_ASSETS_DIR
 
 
+RAY_SUB_PATH = Path(__file__).resolve().parents[3] / "ray.sub"
+
+
 def _ray_sub_default(name: str) -> int:
-    ray_sub = (Path(__file__).resolve().parents[3] / "ray.sub").read_text()
+    ray_sub = RAY_SUB_PATH.read_text()
     match = re.search(
         rf'^{re.escape(name)}="?\$\{{[A-Z0-9_]+:-(\d+)\}}"?',
         ray_sub,
@@ -80,6 +86,18 @@ def test_ray_sub_default_handles_quoted_and_aliased_variables(
     name: str, expected: int
 ) -> None:
     assert _ray_sub_default(name) == expected
+
+
+@pytest.mark.parametrize(
+    "key", [NVLINK_DOMAIN_PREFIX, TOPO_RANK_KEY, NODE_BLOCK_PREFIX]
+)
+def test_ray_sub_registers_python_resource_keys(key: str) -> None:
+    # ray.sub writes the Ray resource keys by hand (bash cannot import Python). If
+    # they drift from the constants, get_node_block_counts() and the topology
+    # sort silently see nothing and fall back to plain placement.
+    ray_sub = RAY_SUB_PATH.read_text()
+    # ray.sub escapes the JSON quotes, so the key appears as \"<key>.
+    assert f'\\"{key}' in ray_sub, f"ray.sub no longer registers {key!r}"
 
 
 def test_get_node_ip_and_free_port_does_not_start_with_zero():
