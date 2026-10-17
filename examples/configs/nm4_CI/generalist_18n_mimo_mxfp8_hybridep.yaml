@@ -1,0 +1,47 @@
+# Component 0: 2 encoder nodes, no segment flag, ranks 0-7.
+# Component 1: 16 LLM nodes, --segment=16, ranks 8-71.
+defaults: generalist_16n_mxfp8_hybridep_aga.yaml
+logger:
+  gpu_monitoring:
+    collection_interval: 120
+    flush_interval: 120
+cluster:
+  num_nodes: 18
+checkpointing:
+  pretrained_checkpoint:
+    # Convert the same base checkpoint; only metadata/key prefixes may differ.
+    path: ${oc.env:NM4_CI_MIMO_CHECKPOINT,/data/models/nm4_nano_bridge_mimo}
+policy:
+  megatron_cfg:
+    manual_gc: true
+    manual_gc_interval: 100
+    model_overrides:
+      # 524288 tokens / language CP 64
+      moe_hybridep_max_num_tokens_per_rank: 8192
+    mimo:
+      single_owner_loader: true
+      parallelism:
+        module_parallelisms:
+          images:
+            tensor_model_parallel_size: 1
+            pipeline_model_parallel_size: 1
+            context_parallel_size: 1
+            expert_model_parallel_size: 1
+            expert_tensor_parallel_size: 1
+            data_parallel_size: 8
+            rank_offset: 0
+          language:
+            tensor_model_parallel_size: 1
+            pipeline_model_parallel_size: 1
+            context_parallel_size: 64
+            expert_model_parallel_size: 64
+            expert_tensor_parallel_size: 1
+            data_parallel_size: 1
+            rank_offset: 8
+data_plane:
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    storage_capacity: 1000000
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}

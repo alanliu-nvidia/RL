@@ -1,0 +1,17 @@
+defaults: _clevr_common.yaml
+cluster:
+  num_nodes: 4
+  segment_size: 4
+policy:
+  megatron_cfg:
+    # Match nm4_clevr_4n.yaml: 16 GPUs, TP1 / PP1 / CP16 / EP16 / GTP1.
+    context_parallel_size: 16
+    expert_model_parallel_size: 16
+logger:
+  log_dir: logs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/clevr_4n_mxfp8_cp16ep16_2k
+  wandb:
+    name: nm4-ci-clevr_4n_mxfp8_cp16ep16_2k-${oc.env:NM4_CI_RUN_TAG}
+  tensorboard:
+    log_dir: logs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/clevr_4n_mxfp8_cp16ep16_2k
+checkpointing:
+  checkpoint_dir: /data/nemorl-runs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/clevr_4n_mxfp8_cp16ep16_2k

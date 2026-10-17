@@ -10,3 +10,10 @@ logger:
     name: nm4-ci-checkpoint_16n_save10-${oc.env:NM4_CI_RUN_TAG}
   tensorboard:
     log_dir: logs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/checkpoint_16n_save10
+policy:
+  megatron_cfg:
+    scheduler:
+      # Same schedule in save10 and resume20 (the full 20-step run). SFT v2 sets train_iters = sft.max_num_steps, so
+      # without this save10 stores wd_incr_steps = 10 * GBS and resume20 builds 20 * GBS, and the restore fails the
+      # OptimizerParamScheduler check. max_steps also sets lr_decay_iters (constant LR and WD styles: no change).
+      max_steps: 20

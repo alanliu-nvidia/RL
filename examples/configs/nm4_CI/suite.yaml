@@ -189,8 +189,8 @@ cases:
     - 18
     - 19
     - 20
-  clevr_1n_mxfp8_cp1_2k:
-    config: clevr_1n_mxfp8_cp1_2k.yaml
+  clevr_1n_mxfp8_cp4ep4_2k:
+    config: clevr_1n_mxfp8_cp4ep4_2k.yaml
     steps:
     - 1
     - 2
@@ -212,8 +212,8 @@ cases:
     - 18
     - 19
     - 20
-  clevr_4n_mxfp8_cp4_2k:
-    config: clevr_4n_mxfp8_cp4_2k.yaml
+  clevr_4n_mxfp8_cp16ep16_2k:
+    config: clevr_4n_mxfp8_cp16ep16_2k.yaml
     steps: &id006
     - 1
     - 2
@@ -235,8 +235,9 @@ cases:
     - 18
     - 19
     - 20
-  clevr_16n_mxfp8_cp16_2k:
-    config: clevr_16n_mxfp8_cp16_2k.yaml
+  # DP4 execution check; the one/four-node references both use DP1.
+  clevr_16n_mxfp8_cp16ep16_2k:
+    config: clevr_16n_mxfp8_cp16ep16_2k.yaml
     steps: &id007
     - 1
     - 2
@@ -282,6 +283,7 @@ cases:
     - 19
     - 20
   checkpoint_16n_save10:
+    checkpoint_group: checkpoint-16n-split
     config: checkpoint_16n_save10.yaml
     steps: &id008
     - 1
@@ -295,6 +297,8 @@ cases:
     - 9
     - 10
   checkpoint_16n_resume20:
+    checkpoint_group: checkpoint-16n-split
+    resume_from: checkpoint_16n_save10
     config: checkpoint_16n_resume20.yaml
     steps: &id009
     - 11
@@ -393,18 +397,14 @@ checks:
   steps: *id005
   max_relative_loss_pct: 0.5
   strict_threshold: true
-- name: clevr_4n_mxfp8_cp4_2k_parity
-  candidate: clevr_4n_mxfp8_cp4_2k
-  reference_case: clevr_1n_mxfp8_cp1_2k
+# The one- and four-node cases both use DP1, GBS4 and identical data settings.
+- name: clevr_4n_mxfp8_cp16ep16_2k_parity
+  candidate: clevr_4n_mxfp8_cp16ep16_2k
+  reference_case: clevr_1n_mxfp8_cp4ep4_2k
   steps: *id006
   max_relative_loss_pct: 0.5
   strict_threshold: true
-- name: clevr_16n_mxfp8_cp16_2k_parity
-  candidate: clevr_16n_mxfp8_cp16_2k
-  reference_case: clevr_1n_mxfp8_cp1_2k
-  steps: *id007
-  max_relative_loss_pct: 0.5
-  strict_threshold: true
+# The sixteen-node case uses DP4, so it has no matching data-lane reference yet.
 - name: checkpoint_16n_save10_parity
   candidate: checkpoint_16n_save10
   reference_case: checkpoint_16n_uninterrupted

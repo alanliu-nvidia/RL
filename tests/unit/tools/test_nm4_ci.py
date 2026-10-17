@@ -15,6 +15,7 @@
 """CPU checks for the opt-in NM4 runner's failure and parity gates."""
 
 import json
+import os
 import subprocess
 import sys
 import types
@@ -27,6 +28,7 @@ SUITE_DIR = Path(__file__).resolve().parents[3] / "examples/configs/nm4_CI"
 sys.path.insert(0, str(SUITE_DIR))
 import check_losses  # noqa: E402
 import run_ci  # noqa: E402
+import run_sft_on_node_blocks  # noqa: E402
 
 
 @pytest.fixture
@@ -89,12 +91,35 @@ def test_case_geometry_and_resume_paths(suite: DictConfig, tmp_path: Path) -> No
         ].policy.megatron_cfg.model_overrides.expert_gtp_weight_remat_size
         == 2
     )
-    for nodes, cp in ((1, 1), (4, 4), (16, 16)):
-        config = configs[f"clevr_{nodes}n_mxfp8_cp{cp}_2k"]
+    for case, cp, ep in (
+        ("clevr_1n_mxfp8_cp4ep4_2k", 4, 4),
+        ("clevr_4n_mxfp8_cp16ep16_2k", 16, 16),
+        ("clevr_16n_mxfp8_cp16ep16_2k", 16, 16),
+    ):
+        config = configs[case]
         assert config.policy.max_total_sequence_length == 2048
         assert config.policy.megatron_cfg.context_parallel_size == cp
+        assert config.policy.megatron_cfg.expert_model_parallel_size == ep
+        assert config.policy.megatron_cfg.tensor_model_parallel_size == 1
+        assert config.policy.megatron_cfg.pipeline_model_parallel_size == 1
         assert config.policy.train_global_batch_size == 4
-        assert config.cluster.segment_size == nodes
+        assert config.cluster.segment_size == config.cluster.num_nodes
+    # Paired CLEVR cases must retain the same Energon data-lane count.
+    for check in suite.checks:
+        if check.candidate.startswith("clevr_"):
+            candidate = configs[check.candidate]
+            reference = configs[check.reference_case]
+            assert (
+                candidate.cluster.num_nodes
+                * candidate.cluster.gpus_per_node
+                // candidate.policy.megatron_cfg.context_parallel_size
+                == reference.cluster.num_nodes
+                * reference.cluster.gpus_per_node
+                // reference.policy.megatron_cfg.context_parallel_size
+            )
+    assert all(
+        check.candidate != "clevr_16n_mxfp8_cp16ep16_2k" for check in suite.checks
+    )
     assert (
         configs["checkpoint_16n_save10"].checkpointing.checkpoint_dir
         == configs["checkpoint_16n_resume20"].checkpointing.checkpoint_dir
@@ -173,41 +198,45 @@ def test_complete_metrics_cannot_hide_failed_driver(
         check_losses.read_local_result(directory, case="case", steps=[1, 2])
 
 
+@pytest.mark.parametrize("prefix", ["16n", "18n_mimo"])
 def test_resume_rejects_missing_save_phase_and_incomplete_checkpoint(
-    suite: DictConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    suite: DictConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prefix: str
 ) -> None:
+    if prefix == "18n_mimo":
+        suite = OmegaConf.load(SUITE_DIR / "mimo_suite.yaml")
+    save_case = f"checkpoint_{prefix}_save10"
+    resume_case = f"checkpoint_{prefix}_resume20"
     config = run_ci.compose_case(
-        "checkpoint_16n_resume20", suite=suite, run_dir=tmp_path, overrides=[]
+        resume_case, suite=suite, run_dir=tmp_path, overrides=[]
     )
     with pytest.raises(FileNotFoundError):
         run_ci.resume_environment(
-            tmp_path, case="checkpoint_16n_resume20", config=config
+            tmp_path, case=resume_case, config=config, suite=suite
         )
     write_result(
-        tmp_path / "checkpoint_16n_save10",
-        case="checkpoint_16n_save10",
+        tmp_path / save_case,
+        case=save_case,
         steps=list(range(1, 11)),
     )
     with pytest.raises(ValueError, match="Missing finalized"):
         run_ci.resume_environment(
-            tmp_path, case="checkpoint_16n_resume20", config=config
+            tmp_path, case=resume_case, config=config, suite=suite
         )
     checkpoint = Path(config.checkpointing.checkpoint_dir) / "step_10"
     (checkpoint / "policy/weights").mkdir(parents=True)
     (checkpoint / "training_info.json").write_text("{}")
     (checkpoint / "sft_v2_loaders.pt").write_bytes(b"fixture")
     env = run_ci.resume_environment(
-        tmp_path, case="checkpoint_16n_resume20", config=config
+        tmp_path, case=resume_case, config=config, suite=suite
     )
     assert env["NEMO_RL_REQUIRE_RESUME"] == "1"
     assert env["NEMO_RL_EXPECTED_RESUME_CHECKPOINT"] == str(checkpoint)
     monkeypatch.setenv("NEMO_RL_REQUIRE_RESUME", "1")
     monkeypatch.setenv("NEMO_RL_EXPECTED_RESUME_CHECKPOINT", "wrong")
-    fresh = run_ci.compose_case(
-        "generalist_16n_mxfp8_hybridep", suite=suite, run_dir=tmp_path, overrides=[]
-    )
+    fresh_case = next(iter(suite.cases))
+    fresh = run_ci.compose_case(fresh_case, suite=suite, run_dir=tmp_path, overrides=[])
     assert "NEMO_RL_REQUIRE_RESUME" not in run_ci.resume_environment(
-        tmp_path, case="generalist_16n_mxfp8_hybridep", config=fresh
+        tmp_path, case=fresh_case, config=fresh, suite=suite
     )
 
 
@@ -277,16 +306,22 @@ def test_offline_checker_cli(tmp_path: Path) -> None:
     "failure",
     [None, "driver", "completion", "export", "nan", "missing_steps", "timeout"],
 )
+@pytest.mark.parametrize("control", [False, True])
 def test_driver_and_export_gates(
     suite: DictConfig,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     failure: str | None,
+    control: bool,
 ) -> None:
     """Exercise execution and artifact writing with fake training, without GPUs."""
     case = "generalist_16n_mxfp8_hybridep"
+    if control:
+        suite = OmegaConf.load(SUITE_DIR / "mimo_suite.yaml")
+        case = "generalist_16n_mxfp8_hybridep_aga"
+    monkeypatch.setenv("NM4_CI_NODE_BLOCKS", "[99]")
     config = run_ci.compose_case(case, suite=suite, run_dir=tmp_path, overrides=[])
-    monkeypatch.setattr(run_ci, "require_allocation", lambda config: None)
+    monkeypatch.setattr(run_ci, "require_allocation", lambda config, **kwargs: None)
     terminated = []
     monkeypatch.setattr(run_ci.os, "killpg", lambda pid, sig: terminated.append(pid))
 
@@ -294,7 +329,15 @@ def test_driver_and_export_gates(
         pid = 123456
 
         def __init__(self, command: list[str], **kwargs: object) -> None:
-            assert command[:4] == ["uv", "run", "--no-sync", "examples/run_sft_v2.py"]
+            assert command[:3] == ["uv", "run", "--no-sync"]
+            assert command[3] == (
+                "examples/configs/nm4_CI/run_sft_on_node_blocks.py"
+                if control
+                else "examples/run_sft_v2.py"
+            )
+            assert kwargs["env"].get("NM4_CI_NODE_BLOCKS") == (
+                "[1]" if control else None
+            )
             kwargs["stdout"].write(
                 "{}" if failure == "completion" else "{'total_steps': 20}"
             )
@@ -339,3 +382,244 @@ def test_driver_and_export_gates(
     assert bool(result["error"]) == bool(failure)
     if failure == "timeout":
         assert terminated == [FakeDriver.pid]
+
+
+@pytest.fixture
+def mimo_suite(suite: DictConfig) -> DictConfig:
+    return OmegaConf.load(SUITE_DIR / "mimo_suite.yaml")
+
+
+def test_mimo_geometry_and_matching_inputs(
+    mimo_suite: DictConfig, tmp_path: Path
+) -> None:
+    configs = {
+        case: run_ci.compose_case(
+            case, suite=mimo_suite, run_dir=tmp_path, overrides=[]
+        )
+        for case in mimo_suite.cases
+    }
+    assert len(configs) == 4
+    control = configs["generalist_16n_mxfp8_hybridep_aga"]
+    reference = configs["generalist_18n_mimo_mxfp8_hybridep"]
+    assert control.cluster.num_nodes == 16
+    assert reference.cluster.num_nodes == 18
+    assert reference.cluster.segment_size is None
+    assert reference.cluster.gpus_per_node == control.cluster.gpus_per_node == 4
+    assert control.data == reference.data
+    assert control.data.energon.task_encoder.packing.buffer_size == 500
+    assert control.data.train.path == (
+        "/opt/nemo-rl/examples/configs/sft_v2_tests/sft_super35_generalist_full_cmh.yaml"
+    )
+    assert (
+        control.policy.train_global_batch_size
+        == reference.policy.train_global_batch_size
+        == 1
+    )
+    assert (
+        control.policy.max_total_sequence_length
+        == reference.policy.max_total_sequence_length
+    )
+    assert control.sft.seed == reference.sft.seed == 42
+    modules = reference.policy.megatron_cfg.mimo.parallelism.module_parallelisms
+    assert modules.images.data_parallel_size == 8
+    assert modules.images.rank_offset == 0
+    assert modules.language.rank_offset == 8
+    assert (
+        modules.language.context_parallel_size
+        == modules.language.expert_model_parallel_size
+        == 64
+    )
+    assert modules.language.data_parallel_size == 1
+    for config in configs.values():
+        assert config.policy.megatron_cfg.optimizer.use_distributed_optimizer
+        assert config.policy.megatron_cfg.moe_flex_dispatcher_backend == "hybridep"
+        assert config.policy.megatron_cfg.context_parallel_size == 64
+        assert config.policy.megatron_cfg.expert_model_parallel_size == 64
+        assert not config.logger.wandb_enabled
+    save = configs["checkpoint_18n_mimo_save10"]
+    resume = configs["checkpoint_18n_mimo_resume20"]
+    assert save.checkpointing.checkpoint_dir == resume.checkpointing.checkpoint_dir
+    assert save.checkpointing.checkpoint_dir != reference.checkpointing.checkpoint_dir
+    assert save.checkpointing.enabled and save.checkpointing.save_optimizer
+    assert not save.policy.megatron_cfg.checkpoint.async_save
+    assert save.sft.max_num_steps == save.checkpointing.save_period == 10
+    assert resume.sft.max_num_steps == 20
+
+
+@pytest.mark.parametrize("control", [False, True])
+@pytest.mark.parametrize(
+    "failure", [None, "missing_encoder", "wrong_tag", "double_tag", "wrong_gpu_count"]
+)
+def test_mimo_allocation_components(
+    mimo_suite: DictConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    control: bool,
+    failure: str | None,
+) -> None:
+    nodes = [
+        {"Alive": True, "Resources": {"GPU": 4, f"node_block_{block}": 1}}
+        for block, count in ((0, 2), (1, 16))
+        for _ in range(count)
+    ]
+    if failure == "missing_encoder":
+        nodes.pop(0)
+    elif failure == "wrong_tag":
+        nodes[0]["Resources"] = {"GPU": 4, "node_block_2": 1}
+    elif failure == "double_tag":
+        nodes[0]["Resources"]["node_block_1"] = 1
+    elif failure == "wrong_gpu_count":
+        nodes[-1]["Resources"]["GPU"] = 3
+    stopped = []
+    monkeypatch.setitem(
+        sys.modules,
+        "ray",
+        types.SimpleNamespace(
+            init=lambda **kwargs: None,
+            nodes=lambda: nodes,
+            shutdown=lambda: stopped.append(True),
+        ),
+    )
+    case = (
+        "generalist_16n_mxfp8_hybridep_aga"
+        if control
+        else "generalist_18n_mimo_mxfp8_hybridep"
+    )
+    config = run_ci.compose_case(case, suite=mimo_suite, run_dir=tmp_path, overrides=[])
+    args = dict(
+        components=mimo_suite.het_components, node_blocks=[1] if control else None
+    )
+    if failure:
+        with pytest.raises(ValueError):
+            run_ci.require_allocation(config, **args)
+    else:
+        run_ci.require_allocation(config, **args)
+    assert stopped == [True]
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_control_entrypoint_selects_llm_nodes_and_restores_hook(
+    monkeypatch: pytest.MonkeyPatch,
+    fail: bool,
+) -> None:
+    seen = []
+
+    def constraints(
+        counts: dict[int, int], num_nodes: int, blocks: list[int] | None = None
+    ) -> None:
+        assert counts == {0: 2, 1: 16} and num_nodes == 16 and blocks == [1]
+        seen.append(blocks)
+
+    fake_sft = types.SimpleNamespace(node_block_constraints=constraints)
+    monkeypatch.setitem(
+        sys.modules, "nemo_rl.algorithms", types.SimpleNamespace(sft_v2=fake_sft)
+    )
+    monkeypatch.setenv("NM4_CI_NODE_BLOCKS", "[1]")
+
+    def run(path: str, *, run_name: str) -> None:
+        assert path.endswith("examples/run_sft_v2.py") and run_name == "__main__"
+        fake_sft.node_block_constraints({0: 2, 1: 16}, 16)
+        if fail:
+            raise RuntimeError("fake training error")
+
+    monkeypatch.setattr(run_sft_on_node_blocks.runpy, "run_path", run)
+    if fail:
+        with pytest.raises(RuntimeError, match="fake training error"):
+            run_sft_on_node_blocks.main()
+    else:
+        run_sft_on_node_blocks.main()
+    assert seen == [[1]]
+    assert fake_sft.node_block_constraints is constraints
+
+
+def test_mimo_checker_detects_restart_spike(
+    mimo_suite: DictConfig, tmp_path: Path
+) -> None:
+    for case, spec in mimo_suite.cases.items():
+        write_result(tmp_path / case, case=case, steps=list(spec.steps))
+    command = [
+        sys.executable,
+        str(SUITE_DIR / "check_losses.py"),
+        "--suite",
+        str(SUITE_DIR / "mimo_suite.yaml"),
+        "--artifacts",
+        str(tmp_path),
+        "--output",
+        str(tmp_path / "summary.json"),
+    ]
+    assert subprocess.run(command, capture_output=True).returncode == 0
+    result = json.loads((tmp_path / "summary.json").read_text())
+    assert set(result["checks"]) == {
+        "non_mimo_vs_mimo",
+        "mimo_save_parity",
+        "mimo_resume_parity",
+    }
+    path = tmp_path / "checkpoint_18n_mimo_resume20/metrics.json"
+    metrics = json.loads(path.read_text())
+    metrics["loss"]["11"] = 1.02
+    path.write_text(json.dumps(metrics))
+    assert subprocess.run(command, capture_output=True).returncode == 1
+    assert (
+        "mimo_resume_parity"
+        in json.loads((tmp_path / "summary.json").read_text())["errors"]
+    )
+
+
+def test_mimo_plan_cli(tmp_path: Path) -> None:
+    command = [
+        sys.executable,
+        str(SUITE_DIR / "run_ci.py"),
+        "plan",
+        "--suite",
+        str(SUITE_DIR / "mimo_suite.yaml"),
+        "--run-tag",
+        "mimo-test",
+        "--artifacts",
+        str(tmp_path),
+    ]
+    # Match execution from the repository root in an uninstalled source checkout.
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": str(SUITE_DIR.parents[2])},
+    )
+    assert result.returncode == 0, result.stderr
+    plan = json.loads(result.stdout)
+    assert [case["nodes"] for case in plan] == [18, 16, 18, 18]
+    assert plan[1]["node_blocks"] == [1]
+    assert plan[3]["depends_on"] == "checkpoint_18n_mimo_save10"
+
+
+@pytest.mark.parametrize("fail_case", ["", "checkpoint_18n_mimo_save10"])
+def test_mimo_loop_order_and_failure_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_case: str
+) -> None:
+    fake_uv = tmp_path / "uv"
+    fake_uv.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "with open(os.environ['CALLS'], 'a') as f: f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "sys.exit(7 if os.environ['FAIL_CASE'] and os.environ['FAIL_CASE'] in sys.argv else 0)\n"
+    )
+    fake_uv.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("NM4_CI_RUN_TAG", "loop-test")
+    monkeypatch.setenv("NM4_CI_ARTIFACTS", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("CALLS", str(tmp_path / "calls.jsonl"))
+    monkeypatch.setenv("FAIL_CASE", fail_case)
+    result = subprocess.run(
+        ["bash", str(SUITE_DIR / "run_mimo_ci.sh"), "--override", "sft.seed=43"],
+        capture_output=True,
+    )
+    calls = [
+        json.loads(line) for line in (tmp_path / "calls.jsonl").read_text().splitlines()
+    ]
+    assert result.returncode == (7 if fail_case else 0), result.stderr
+    cases = [call[call.index("--case") + 1] for call in calls if "--case" in call]
+    expected = list(OmegaConf.load(SUITE_DIR / "mimo_suite.yaml").cases)
+    assert cases == (expected[:3] if fail_case else expected)
+    assert len(calls) == (3 if fail_case else 5)
+    assert all("sft.seed=43" in call for call in calls if "--case" in call)
+    if not fail_case:
+        assert calls[-1][2].endswith("check_losses.py")

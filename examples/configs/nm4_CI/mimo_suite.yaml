@@ -1,0 +1,46 @@
+description: Opt-in MIMO parity and checkpoint restart on one 2+16-node allocation.
+run_tag_env: NM4_CI_RUN_TAG
+metric: loss
+step_metric: nemo_rl/step
+relative_loss_formula: 100 * abs(candidate_loss - reference_loss) / abs(reference_loss)
+require_finished: true
+# Counts refer to Ray's node_block_<index> resources set by ray.sub.
+het_components:
+  0: 2
+  1: 16
+cases:
+  generalist_18n_mimo_mxfp8_hybridep:
+    config: generalist_18n_mimo_mxfp8_hybridep.yaml
+    steps: &all_steps [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+  generalist_16n_mxfp8_hybridep_aga:
+    config: generalist_16n_mxfp8_hybridep_aga.yaml
+    steps: *all_steps
+    node_blocks: [1]
+  checkpoint_18n_mimo_save10:
+    config: checkpoint_18n_mimo_save10.yaml
+    checkpoint_group: checkpoint-18n-mimo-split
+    steps: &save_steps [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+  checkpoint_18n_mimo_resume20:
+    config: checkpoint_18n_mimo_resume20.yaml
+    checkpoint_group: checkpoint-18n-mimo-split
+    resume_from: checkpoint_18n_mimo_save10
+    steps: &resume_steps [11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+checks:
+- name: non_mimo_vs_mimo
+  candidate: generalist_16n_mxfp8_hybridep_aga
+  reference_case: generalist_18n_mimo_mxfp8_hybridep
+  steps: *all_steps
+  max_relative_loss_pct: 0.5
+  strict_threshold: true
+- name: mimo_save_parity
+  candidate: checkpoint_18n_mimo_save10
+  reference_case: generalist_18n_mimo_mxfp8_hybridep
+  steps: *save_steps
+  max_relative_loss_pct: 0.5
+  strict_threshold: true
+- name: mimo_resume_parity
+  candidate: checkpoint_18n_mimo_resume20
+  reference_case: generalist_18n_mimo_mxfp8_hybridep
+  steps: *resume_steps
+  max_relative_loss_pct: 0.5
+  strict_threshold: true

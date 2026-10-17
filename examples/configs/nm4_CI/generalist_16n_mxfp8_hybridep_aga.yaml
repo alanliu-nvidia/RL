@@ -1,0 +1,12 @@
+# Control for MIMO parity on AGA; run on the 16-node LLM component.
+defaults: generalist_16n_mxfp8_hybridep.yaml
+cluster:
+  # Segment size is supplied per Slurm component, not to the Ray placement layer.
+  segment_size: null
+data:
+  train:
+    path: /opt/nemo-rl/examples/configs/sft_v2_tests/sft_super35_generalist_full_cmh.yaml
+  energon:
+    task_encoder:
+      packing:
+        buffer_size: 500

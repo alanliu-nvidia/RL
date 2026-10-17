@@ -1,0 +1,9 @@
+defaults: generalist_18n_mimo_mxfp8_hybridep.yaml
+checkpointing:
+  enabled: true
+  checkpoint_dir: /data/nemorl-runs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/checkpoint-18n-mimo-split
+policy:
+  megatron_cfg:
+    scheduler:
+      # Same schedule as checkpoint_18n_mimo_save10 (the full 20-step run; see the comment there).
+      max_steps: 20

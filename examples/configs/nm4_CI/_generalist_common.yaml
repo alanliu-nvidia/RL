@@ -1,4 +1,4 @@
-defaults: ../sft_v2_tests/nm4_generalist_16n_mxfp8_cp64ep64_gbs1.yaml
+defaults: ../sft_v2_tests/nm4_generalist_16n_mxfp8_cp64ep64_gbs4.yaml
 sft:
   max_num_steps: 20
   max_consecutive_step_failures: 0

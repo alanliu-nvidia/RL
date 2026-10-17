@@ -1,5 +1,9 @@
 # Opt-in NM4 functional CI
 
+For the separate 18-node MIMO / 16-node non-MIMO comparison and MIMO
+save/restart loop, see [MIMO CI](mimo-ci.md). It reuses one 2+16-node
+heterogeneous allocation and is selected with `--suite mimo_suite.yaml`.
+
 These 14 recipes exercise the NM4 production architecture for 20 optimizer steps
 (10 steps per restart phase). They were copied from AGA's `sft_v2_up_n4` project
 to HSG's `sft_v2_n4_oct6_rebase` project. The suite runs only when explicitly
@@ -7,7 +11,7 @@ selected; it is not included in the default GB200 nightly list and does not
 submit Slurm jobs automatically.
 
 Generalist recipes inherit the data path and sequence length from
-`../sft_v2_tests/nm4_generalist_16n_mxfp8_cp64ep64_gbs1.yaml`. The AGA source used
+`../sft_v2_tests/nm4_generalist_16n_mxfp8_cp64ep64_gbs4.yaml`. The AGA source used
 524288 tokens; the HSG parent currently uses **131072**. Always inspect the
 resolved plan/config rather than assuming those settings are identical.
 The CI common fragment selects `/data/models/nm4_nano_bridge`, seed 42 and Muon.
@@ -25,9 +29,9 @@ or overridden to readable paths. Training data is not copied by this suite.
 | `generalist_32n_mxfp8_egtp2.yaml` | 32 × 4 | 64 / 64 | 1 / 2 | 2 | Expert GTP2 parity |
 | `generalist_32n_mxfp8_muon_padded.yaml` | 32 × 4 | 64 / 64 | 1 / 1 | 2 | Explicit layer-wise padded layout |
 | `generalist_32n_mxfp8_muon_compact.yaml` | 32 × 4 | 64 / 64 | 1 / 1 | 2 | Compact layout, distributed optimizer disabled |
-| `clevr_1n_mxfp8_cp1_2k.yaml` | 1 × 4 | 1 / 4 | 1 / 1 | 4 | CLEVR CP1 reference, 2K tokens |
-| `clevr_4n_mxfp8_cp4_2k.yaml` | 4 × 4 | 4 / 4 | 1 / 1 | 4 | CLEVR CP4 parity, 2K tokens |
-| `clevr_16n_mxfp8_cp16_2k.yaml` | 16 × 4 | 16 / 4 | 1 / 1 | 4 | CLEVR CP16 parity, 2K tokens |
+| `clevr_1n_mxfp8_cp4ep4_2k.yaml` | 1 × 4 | 4 / 4 | 1 / 1 | 4 | CLEVR DP1 reference, 2K tokens |
+| `clevr_4n_mxfp8_cp16ep16_2k.yaml` | 4 × 4 | 16 / 16 | 1 / 1 | 4 | CLEVR CP/EP parity against one-node DP1 reference |
+| `clevr_16n_mxfp8_cp16ep16_2k.yaml` | 16 × 4 | 16 / 16 | 1 / 1 | 4 | CLEVR DP4 execution/finite-metric check, 2K tokens |
 | `checkpoint_16n_uninterrupted.yaml` | 16 × 4 | 64 / 64 | 1 / 1 | 1 | Uninterrupted 20-step reference |
 | `checkpoint_16n_save10.yaml` | 16 × 4 | 64 / 64 | 1 / 1 | 1 | Ten steps, then save weights/optimizer/loaders |
 | `checkpoint_16n_resume20.yaml` | 16 × 4 | 64 / 64 | 1 / 1 | 1 | Fresh-process resume, steps 11–20 |
@@ -148,8 +152,8 @@ cases is a separate opt-in run.
   per-step relative loss difference is **greater than 10%**.
 - GTP2, EGTP2 and both Muon variants versus the 32-node GTP1 reference:
   maximum absolute per-step relative difference must be **less than 0.5%**.
-- alltoall versus the 16-node GTP1 HybridEP reference, and CLEVR CP4/CP16 versus
-  CP1: the same **less than 0.5%** gate.
+- alltoall versus the 16-node GTP1 HybridEP reference, and four-node CLEVR
+  CP16/EP16 versus one-node CP4/EP4: the same **less than 0.5%** gate.
 - Restart phase one versus uninterrupted steps 1–10, and restart phase two versus
   uninterrupted steps 11–20: the same **less than 0.5%** gate. Comparing step 11
   against uninterrupted step 11 detects a restart spike without confusing it with
@@ -199,11 +203,54 @@ it does not independently prove equality of every saved RNG/optimizer tensor.
 
 ## CLEVR context parallelism
 
-The CP sweep keeps **DP4, EP4, GBS4, microbatch1 and GTP1 fixed** while changing
-world size with CP. Using a fixed 16-GPU world would change DP from 16 to 4 to 1,
-which would also change Energon's data lanes and packing. The sweep uses the existing
-CLEVR data at `/data/nemorl-datasets/clevr`, 2048-token sequences and matching packing
-limits. Its loss baseline is independent of the generalist dataset.
+The one-node case uses CP4/EP4. Both the four- and sixteen-node cases use
+CP16/EP16. TP1, PP1, dense/expert GTP1, GBS4, microbatch1, 2048-token sequences
+and 20 optimizer steps are common to all three cases.
+
+The one- and four-node cases have DP1 and four microbatches per step. Their
+loss comparison uses matching Energon data-lane geometry and tests the combined
+CP/EP change. The sixteen-node case has DP4 and one microbatch per step; it checks
+execution and finite losses/gradients without claiming loss parity against the
+DP1 references.
+
+The four-node parallelism matches
+`../sft_v2_tests/nm4_clevr_4n.yaml`. Its former CP4/EP4 configuration placed
+128 of the 512 experts on each GPU and exhausted memory while creating Muon's
+FP32 master parameters. EP16 places 32 experts on each GPU.
+
+The one-node CP4/EP4 case still has 128 experts per GPU. On HSG allocation
+7948255 it failed during Muon FP32 master-parameter initialization with CUDA OOM.
+It remains in the suite so that the failure is visible; CLEVR loss parity is
+not established. All CLEVR cases use `/data/nemorl-datasets/clevr` and matching
+2048-token packing limits.
+
+### Four-node GPU validation
+
+HSG allocation 7951113 completed all 20 steps of
+`clevr_4n_mxfp8_cp16ep16_2k` with exit code 0 and finite loss/gradient metrics,
+using `rl-gym:pipe.72296264.sqsh`. Loss went from 10.0107 to 5.8952; mean policy
+time over steps 2–20 was 12.95 seconds. This is an execution check, not a loss
+parity result. The validation checkout was oct6 commit `0512eb04` plus the
+replayed MR !8 fix (`242a3a7b`).
+
+The passing allocation placed all four nodes in one NVLink domain using Slurm
+segment size 4. It also used a runtime override of 16 ranks per NVLink domain;
+the inherited production value is 64. Reproduce on an equivalent existing
+four-node Ray allocation with a fresh run tag:
+
+```bash
+uv run --no-sync examples/configs/nm4_CI/run_ci.py run \
+  --case clevr_4n_mxfp8_cp16ep16_2k \
+  --run-tag clevr4n-validation-NEW_TAG \
+  --artifacts /data/nm4-ci-results \
+  --override cluster.segment_size=4 \
+  --override policy.megatron_cfg.hybridep_num_ranks_per_nvlink_domain=16
+```
+
+A proposed four-node TP8/CP2/EP16 replacement reference failed before training:
+Bridge's vision-projector config sets `num_attention_heads=1` while inheriting
+TP8, triggering MCore's divisibility check. That candidate is not registered
+in this suite.
 
 ## Muon layouts
 

@@ -48,11 +48,7 @@ def compose_case(
     logs = str(run_dir / case / "logs")
     config.logger.log_dir = logs
     config.logger.tensorboard.log_dir = logs
-    checkpoint_name = (
-        "checkpoint-16n-split"
-        if case in ("checkpoint_16n_save10", "checkpoint_16n_resume20")
-        else case
-    )
+    checkpoint_name = suite.cases[case].get("checkpoint_group") or case
     config.checkpointing.checkpoint_dir = str(run_dir / "checkpoints" / checkpoint_name)
     if config.sft.max_num_steps != suite.cases[case].steps[-1]:
         raise ValueError(
@@ -64,7 +60,12 @@ def compose_case(
     return config
 
 
-def require_allocation(config: DictConfig) -> None:
+def require_allocation(
+    config: DictConfig,
+    *,
+    components: DictConfig | None = None,
+    node_blocks: list[int] | None = None,
+) -> None:
     """Fail instead of silently skipping a case on an undersized/mismatched cluster."""
     # Ray is unnecessary for CPU planning and artifact checking.
     import ray
@@ -76,6 +77,38 @@ def require_allocation(config: DictConfig) -> None:
             for node in ray.nodes()
             if node["Alive"] and node["Resources"].get("GPU", 0) > 0
         ]
+        if components is not None:
+            if any(
+                sum(
+                    node["Resources"].get(f"node_block_{block}", 0) > 0
+                    for block in components
+                )
+                != 1
+                for node in gpu_nodes
+            ):
+                raise ValueError(
+                    "Each GPU node must belong to exactly one expected node block."
+                )
+            for block, count in components.items():
+                key = f"node_block_{block}"
+                actual = sum(node["Resources"].get(key, 0) > 0 for node in gpu_nodes)
+                if actual != count:
+                    raise ValueError(
+                        f"Expected {count} GPU nodes in component {block}; got {actual}."
+                    )
+            if len(gpu_nodes) != sum(components.values()):
+                raise ValueError(
+                    "Unexpected GPU nodes outside the requested heterogeneous components."
+                )
+        if node_blocks is not None:
+            gpu_nodes = [
+                node
+                for node in gpu_nodes
+                if any(
+                    node["Resources"].get(f"node_block_{block}", 0) > 0
+                    for block in node_blocks
+                )
+            ]
         expected = config.cluster
         if len(gpu_nodes) != expected.num_nodes or any(
             node["Resources"]["GPU"] != expected.gpus_per_node for node in gpu_nodes
@@ -89,20 +122,20 @@ def require_allocation(config: DictConfig) -> None:
 
 
 def resume_environment(
-    run_dir: Path, *, case: str, config: DictConfig
+    run_dir: Path, *, case: str, config: DictConfig, suite: DictConfig
 ) -> dict[str, str]:
     """Require the completed save phase; the training preflight verifies optimizer state."""
     environment = os.environ.copy()
     # An inherited resume request must not contaminate a fresh reference case.
     environment.pop("NEMO_RL_REQUIRE_RESUME", None)
     environment.pop("NEMO_RL_EXPECTED_RESUME_CHECKPOINT", None)
-    if case == "checkpoint_16n_resume20":
-        read_local_result(
-            run_dir / "checkpoint_16n_save10",
-            case="checkpoint_16n_save10",
-            steps=list(range(1, 11)),
+    save_case = suite.cases[case].get("resume_from")
+    if save_case is not None:
+        saved_steps = list(suite.cases[save_case].steps)
+        read_local_result(run_dir / save_case, case=save_case, steps=saved_steps)
+        checkpoint = (
+            Path(config.checkpointing.checkpoint_dir) / f"step_{saved_steps[-1]}"
         )
-        checkpoint = Path(config.checkpointing.checkpoint_dir) / "step_10"
         for relative in ("training_info.json", "sft_v2_loaders.pt", "policy/weights"):
             if not (checkpoint / relative).exists():
                 raise ValueError(
@@ -130,11 +163,17 @@ def run_case(
     directory.mkdir(parents=True, exist_ok=False)
     config_path = directory / "resolved_config.yaml"
     OmegaConf.save(config, config_path)
+    node_blocks = suite.cases[case].get("node_blocks")
+    entrypoint = (
+        "examples/configs/nm4_CI/run_sft_on_node_blocks.py"
+        if node_blocks is not None
+        else "examples/run_sft_v2.py"
+    )
     command = [
         "uv",
         "run",
         "--no-sync",
-        "examples/run_sft_v2.py",
+        entrypoint,
         "--config",
         str(config_path),
     ]
@@ -148,8 +187,13 @@ def run_case(
         "error": None,
     }
     try:
-        require_allocation(config)
-        environment = resume_environment(run_dir, case=case, config=config)
+        require_allocation(
+            config, components=suite.get("het_components"), node_blocks=node_blocks
+        )
+        environment = resume_environment(run_dir, case=case, config=config, suite=suite)
+        environment.pop("NM4_CI_NODE_BLOCKS", None)
+        if node_blocks is not None:
+            environment["NM4_CI_NODE_BLOCKS"] = json.dumps(list(node_blocks))
         environment["PYTHONUNBUFFERED"] = "1"
         environment["PYTORCH_CUDA_ALLOC_CONF"] = (
             config.policy.megatron_cfg.env_vars.PYTORCH_CUDA_ALLOC_CONF
@@ -225,9 +269,8 @@ def main() -> None:
     """Print the allocation plan or execute one opt-in case."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("plan", "run"))
-    parser.add_argument(
-        "--case", choices=list(OmegaConf.load(SUITE_DIR / "suite.yaml").cases)
-    )
+    parser.add_argument("--suite", type=Path, default=SUITE_DIR / "suite.yaml")
+    parser.add_argument("--case")
     parser.add_argument(
         "--run-tag", required=True, help="Fresh tag shared by all cases"
     )
@@ -251,7 +294,9 @@ def main() -> None:
         )
     if args.timeout_seconds <= 0:
         parser.error("Timeout must be positive.")
-    suite = OmegaConf.load(SUITE_DIR / "suite.yaml")
+    suite = OmegaConf.load(args.suite)
+    if args.case is not None and args.case not in suite.cases:
+        parser.error(f"Unknown case {args.case!r} in {args.suite}")
     os.environ[suite.run_tag_env] = args.run_tag
     run_dir = args.artifacts.resolve() / args.run_tag
     if args.action == "run":
@@ -280,8 +325,12 @@ def main() -> None:
                     "gpus_per_node": config.cluster.gpus_per_node,
                     "segment_size": config.cluster.segment_size,
                     "steps": list(suite.cases[case].steps),
-                    "depends_on": "checkpoint_16n_save10"
-                    if case == "checkpoint_16n_resume20"
+                    "depends_on": suite.cases[case].get("resume_from"),
+                    "node_blocks": list(suite.cases[case].node_blocks)
+                    if "node_blocks" in suite.cases[case]
+                    else None,
+                    "het_components": OmegaConf.to_container(suite.het_components)
+                    if "het_components" in suite
                     else None,
                     "sequence_length": config.policy.max_total_sequence_length,
                     "checkpoint": config.checkpointing.pretrained_checkpoint.path,

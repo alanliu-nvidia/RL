@@ -1,0 +1,13 @@
+defaults: generalist_18n_mimo_mxfp8_hybridep.yaml
+sft:
+  max_num_steps: 10
+checkpointing:
+  enabled: true
+  checkpoint_dir: /data/nemorl-runs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/checkpoint-18n-mimo-split
+policy:
+  megatron_cfg:
+    scheduler:
+      # Build the schedule of the full 20-step run (Bridge SchedulerConfig.max_steps). SFT v2 sets
+      # train_iters = sft.max_num_steps (10 here), so without this the saved wd_incr_steps (10 * GBS) differs
+      # from the one resume20 builds (20 * GBS) and the restore fails the OptimizerParamScheduler check.
+      max_steps: 20
