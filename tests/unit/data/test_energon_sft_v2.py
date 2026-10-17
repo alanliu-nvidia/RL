@@ -32,6 +32,7 @@ from nemo_rl.data.energon.config import (  # noqa: E402
     EnergonLoaderConfig,
     EnergonSourceConfig,
 )
+from nemo_rl.data.energon.mimo_image_split import EncoderShard  # noqa: E402
 from nemo_rl.data.energon.sft_dataloader import (  # noqa: E402
     _identity_fingerprint,
     _loader_identity,
@@ -114,6 +115,9 @@ def test_v2_fingerprint_identifies_each_logical_shard() -> None:
     assert rank_zero != _v2_fingerprint(
         logical_rank=0,
         **{**common, "loader_config": nemotron},
+    )
+    assert rank_zero != _v2_fingerprint(
+        logical_rank=0, **{**common, "placement_fingerprint": "other-placement"}
     )
 
 
@@ -215,6 +219,12 @@ def test_sft_v2_worker_defers_processor_construction() -> None:
     get_tokenizer.assert_not_called()
     assert worker._sft_processor is None
 
+    worker.cfg = {"tokenizer": {"use_processor": True}}
+    with patch("nemo_rl.algorithms.utils.get_tokenizer") as get_tokenizer:
+        assert worker._ensure_sft_processor() is get_tokenizer.return_value
+        assert worker._ensure_sft_processor() is get_tokenizer.return_value
+    get_tokenizer.assert_called_once_with(worker.cfg["tokenizer"], get_processor=True)
+
 
 def test_sft_v2_worker_publishes_sequence_alignment() -> None:
     from nemo_rl.data.energon.sft_worker import SFTMegatronPolicyWorker
@@ -226,6 +236,9 @@ def test_sft_v2_worker_publishes_sequence_alignment() -> None:
     worker._sft_active_envelope = None
     worker._sft_logical_rank = 0
     worker._sft_logical_world_size = 2
+    worker._sft_mimo_role = None
+    worker._sft_single_owner = False
+    worker._sft_encoder_dp_client = None
     worker._sft_next_batch_index = 0
     worker._ld_on = False
     worker._ld_phase = None
@@ -291,3 +304,235 @@ def test_sft_v2_worker_publishes_sequence_alignment() -> None:
         envelope.load_phase_seconds[phase]
         for phase in ("iter", "prepare", "post-prepare", "tensordict", "publish")
     )
+
+
+@pytest.mark.parametrize("mimo", [False, True])
+def test_sft_v2_non_owner_loader_lifecycle_is_a_noop(mimo: bool) -> None:
+    from nemo_rl.data.energon.sft_worker import SFTMegatronPolicyWorker
+
+    worker_cls = SFTMegatronPolicyWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker._sft_loader = None
+    worker._sft_loader_iterator = None
+    worker._sft_active_envelope = None
+    worker._sft_mimo_role = None
+    worker._sft_single_owner = False
+    worker.mimo_runtime = object() if mimo else None
+    worker._sft_active_validation_envelope = None
+    worker._is_replica_leader = MagicMock(return_value=False)
+    worker._mimo_loader_role = MagicMock(return_value=None)
+    worker._configure_sft_dataloader = MagicMock()
+
+    assert (
+        worker.setup_sft_dataloader(
+            single_owner=False,
+            data_config={},
+            batch_size=1,
+            max_sequence_length=8,
+            placement_fingerprint="placement",
+            only_unmask_final=False,
+        )
+        is None
+    )
+    worker._configure_sft_dataloader.assert_not_called()
+
+    assert (
+        worker.load_next_sft_batch(
+            only_unmask_final=False,
+            make_sequence_length_divisible_by=1,
+        )
+        is None
+    )
+    assert worker.sft_dataloader_state_dict() is None
+    assert worker.commit_sft_batch() is None
+    assert worker.abort_sft_batch() is None
+    assert worker.close_sft_dataloader() is None
+
+
+@pytest.mark.parametrize("rank", range(8))
+@pytest.mark.parametrize("single_owner", [False, True])
+def test_mimo_dp4_dp2_loader_owners_and_lanes(rank: int, single_owner: bool) -> None:
+    from nemo_rl.data.energon.sft_worker import SFTMegatronPolicyWorker
+
+    worker_cls = SFTMegatronPolicyWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker._sft_loader = None
+    worker._sft_encoder_dp_client = None
+    worker._dp_client = MagicMock()
+    encoder = rank < 4
+    dp_group = MagicMock()
+    dp_group.rank.return_value = rank if encoder else (rank - 4) // 2
+    dp_group.size.return_value = 4 if encoder else 2
+    worker.mimo_runtime = MagicMock()
+    worker.mimo_runtime.active_module_name = "images" if encoder else "language"
+    worker.mimo_runtime.local_pg_collection.dp = dp_group
+    language_grid = worker.mimo_runtime.megatron_mimo_infra.module_to_grid_map[
+        "language"
+    ]
+    language_grid.shape = [1, 2, 2, 1]
+    language_grid.dim_names = ["tp", "cp", "dp", "pp"]
+    worker.mimo_parallelism_config = MagicMock()
+    worker.mimo_parallelism_config.get_parallelism.return_value.data_parallel_size = 2
+    worker._is_replica_leader = MagicMock(return_value=encoder or rank % 2 == 0)
+    worker._configure_sft_dataloader = MagicMock()
+
+    def module(dp: int, offset: int, cp: int) -> dict[str, int]:
+        return {
+            "tensor_model_parallel_size": 1,
+            "context_parallel_size": cp,
+            "pipeline_model_parallel_size": 1,
+            "data_parallel_size": dp,
+            "rank_offset": offset,
+        }
+
+    # The encoder loaders check their shard against the controller's placement.
+    worker.cfg = {
+        "megatron_cfg": {
+            "mimo": {
+                "parallelism": {
+                    "module_parallelisms": {
+                        "images": module(4, 0, 1),
+                        "language": module(2, 4, 2),
+                    }
+                }
+            }
+        }
+    }
+    with (
+        patch("torch.distributed.get_rank", return_value=rank),
+        patch("torch.distributed.get_world_size", return_value=8),
+    ):
+        result = worker.setup_sft_dataloader(
+            single_owner=single_owner,
+            data_config={},
+            batch_size=2,
+            max_sequence_length=2048,
+            placement_fingerprint="test",
+            only_unmask_final=False,
+        )
+    # Every encoder DP replica loads its lane; its shard selects its media range.
+    if rank in ((0, 1, 2, 3) if single_owner else (0, 1, 2, 3, 4, 6)):
+        assert result is True
+        args = worker._configure_sft_dataloader.call_args.kwargs
+        assert args["logical_rank"] == (rank // 2 if encoder else (rank - 4) // 2)
+        assert args["logical_world_size"] == 2
+        assert args["encoder_shard"] == (
+            EncoderShard(index=rank % 2, count=2) if encoder else None
+        )
+        from nemo_rl.data_plane.adapters.local import LocalDataPlaneClient
+
+        if single_owner:
+            assert isinstance(worker._sft_encoder_dp_client, LocalDataPlaneClient)
+            assert worker._sft_encoder_dp_client is not worker._dp_client
+        else:
+            assert worker._sft_encoder_dp_client is None
+        assert args["mimo_role"] == ("encoder" if encoder else "language")
+    else:
+        assert result is None
+        worker._configure_sft_dataloader.assert_not_called()
+
+
+@pytest.mark.parametrize("release", ["commit_sft_batch", "abort_sft_batch"])
+@pytest.mark.parametrize(
+    "role", ["canonical", "canonical-shard1", "encoder", "language"]
+)
+def test_single_owner_keeps_pixels_local_and_releases_both_views(release, role) -> None:
+    from nemo_rl.data.energon.sft_worker import SFTMegatronPolicyWorker
+    from nemo_rl.data.multimodal_utils import PackedTensor
+    from nemo_rl.data_plane.adapters.local import (
+        LocalDataPlaneClient,
+        is_local_batch_meta,
+    )
+    from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig
+
+    worker_cls = SFTMegatronPolicyWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker._sft_loader = MagicMock()
+    worker._sft_loader_iterator = iter([None])
+    worker._sft_active_envelope = None
+    worker._sft_next_batch_index = 0
+    worker._sft_logical_rank = 0
+    worker._sft_logical_world_size = 1
+    worker._sft_mimo_role = "encoder" if role.startswith("canonical") else role
+    worker._sft_single_owner = role.startswith("canonical")
+    # Encoder shard 1 of a lane keeps its pixels and does not publish the language batch.
+    worker._sft_encoder_shard = (
+        EncoderShard(index=1, count=2) if role == "canonical-shard1" else None
+    )
+    worker._sft_encoder_dp_client = (
+        LocalDataPlaneClient(LocalDataPlaneConfig())
+        if role.startswith("canonical")
+        else None
+    )
+    remote = worker._dp_client = MagicMock()
+    if not role.startswith("canonical"):
+        worker._dp_client = LocalDataPlaneClient(LocalDataPlaneConfig())
+    remote.put_samples.side_effect = lambda **kw: KVBatchMeta(
+        sample_ids=kw["sample_ids"],
+        partition_id=kw["partition_id"],
+        task_name="train",
+        fields=list(kw["fields"].keys()),
+        tags=kw["tags"],
+    )
+    worker._ld_mark = MagicMock()
+    worker.tokenizer = None
+    pixels = PackedTensor([torch.ones(2, 3, dtype=torch.bfloat16)], dim_to_pack=0)
+    prepared = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1, 2, 3, 4]]),
+            "input_lengths": torch.tensor([4]),
+            "sample_mask": torch.ones(1),
+            "token_mask": torch.ones(1, 4),
+            "pixel_values": pixels,
+            "cu_seqlens": PackedTensor(
+                [torch.tensor([0, 4], dtype=torch.int32)], dim_to_pack=0
+            ),
+        }
+    )
+    with patch(
+        "nemo_rl.data.energon.sft_worker.prepare_sft_batch", return_value=prepared
+    ):
+        envelope = worker._load_next_sft_batch(
+            validation=False,
+            only_unmask_final=False,
+            make_sequence_length_divisible_by=2,
+        )
+    assert is_local_batch_meta(envelope.meta)
+    if role == "canonical-shard1":
+        assert "_encoder1_" in envelope.meta.partition_id
+        assert envelope.role_metas == {}
+        remote.put_samples.assert_not_called()
+        local = worker._require_dp_client().get_data(envelope.meta)
+        assert "pixel_values" in local.keys()
+        getattr(worker, release)()
+        assert worker._sft_active_envelope is None
+        remote.clear_samples.assert_not_called()
+        assert not worker._sft_encoder_dp_client._partitions
+        return
+    if role != "canonical":
+        assert envelope.role_metas == {}
+        remote.put_samples.assert_not_called()
+        local = worker._require_dp_client().get_data(envelope.meta)
+        assert ("pixel_values" in local.keys()) == (role == "encoder")
+        assert "cu_seqlens" in local.keys()
+        getattr(worker, release)()
+        assert worker._sft_active_envelope is None
+        assert not worker._dp_client._partitions
+        return
+    language_meta = envelope.role_metas["language"]
+    assert not is_local_batch_meta(language_meta)
+    assert language_meta.partition_id != envelope.meta.partition_id
+    assert language_meta.sequence_lengths == envelope.meta.sequence_lengths
+    assert language_meta.extra_info["pad_to_multiple"] == 2
+    published = remote.put_samples.call_args.kwargs["fields"]
+    assert "pixel_values" not in published.keys()
+    assert "cu_seqlens" in published.keys()
+    local = worker._require_dp_client().get_data(envelope.meta)
+    assert "pixel_values" in local.keys()
+    getattr(worker, release)()
+    remote.clear_samples.assert_called_once_with(
+        sample_ids=language_meta.sample_ids,
+        partition_id=language_meta.partition_id,
+    )
+    assert worker._sft_active_envelope is None
+    assert not worker._sft_encoder_dp_client._partitions

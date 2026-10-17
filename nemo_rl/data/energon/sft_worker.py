@@ -23,17 +23,28 @@ from dataclasses import replace
 from typing import Any, Mapping, Optional
 
 import ray
+import torch
 from megatron.core import parallel_state
+from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 
 from nemo_rl.algorithms.sft import prepare_sft_batch
-from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.data.energon.config import EnergonLoaderConfig
+from nemo_rl.data.energon.mimo_batch import MIMORole, mimo_data_plane_batch
+from nemo_rl.data.energon.mimo_image_split import EncoderShard
 from nemo_rl.data.energon.sft_dataloader import (
     EnergonSFTDataLoader,
     build_energon_sft_loader,
 )
 from nemo_rl.data.energon.sft_types import StepEnvelope
-from nemo_rl.data_plane.adapters.local import local_batch_to_tensordict
+from nemo_rl.data.energon.topology import build_mimo_data_loader_placement
+from nemo_rl.data_plane.adapters.local import (
+    LocalDataPlaneClient,
+    local_batch_to_tensordict,
+)
+from nemo_rl.data_plane.codec import packed_batch_to_wire
+from nemo_rl.data_plane.interfaces import DataPlaneClient, LocalDataPlaneConfig
 from nemo_rl.data_plane.schema import MICRO_BATCH_INDICES, MICRO_BATCH_LENGTHS
+from nemo_rl.models.megatron.mimo import resolve_mimo_sft_config
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
@@ -49,10 +60,6 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
     """Megatron policy worker with an Energon loader on each DP owner."""
 
     def __init__(self, *args: Any, processor: Any = None, **kwargs: Any) -> None:
-        if processor is None:
-            config = args[0] if args else kwargs["config"]
-            if config["tokenizer"].get("use_processor"):
-                processor = get_tokenizer(config["tokenizer"], get_processor=True)
         self._sft_processor = processor
         self._sft_loader: Optional[EnergonSFTDataLoader] = None
         self._sft_loader_iterator: Any = None
@@ -64,12 +71,22 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         self._sft_next_validation_batch_index = 0
         self._sft_logical_rank: Optional[int] = None
         self._sft_logical_world_size: Optional[int] = None
+        self._sft_mimo_role: MIMORole | None = None
+        self._sft_encoder_shard: EncoderShard | None = None
+        self._sft_single_owner: bool | None = None
+        self._sft_encoder_dp_client: DataPlaneClient | None = None
         self._ld_on = os.environ.get("NRL_LOADDIAG") == "1"
         self._ld_phase: Optional[str] = None
         self._ld_t0 = time.monotonic()
         self._ld_durations: dict[str, float] = {}
         self._ld_watchdog: Optional[threading.Thread] = None
         super().__init__(*args, **kwargs)
+
+    def _require_dp_client(self) -> DataPlaneClient:
+        """Use local pixels on encoder owners; keep their TQ client for language."""
+        if self._sft_encoder_dp_client is not None:
+            return self._sft_encoder_dp_client
+        return super()._require_dp_client()
 
     def setup_sft_dataloader(
         self,
@@ -79,23 +96,80 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         max_sequence_length: int,
         placement_fingerprint: str,
         only_unmask_final: bool,
+        single_owner: bool,
         restored_state: Optional[dict[str, Any]] = None,
-    ) -> bool:
-        """Build the train loader on the TP0/PP0/CP0 rank of this DP replica."""
-        if not self._is_replica_leader():
-            return False
+    ) -> bool | None:
+        """Build one native V2 loader when this rank is a placement owner."""
+        self._sft_single_owner = single_owner
+        mimo_runtime = self.mimo_runtime
+        encoder_shard = None
+        if mimo_runtime is None:
+            if not self._is_replica_leader():
+                if restored_state is not None:
+                    raise ValueError("A non-owner rank received SFT loader state.")
+                return None
+            logical_rank = parallel_state.get_data_parallel_rank()
+            logical_world_size = parallel_state.get_data_parallel_world_size()
+            mimo_role = None
+        else:
+            mimo_role = self._mimo_loader_role()
+            if mimo_role is None:
+                if restored_state is not None:
+                    raise ValueError("A non-owner rank received SFT loader state.")
+                return None
+            language_grid = mimo_runtime.megatron_mimo_infra.module_to_grid_map[
+                MIMO_LANGUAGE_MODULE_KEY
+            ]
+            logical_world_size = language_grid.shape[
+                language_grid.dim_names.index("dp")
+            ]
+            dp_group = mimo_runtime.local_pg_collection.dp
+            logical_rank = dp_group.rank()
+            if mimo_role == "encoder":
+                # The lane's encoder ranks share its stream; each keeps one
+                # media range of every pack.
+                stride = dp_group.size() // logical_world_size
+                encoder_shard = EncoderShard(index=logical_rank % stride, count=stride)
+                logical_rank //= stride
+                self._check_encoder_placement(
+                    lane=logical_rank, shard=encoder_shard, single_owner=single_owner
+                )
+
+        if single_owner and self._sft_encoder_dp_client is None:
+            self._sft_encoder_dp_client = LocalDataPlaneClient(LocalDataPlaneConfig())
+
+        self._configure_sft_dataloader(
+            data_config=data_config,
+            batch_size=batch_size,
+            max_sequence_length=max_sequence_length,
+            placement_fingerprint=placement_fingerprint,
+            only_unmask_final=only_unmask_final,
+            logical_rank=logical_rank,
+            logical_world_size=logical_world_size,
+            restored_state=restored_state,
+            mimo_role=mimo_role,
+            encoder_shard=encoder_shard,
+        )
+        return True
+
+    def _configure_sft_dataloader(
+        self,
+        *,
+        data_config: Mapping[str, Any],
+        batch_size: int,
+        max_sequence_length: int,
+        placement_fingerprint: str,
+        only_unmask_final: bool,
+        logical_rank: int,
+        logical_world_size: int,
+        restored_state: Optional[dict[str, Any]],
+        mimo_role: MIMORole | None,
+        encoder_shard: EncoderShard | None = None,
+    ) -> None:
+        """Configure the existing V2 Energon loader for one logical owner."""
         if self._sft_loader is not None:
             raise RuntimeError("The SFT Energon loader is already configured.")
-        if self._sft_processor is None:
-            tokenizer_config = (self.cfg or {}).get("tokenizer")
-            if tokenizer_config is None:
-                raise ValueError(
-                    "SFTv2 requires a multimodal processor on policy workers, and "
-                    "policy.tokenizer was not available to build one locally."
-                )
-            from nemo_rl.algorithms.utils import get_tokenizer
-
-            self._sft_processor = get_tokenizer(tokenizer_config, get_processor=True)
+        processor = self._ensure_sft_processor()
 
         def _field(obj: Any, key: str) -> Any:
             if obj is None:
@@ -104,11 +178,18 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 return obj.get(key)
             return getattr(obj, key, None)
 
-        packing = _field(
-            _field(_field(data_config, "energon"), "task_encoder"), "packing"
-        )
+        task_encoder_config = _field(_field(data_config, "energon"), "task_encoder")
+        packing = _field(task_encoder_config, "packing")
         if packing is not None:
-            cp_size = parallel_state.get_context_parallel_world_size()
+            if self.mimo_runtime is None:
+                cp_size = parallel_state.get_context_parallel_world_size()
+            else:
+                language_grid = (
+                    self.mimo_runtime.megatron_mimo_infra.module_to_grid_map[
+                        MIMO_LANGUAGE_MODULE_KEY
+                    ]
+                )
+                cp_size = language_grid.shape[language_grid.dim_names.index("cp")]
             pad_multiple = _field(
                 _field(packing, "options"), "sequence_length_pad_multiple"
             )
@@ -119,12 +200,10 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                     f"context_parallel_size ({2 * cp_size})."
                 )
 
-        logical_rank = parallel_state.get_data_parallel_rank()
-        logical_world_size = parallel_state.get_data_parallel_world_size()
         self._sft_loader = build_energon_sft_loader(
             data_config=data_config,
             source=data_config["train"],
-            processor=self._sft_processor,
+            processor=processor,
             batch_size=batch_size,
             max_sequence_length=max_sequence_length,
             split_role="train",
@@ -132,13 +211,93 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             logical_world_size=logical_world_size,
             placement_fingerprint=placement_fingerprint,
             only_unmask_final=only_unmask_final,
+            mimo_role=mimo_role,
+            pixel_transport_dtype=(
+                self.dtype
+                if mimo_role is not None
+                and _field(task_encoder_config, "name") == "nemotron4_multimodal"
+                else None
+            ),
+            mimo_encoder_shard=encoder_shard,
+            encoder_media_split_frame_weight=(
+                self._encoder_media_split_frame_weight()
+                if encoder_shard is not None
+                else None
+            ),
         )
         if restored_state is not None:
             self._sft_loader.load_state_dict(restored_state)
         self._sft_loader_iterator = iter(self._sft_loader)
         self._sft_logical_rank = logical_rank
         self._sft_logical_world_size = logical_world_size
-        return True
+        self._sft_mimo_role = mimo_role
+        self._sft_encoder_shard = encoder_shard
+
+    def _mimo_loader_role(self) -> MIMORole | None:
+        """Return this rank's loader role, or ``None`` for TP/CP/PP replicas."""
+        if self.mimo_runtime is None:
+            raise RuntimeError("MIMO SFT data setup requires a MIMO model runtime.")
+        if not self._is_replica_leader():
+            return None
+        active_module = self.mimo_runtime.active_module_name
+        if active_module == MIMO_LANGUAGE_MODULE_KEY:
+            return None if self._sft_single_owner else "language"
+        # Every encoder DP replica loads; its shard selects its media range.
+        return "encoder"
+
+    def _check_encoder_placement(
+        self, *, lane: int, shard: EncoderShard, single_owner: bool
+    ) -> None:
+        """Require the controller's loader copy for this rank to be this lane and shard.
+
+        The controller places encoder DP rank ``d`` at
+        ``rank_offset + d * replica_size``; the controller's accounting and
+        language delivery trust that placement. Fail at setup if the process
+        groups order the encoder ranks differently.
+        """
+        mimo_config = resolve_mimo_sft_config(self.cfg)
+        if mimo_config is None:
+            raise RuntimeError("MIMO SFT data setup requires policy.megatron_cfg.mimo.")
+        plan = build_mimo_data_loader_placement(
+            mimo_config.parallelism,
+            world_size=torch.distributed.get_world_size(),
+            single_owner=single_owner,
+        )
+        rank = torch.distributed.get_rank()
+        copies = [copy for copy in plan.copies if copy.owner_rank == rank]
+        if len(copies) != 1 or (
+            copies[0].role,
+            copies[0].logical_rank,
+            copies[0].encoder_shard,
+        ) != ("encoder", lane, shard.index):
+            raise RuntimeError(
+                f"Encoder rank {rank} computed lane {lane} shard {shard.index}, but "
+                f"the loader placement assigns {copies}. The encoder DP ranks are "
+                "not in the order of their global ranks."
+            )
+
+    def _sft_partition_role(self) -> str:
+        """Name this loader's data-plane partitions apart from the lane's others."""
+        if self._sft_mimo_role is None:
+            return ""
+        role = f"_{self._sft_mimo_role}"
+        if self._sft_encoder_shard is not None and self._sft_encoder_shard.count > 1:
+            role += str(self._sft_encoder_shard.index)
+        return role
+
+    def _sft_publishes_language_batch(self) -> bool:
+        """With single-owner loading, encoder shard 0 publishes the language batch."""
+        return bool(self._sft_single_owner) and (
+            self._sft_encoder_shard is None or self._sft_encoder_shard.index == 0
+        )
+
+    def _encoder_media_split_frame_weight(self) -> int:
+        mimo_config = resolve_mimo_sft_config(self.cfg)
+        if mimo_config is None:
+            raise RuntimeError(
+                "The MIMO media split requires policy.megatron_cfg.mimo."
+            )
+        return mimo_config.encoder_media_split_frame_weight
 
     @accepts_trace_context
     def setup_sft_validation_dataloader(
@@ -162,6 +321,12 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             raise ValueError("SFT validation requires data.validation.")
         if self._sft_logical_rank is None or self._sft_logical_world_size is None:
             raise RuntimeError("The SFT logical loader identity is missing.")
+        if self._sft_encoder_shard is not None and self._sft_encoder_shard.count > 1:
+            # Validation loaders do not split media: every encoder rank of the
+            # lane would encode all media of each pack.
+            raise NotImplementedError(
+                "MIMO validation with encoder DP > language DP is not supported."
+            )
         self._sft_validation_loader = build_energon_sft_loader(
             data_config=data_config,
             source=source,
@@ -173,6 +338,16 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             logical_world_size=self._sft_logical_world_size,
             placement_fingerprint=placement_fingerprint,
             only_unmask_final=only_unmask_final,
+            mimo_role=self._sft_mimo_role,
+            pixel_transport_dtype=(
+                self.dtype
+                if self._sft_mimo_role is not None
+                and EnergonLoaderConfig.model_validate(
+                    data_config["energon"]
+                ).task_encoder.name
+                == "nemotron4_multimodal"
+                else None
+            ),
         )
         self._sft_validation_iterator = iter(self._sft_validation_loader)
         return True
@@ -249,8 +424,10 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         *,
         only_unmask_final: bool,
         make_sequence_length_divisible_by: int,
-    ) -> StepEnvelope:
+    ) -> StepEnvelope | None:
         """Load, prepare, and publish one batch into this process's local store."""
+        if self._sft_loader is None:
+            return None
         envelope = self._load_next_sft_batch(
             validation=False,
             only_unmask_final=only_unmask_final,
@@ -329,18 +506,31 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             else self._sft_next_batch_index
         )
         split = "val" if validation else "train"
-        partition_id = f"sft_v2_{split}_dp{self._sft_logical_rank}_batch{batch_index}"
+        role = self._sft_partition_role()
+        partition_id = (
+            f"sft_v2_{split}{role}_dp{self._sft_logical_rank}_batch{batch_index}"
+        )
         sample_ids = [f"{partition_id}_row{row}" for row in range(batch_size)]
         # Source IDs are controller metadata carried by the envelope and tags.
         # Policy workers do not consume them, and replica broadcasts reject
         # Python containers to keep bulk payloads off the object collective.
         policy_batch = {
             key: value
-            for key, value in prepared.items()
+            for key, value in (
+                mimo_data_plane_batch(prepared, role=self._sft_mimo_role)
+                if self._sft_mimo_role is not None
+                else prepared
+            ).items()
             if key not in {"source_ids", "sample_keys"}
         }
         self._ld_mark("tensordict")
         fields = local_batch_to_tensordict(policy_batch, batch_size=batch_size)
+        publish_language = self._sft_publishes_language_batch()
+        if publish_language:
+            language_fields, language_wire_tags = packed_batch_to_wire(
+                mimo_data_plane_batch(policy_batch, role="language"),
+                batch_size=batch_size,
+            )
 
         self._ld_mark("publish")
         publish_phase_started = time.monotonic()
@@ -370,6 +560,35 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         )
         publish_put_samples = time.monotonic() - publish_phase_started
 
+        role_metas = {}
+        if publish_language:
+            language_client = super()._require_dp_client()
+            language_partition = f"{partition_id}_language"
+            publish_phase_started = time.monotonic()
+            language_client.register_partition(
+                partition_id=language_partition,
+                fields=list(language_fields.keys()),
+                num_samples=batch_size,
+                consumer_tasks=["train"],
+            )
+            publish_register_partition += time.monotonic() - publish_phase_started
+            publish_phase_started = time.monotonic()
+            language_tags = [dict(tag) for tag in tags]
+            if language_wire_tags is not None:
+                for tag, geometry in zip(
+                    language_tags, language_wire_tags, strict=True
+                ):
+                    tag.update(geometry)
+            publish_source_tags += time.monotonic() - publish_phase_started
+            publish_phase_started = time.monotonic()
+            role_metas["language"] = language_client.put_samples(
+                sample_ids=sample_ids,
+                partition_id=language_partition,
+                fields=language_fields,
+                tags=language_tags,
+            )
+            publish_put_samples += time.monotonic() - publish_phase_started
+
         publish_phase_started = time.monotonic()
         lengths_tensor = prepared["input_lengths"]
         lengths = tuple(int(value) for value in lengths_tensor.tolist())
@@ -377,14 +596,23 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         valid_tokens = int(
             (sample_mask.unsqueeze(-1) * prepared["token_mask"][:, 1:]).sum().item()
         )
-        extra_info = dict(published_meta.extra_info)
+        batch_extra_info = {}
         if "cu_seqlens" in prepared:
-            extra_info[MICRO_BATCH_INDICES] = [
+            batch_extra_info[MICRO_BATCH_INDICES] = [
                 [[index, index + 1] for index in range(batch_size)]
             ]
-            extra_info[MICRO_BATCH_LENGTHS] = [list(lengths)]
+            batch_extra_info[MICRO_BATCH_LENGTHS] = [list(lengths)]
         if make_sequence_length_divisible_by > 1:
-            extra_info["pad_to_multiple"] = int(make_sequence_length_divisible_by)
+            batch_extra_info["pad_to_multiple"] = int(make_sequence_length_divisible_by)
+        role_metas = {
+            role: replace(
+                meta,
+                task_name="train",
+                sequence_lengths=list(lengths),
+                extra_info={**meta.extra_info, **batch_extra_info},
+            )
+            for role, meta in role_metas.items()
+        }
         publish_batch_metadata = time.monotonic() - publish_phase_started
         self._ld_mark("idle")
         self._ld_durations.update(
@@ -400,7 +628,8 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             meta=replace(
                 published_meta,
                 task_name="train",
-                extra_info=extra_info,
+                sequence_lengths=list(lengths),
+                extra_info={**published_meta.extra_info, **batch_extra_info},
             ),
             logical_rank=self._sft_logical_rank,
             logical_world_size=self._sft_logical_world_size,
@@ -411,6 +640,8 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             load_seconds=time.monotonic() - started,
             valid_tokens=valid_tokens,
             load_phase_seconds=dict(self._ld_durations),
+            mimo_role=self._sft_mimo_role,
+            role_metas=role_metas,
         )
         if validation:
             self._sft_active_validation_envelope = envelope
@@ -422,11 +653,21 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
     def commit_sft_batch(self) -> None:
         """Release the active process-local batch after a successful step."""
+        if self._sft_loader is None:
+            if self._sft_active_envelope is not None:
+                raise RuntimeError("SFT loader state is inconsistent on this rank.")
+            return
         envelope = self._require_active_envelope()
         self._require_dp_client().clear_samples(
             sample_ids=envelope.meta.sample_ids,
             partition_id=envelope.meta.partition_id,
         )
+        if envelope.role_metas:
+            language_meta = envelope.role_metas["language"]
+            super()._require_dp_client().clear_samples(
+                sample_ids=language_meta.sample_ids,
+                partition_id=language_meta.partition_id,
+            )
         self._sft_active_envelope = None
 
     def abort_sft_batch(self) -> None:
@@ -451,10 +692,10 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         if self._sft_active_validation_envelope is not None:
             self.commit_sft_validation_batch()
 
-    def sft_dataloader_state_dict(self) -> dict[str, Any]:
+    def sft_dataloader_state_dict(self) -> dict[str, Any] | None:
         """Capture this logical loader state after its batch is committed."""
         if self._sft_loader is None:
-            raise RuntimeError("The SFT Energon loader is not configured on this rank.")
+            return None
         if self._sft_active_envelope is not None:
             raise RuntimeError("Cannot checkpoint an uncommitted SFT batch.")
         return self._sft_loader.state_dict()
@@ -467,11 +708,30 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         self._sft_loader = None
         self._sft_validation_iterator = None
         self._sft_validation_loader = None
+        self._sft_mimo_role = None
 
     def _require_active_envelope(self) -> StepEnvelope:
         if self._sft_active_envelope is None:
             raise RuntimeError("There is no active SFT batch to commit.")
         return self._sft_active_envelope
+
+    def _ensure_sft_processor(self) -> Any:
+        """Construct the trust-remote-code processor inside the Ray actor."""
+        if self._sft_processor is not None:
+            return self._sft_processor
+        # Dynamic transformers modules cannot be pickled reliably across the
+        # driver/actor boundary, so mirror the normal SPMD construction here.
+        tok_cfg = (self.cfg or {}).get("tokenizer")
+        if tok_cfg is None:
+            raise ValueError(
+                "SFTv2 requires a multimodal processor on policy workers, and "
+                "policy.tokenizer was not available to build one locally."
+            )
+        # The processor helper imports optional training dependencies.
+        from nemo_rl.algorithms.utils import get_tokenizer
+
+        self._sft_processor = get_tokenizer(tok_cfg, get_processor=True)
+        return self._sft_processor
 
     @staticmethod
     def _source_ids(batch: Mapping[str, Any], *, batch_size: int) -> tuple[str, ...]:

@@ -42,6 +42,7 @@ from nemo_rl.data.energon.config import (
     EnergonSourceConfig,
     EnergonTaskEncoderOptions,
 )
+from nemo_rl.data.energon.mimo_image_split import EncoderShard
 from nemo_rl.data.energon.multimodal.registry import (
     COOKER_REGISTRY,
     TASK_ENCODER_REGISTRY,
@@ -283,18 +284,22 @@ def _v2_topology(
     placement_fingerprint: str,
     logical_rank: int,
     logical_world_size: int,
+    state_identity: str | None = None,
 ) -> dict[str, Any]:
     """Describe the DP shard a V2 loader state belongs to.
 
     This is what makes one DP shard refuse another shard's state, so it is
     hashed into the loader identity by :func:`_loader_identity`.
     """
-    return {
+    topology: dict[str, Any] = {
         "mapper": loader_config.topology_mapper,
         "placement": placement_fingerprint,
         "logical_rank": logical_rank,
         "logical_world_size": logical_world_size,
     }
+    if state_identity is not None:
+        topology["state_identity"] = state_identity
+    return topology
 
 
 def _loader_identity(
@@ -373,6 +378,10 @@ def _task_encoder(
     max_sequence_length: int,
     tokenizer: Any,
     only_unmask_final: bool,
+    mimo_role: Literal["language", "encoder"] | None = None,
+    pixel_transport_dtype: torch.dtype | None = None,
+    mimo_encoder_shard: EncoderShard | None = None,
+    encoder_media_split_frame_weight: int | None = None,
 ) -> BaseSFTTaskEncoder:
     cooker_functions = []
     for cooker_config in loader_config.cookers:
@@ -408,6 +417,24 @@ def _task_encoder(
         encoder_options = EnergonTaskEncoderOptions.model_validate(
             encoder_options
         ).model_dump()
+    if loader_config.task_encoder.name == "nemotron4_multimodal":
+        encoder_options["mimo_role"] = mimo_role
+        encoder_options["pixel_transport_dtype"] = pixel_transport_dtype
+        encoder_options["mimo_encoder_shard"] = mimo_encoder_shard
+        if encoder_media_split_frame_weight is not None:
+            encoder_options["encoder_media_split_frame_weight"] = (
+                encoder_media_split_frame_weight
+            )
+    else:
+        if pixel_transport_dtype is not None:
+            raise ValueError(
+                "pixel_transport_dtype requires task_encoder.name=nemotron4_multimodal."
+            )
+        if mimo_encoder_shard is not None and mimo_encoder_shard.count > 1:
+            raise ValueError(
+                "Splitting media over encoder ranks requires "
+                "task_encoder.name=nemotron4_multimodal."
+            )
     packing = loader_config.task_encoder.packing
     if (
         packing is not None
@@ -453,8 +480,17 @@ def build_energon_sft_loader(
     logical_world_size: int,
     placement_fingerprint: str,
     only_unmask_final: bool,
+    mimo_role: Literal["language", "encoder"] | None = None,
+    pixel_transport_dtype: torch.dtype | None = None,
+    mimo_encoder_shard: EncoderShard | None = None,
+    encoder_media_split_frame_weight: int | None = None,
 ) -> EnergonSFTDataLoader:
-    """Build one loader for an explicit logical data shard and split."""
+    """Build one loader for an explicit logical data shard and split.
+
+    ``mimo_encoder_shard`` selects this encoder rank's media range of each pack.
+    It is not part of the loader identity: all encoder ranks of a lane read the
+    same stream, so their loader states are interchangeable.
+    """
     if "energon" not in data_config:
         raise ValueError("data.backend=energon requires a data.energon block.")
     if processor is None:
@@ -484,6 +520,10 @@ def build_energon_sft_loader(
         max_sequence_length=max_sequence_length,
         tokenizer=processor.tokenizer,
         only_unmask_final=only_unmask_final,
+        mimo_role=mimo_role,
+        pixel_transport_dtype=pixel_transport_dtype,
+        mimo_encoder_shard=mimo_encoder_shard,
+        encoder_media_split_frame_weight=encoder_media_split_frame_weight,
     )
     worker_config = _worker_config(
         loader_config,
@@ -558,6 +598,7 @@ def build_energon_sft_loader(
                 placement_fingerprint=placement_fingerprint,
                 logical_rank=logical_rank,
                 logical_world_size=logical_world_size,
+                state_identity=mimo_role,
             ),
             packing_algorithm=None if packing is None else packing.name,
             max_sequences_per_bin=(

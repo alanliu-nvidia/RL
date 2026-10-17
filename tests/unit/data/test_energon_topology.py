@@ -19,6 +19,7 @@ import pytest
 
 from nemo_rl.data.energon.topology import (
     DefaultDataLoaderTopologyMapper,
+    build_mimo_data_loader_placement,
     resolve_topology_mapper,
 )
 from nemo_rl.distributed.named_sharding import GTP_WEIGHT_REMAT_AXIS, NamedSharding
@@ -129,3 +130,68 @@ def test_gtp_loader_delivery_covers_each_rank_once() -> None:
     plan = DefaultDataLoaderTopologyMapper().map(sharding)
     delivered = [rank for copy in plan.copies for rank in copy.delivery_ranks]
     assert sorted(delivered) == list(range(32))
+
+
+@pytest.mark.parametrize("language_dp", [1, 2])
+@pytest.mark.parametrize("single_owner", [False, True])
+def test_mimo_placement_owners_and_deliveries(language_dp, single_owner) -> None:
+    parallelism = {
+        "module_parallelisms": {
+            "images": {
+                "tensor_model_parallel_size": 1,
+                "context_parallel_size": 1,
+                "pipeline_model_parallel_size": 1,
+                "data_parallel_size": 4,
+                "rank_offset": 0,
+            },
+            "language": {
+                "tensor_model_parallel_size": 2 // language_dp,
+                "context_parallel_size": 2,
+                "pipeline_model_parallel_size": 1,
+                "data_parallel_size": language_dp,
+                "rank_offset": 4,
+            },
+        }
+    }
+
+    plan = build_mimo_data_loader_placement(
+        parallelism, world_size=8, single_owner=single_owner
+    )
+
+    # Each of the lane's encoder DP replicas loads the lane and keeps one media
+    # range of every pack (its encoder shard).
+    stride = 4 // language_dp
+    assert plan.logical_world_size == language_dp
+    assert len(plan.copies) == (stride + (0 if single_owner else 1)) * language_dp
+    for lane in range(language_dp):
+        lane_copies = [copy for copy in plan.copies if copy.logical_rank == lane]
+        encoders = [copy for copy in lane_copies if copy.role == "encoder"]
+        language_owner = 4 + lane * (4 // language_dp)
+        language_ranks = tuple(range(language_owner, language_owner + 4 // language_dp))
+        assert [copy.encoder_shard for copy in encoders] == list(range(stride))
+        assert [copy.owner_rank for copy in encoders] == [
+            lane * stride + shard for shard in range(stride)
+        ]
+        assert [copy.delivery_ranks for copy in encoders] == [
+            (lane * stride + shard,) for shard in range(stride)
+        ]
+        if single_owner:
+            assert encoders[0].role_delivery_ranks == {"language": language_ranks}
+            assert all(copy.role_delivery_ranks == {} for copy in encoders[1:])
+            assert len(lane_copies) == stride
+            continue
+        (language,) = [copy for copy in lane_copies if copy.role == "language"]
+        assert language.owner_rank == language_owner
+        assert language.delivery_ranks == language_ranks
+        assert language.encoder_shard is None
+    if single_owner:
+        independent = build_mimo_data_loader_placement(
+            parallelism, world_size=8, single_owner=False
+        )
+        assert plan.placement_hash != independent.placement_hash
+    elif language_dp == 2:
+        assert [copy.owner_rank for copy in plan.copies] == [0, 1, 4, 2, 3, 6]
+        # Language CP1 replicas never create loaders.
+        assert not {5, 7} & {copy.owner_rank for copy in plan.copies}
+    with pytest.raises(ValueError, match=f"has {len(lane_copies)} role copies"):
+        plan.copy_for_logical_rank(0)
