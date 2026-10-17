@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Any, Callable, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
 import torch
 from megatron.bridge.models.model_provider import ModelProviderMixin
@@ -24,6 +26,10 @@ from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer import MegatronModule
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+
+if TYPE_CHECKING:
+    from megatron.bridge.training.setup_megatron_mimo import MegatronMIMOSetupOutput
+    from megatron.core.models.mimo.optimizer import MimoOptimizer
 
 
 ## returned from validate_and_set_config
@@ -69,9 +75,10 @@ class ModelAndOptimizerState(NamedTuple):
 
     state: GlobalState
     model: MegatronModule
-    optimizer: MegatronOptimizer
-    scheduler: OptimizerParamScheduler
+    optimizer: MegatronOptimizer | MimoOptimizer
+    scheduler: Optional[OptimizerParamScheduler]
     checkpointing_context: dict[str, Any]
     param_sync_func: Optional[Callable]
     draft_model: Optional[MegatronModule] = None
     colocated_reshard_plan: Optional[ColocatedReshardPlan] = None
+    mimo_runtime: Optional["MegatronMIMOSetupOutput"] = None

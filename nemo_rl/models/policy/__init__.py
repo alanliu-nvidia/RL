@@ -17,6 +17,7 @@ from typing import Any, Literal, NotRequired, TypedDict, Union
 from pydantic import BaseModel
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.megatron.mimo import MIMOSFTConfig
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 
@@ -50,14 +51,8 @@ def _patch_transformers_tokenizer_class_set():
     # TODO: remove this patch (and the assert below) once the deepseek_v3
     # entries actually disappear upstream.
     # https://github.com/NVIDIA-NeMo/RL/issues/2764
-
-    # Nemotron needs transformers 5.17.0. Temporarily disabling this check.
-    # assert PkgVersion(transformers.__version__) < PkgVersion("5.13.0"), (
-    #     f"transformers {transformers.__version__} detected. "
-    #     "The deepseek_v3 tokenizer-blocklist patch was verified against <5.13. "
-    #     "Check if the upstream fix now applies and remove this patch if so."
-    # )
-
+    # NOTE(liding, local-only): the <5.13 transformers assert was removed so this
+    # branch runs in the rl-gym image (transformers 5.17 still ships the entries).
     from transformers import AutoTokenizer
     from transformers.models.auto.tokenization_auto import (
         MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS,
@@ -376,6 +371,9 @@ class MegatronCheckpointConfig(TypedDict, total=False):
 
 class MegatronConfig(TypedDict):
     enabled: Literal[True]
+    # Explicitly gated heterogeneous MIMO topology. The initial integration is
+    # consumed only by SFT v2.
+    mimo: NotRequired[MIMOSFTConfig]
     env_vars: NotRequired[dict[str, str] | None]
     # Arbitrary model-provider attributes applied recursively to the Megatron
     # Bridge model config before model instantiation. Keys must match configurable
@@ -510,6 +508,11 @@ class MegatronConfig(TypedDict):
     # False selects compact gradients with whole-matrix optimizer ownership.
     # Requires a layer-wise optimizer and use_distributed_optimizer=False.
     use_layer_wise_param_layout: NotRequired[bool]
+    # Disable automatic Python GC in training workers and collect on all ranks
+    # every manual_gc_interval updates (Megatron Bridge TrainingConfig field).
+    manual_gc: NotRequired[bool]
+    # Updates between collections; must be > 0 when manual_gc is true.
+    manual_gc_interval: NotRequired[int]
     # Enable grouped GEMM for MoE experts via CUTLASS. Significant throughput
     # gain when multiple experts are assigned per rank (num_local_experts > 1).
     # Requires TE >= 1.11.0 for FP8 and Ampere (sm_80) or newer.
