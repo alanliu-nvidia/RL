@@ -24,6 +24,7 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "tests/unit/data/test_energon_nemotron4_mimo.py",
   "nemo_rl/data/captured_media.py",
   # TODO: enable these once we have 100 correctness
   #"nemo_rl/**/*.py",
@@ -79,6 +80,9 @@ project-includes = [
   "nemo_rl/algorithms/x_token/__init__.py",
   "nemo_rl/algorithms/x_token/utils.py",
   "nemo_rl/data/__init__.py",
+  "nemo_rl/data/energon/mimo_batch.py",
+  "nemo_rl/data/energon/mimo_image_split.py",
+  "nemo_rl/models/megatron/mimo.py",
   "nemo_rl/data/chat_templates.py",
   "nemo_rl/data/collate_fn.py",
   "nemo_rl/data/dataloader.py",

@@ -150,6 +150,10 @@ policy:
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Disable automatic Python GC in training workers and collect after every
+    # manual_gc_interval training updates on all ranks (> 0 when enabled).
+    manual_gc: false
+    manual_gc_interval: 100
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
 
