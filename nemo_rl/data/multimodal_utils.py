@@ -1412,11 +1412,24 @@ def extract_multimodal_model_inputs(
         processed["num_frames"] = torch.ones(
             len(processed["imgs_sizes"]),
             dtype=torch.long,
+def _normalize_processor_image_sizes(processed: dict[str, Any], processor: Any) -> None:
+    """Normalize placeholder processors' image-size alias before patchification."""
+    if not uses_image_placeholder(processor) or "image_sizes" not in processed:
+        return
+    sizes = torch.as_tensor(processed.pop("image_sizes"))
+    if "imgs_sizes" in processed and not torch.equal(
+        torch.as_tensor(processed["imgs_sizes"]), sizes
+    ):
+        raise ValueError("Processor image_sizes and imgs_sizes disagree.")
+    processed["imgs_sizes"] = sizes
+
+
         )
     sizes = processed.get("imgs_sizes")
     if uses_image_placeholder(processor) and isinstance(sizes, torch.Tensor):
         pixels = processed["pixel_values"]
         segments = pixels if isinstance(pixels, list) else [pixels]
+    _normalize_processor_image_sizes(processed, processor)
         preprocess = get_preprocess(processor, "pixel_values")
         patch_dim = preprocess["preprocess_kwargs"]["patch_dim"]
         pixel_count = sum(
@@ -1632,6 +1645,7 @@ def _materialize_ragged_pixel_values(
 
 def _stack_ragged_pixel_values(
     processed: dict[str, Any], tiles: list[torch.Tensor], processor: Any
+    _normalize_processor_image_sizes(processed, processor)
 ) -> None:
     """Derive image sizes and preserve native-shape tiles for patchification."""
     if uses_image_placeholder(processor) and "imgs_sizes" not in processed:
