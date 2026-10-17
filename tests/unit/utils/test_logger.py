@@ -18,12 +18,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 import pytest
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 from nemo_rl.utils.logger import (
     TELEMETRY_WALL_TIME_METRIC,
@@ -185,11 +187,81 @@ class TestTensorboardLogger:
         step = 10
         logger.log_metrics(metrics, step)
 
-        # Check that add_scalar was called for each metric
-        mock_writer = mock_summary_writer.return_value
-        assert mock_writer.add_scalar.call_count == 2
-        mock_writer.add_scalar.assert_any_call("loss", 0.5, 10)
-        mock_writer.add_scalar.assert_any_call("accuracy", 0.8, 10)
+        mock_writer = mock_summary_writer.return_value._get_file_writer.return_value
+        mock_writer.add_summary.assert_called_once()
+        summary, logged_step = mock_writer.add_summary.call_args.args
+        assert logged_step == step
+        assert {v.tag: v.simple_value for v in summary.value} == pytest.approx(metrics)
+
+    def test_log_metrics_writes_one_record_per_call(self, tmp_path):
+        """Preserve add_scalar values while writing one record per log_metrics call."""
+        from tensorboard.backend.event_processing.event_accumulator import (
+            EventAccumulator,
+        )
+        from tensorboard.backend.event_processing.event_file_loader import (
+            LegacyEventFileLoader,
+        )
+
+        metrics = {
+            "loss": 0.5,
+            "grad_norm": np.float32(1.25),
+            "count": 7,
+            "lr": torch.tensor(2.5e-4),
+            "skipped": [1, 2],
+        }
+        logger = TensorboardLogger(
+            TensorboardConfig(), log_dir=str(tmp_path / "batched")
+        )
+        with SummaryWriter(log_dir=str(tmp_path / "single")) as reference_writer:
+            for step in (1, 2):
+                logger.log_metrics(metrics, step, prefix="train")
+                for name, value in metrics.items():
+                    if name != "skipped":
+                        reference_writer.add_scalar(f"train/{name}", value, step)
+        logger.writer.close()
+
+        scalars, records = {}, {}
+        for mode in ("single", "batched"):
+            log_dir = tmp_path / mode
+            accumulator = EventAccumulator(str(log_dir), size_guidance={"scalars": 0})
+            accumulator.Reload()
+            scalars[mode] = {
+                (tag, event.step): event.value
+                for tag in accumulator.Tags()["scalars"]
+                for event in accumulator.Scalars(tag)
+            }
+            (event_file,) = log_dir.glob("events.out.tfevents.*")
+            records[mode] = sum(
+                1 for _ in LegacyEventFileLoader(str(event_file)).Load()
+            )
+
+        assert len(scalars["single"]) == 8
+        assert scalars["batched"] == scalars["single"]
+        # One file_version record, then one record per scalar or per call.
+        assert records["single"] == 1 + 8
+        assert records["batched"] == 1 + 2
+
+    def test_log_metrics_write_error_prints_a_warning(self, tmp_path, capsys):
+        """A failed event write warns, as for single scalars, and does not stop training."""
+        logger = TensorboardLogger(TensorboardConfig(), log_dir=str(tmp_path))
+        async_writer = logger.writer._get_file_writer().event_writer._async_writer
+
+        def write_fails(data):
+            raise OSError(28, "No space left on device")
+
+        # The writer thread fails on the first record; the next write raises its error.
+        async_writer._writer.write = write_fails
+        logger.log_metrics({"loss": 1.0}, 1)
+        deadline = time.monotonic() + 10
+        while async_writer._worker.exception is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        logger.log_metrics({"loss": 0.5, "lr": 1e-4}, 2)
+
+        assert (
+            "Warning: Failed to log 2 metrics to TensorBoard: [Errno 28] No space left "
+            "on device" in capsys.readouterr().out
+        )
 
     @patch("nemo_rl.utils.logger.SummaryWriter")
     def test_log_histogram(self, mock_summary_writer, temp_dir):
@@ -270,11 +342,13 @@ class TestTensorboardLogger:
         prefix = "train"
         logger.log_metrics(metrics, step, prefix)
 
-        # Check that add_scalar was called for each metric with prefix
-        mock_writer = mock_summary_writer.return_value
-        assert mock_writer.add_scalar.call_count == 2
-        mock_writer.add_scalar.assert_any_call("train/loss", 0.5, 10)
-        mock_writer.add_scalar.assert_any_call("train/accuracy", 0.8, 10)
+        mock_writer = mock_summary_writer.return_value._get_file_writer.return_value
+        mock_writer.add_summary.assert_called_once()
+        summary, logged_step = mock_writer.add_summary.call_args.args
+        assert logged_step == step
+        assert {v.tag: v.simple_value for v in summary.value} == pytest.approx(
+            {f"train/{name}": value for name, value in metrics.items()}
+        )
 
     @patch("nemo_rl.utils.logger.SummaryWriter")
     def test_log_hyperparams(self, mock_summary_writer, temp_dir):
@@ -378,12 +452,15 @@ class TestTensorboardLogger:
         }
         logger.log_metrics(metrics, step=1)
 
-        mock_writer = mock_summary_writer.return_value
+        mock_writer = mock_summary_writer.return_value._get_file_writer.return_value
         # Should log 6 scalars, skip 3 incompatible
-        assert mock_writer.add_scalar.call_count == 6
+        mock_writer.add_summary.assert_called_once()
+        summary, logged_step = mock_writer.add_summary.call_args.args
+        assert logged_step == 1
+        assert len(summary.value) == 6
 
         # Verify each scalar was logged with correct value
-        calls = {c[0][0]: c[0][1] for c in mock_writer.add_scalar.call_args_list}
+        calls = {v.tag: v.simple_value for v in summary.value}
         assert calls["python_float"] == 1.0
         assert calls["numpy_float32"] == pytest.approx(2.0)
         assert calls["numpy_float64"] == pytest.approx(3.0)

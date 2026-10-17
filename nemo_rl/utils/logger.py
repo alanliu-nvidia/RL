@@ -40,7 +40,9 @@ from rich.box import ROUNDED
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.panel import Panel
+from tensorboard.compat.proto.summary_pb2 import Summary
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard.summary import scalar as tensorboard_scalar
 
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -203,7 +205,7 @@ class TensorboardLogger(LoggerInterface):
         step_metric: Optional[str] = None,  # ignored in TensorBoard
         step_finished: bool = False,  # ignored in TensorBoard
     ) -> None:
-        """Log metrics to Tensorboard.
+        """Log metrics to Tensorboard in one event record per call.
 
         Args:
             metrics: Dict of metrics to log
@@ -211,6 +213,7 @@ class TensorboardLogger(LoggerInterface):
             prefix: Optional prefix for metric names
             step_metric: Optional step metric name (ignored in TensorBoard)
         """
+        batched: list[Summary.Value] = []
         for name, value in metrics.items():
             if prefix:
                 name = f"{prefix}/{name}"
@@ -224,10 +227,18 @@ class TensorboardLogger(LoggerInterface):
                 continue
 
             try:
-                self.writer.add_scalar(name, scalar, step)
+                batched.extend(tensorboard_scalar(name, scalar).value)
             except Exception as e:
                 print(f"Warning: Failed to log metric '{name}' to TensorBoard: {e}")
                 continue
+        if batched:
+            try:
+                # One record avoids repeated file opens and writer queue stalls.
+                self.writer._get_file_writer().add_summary(Summary(value=batched), step)
+            except Exception as e:
+                print(
+                    f"Warning: Failed to log {len(batched)} metrics to TensorBoard: {e}"
+                )
 
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
         """Log histogram metrics to Tensorboard."""
