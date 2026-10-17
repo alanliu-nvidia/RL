@@ -26,7 +26,7 @@ from dataclasses import fields, is_dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Optional, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar, cast
 
 import torch
 import yaml
@@ -93,6 +93,9 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
 from nemo_rl.models.megatron.draft.optimizer import (
     build_draft_optimizer_override_provider,
 )
+
+if TYPE_CHECKING:
+    from megatron.bridge.models.megatron_mimo import MegatronMIMOParallelismConfig
 
 _HF_CONFIG_PATCHED = False
 
@@ -165,6 +168,8 @@ def _register_mistral_pretokenized_config_safe_global() -> None:
     try:
         from mistral_adapter.pretokenized_config import (
             PretokenizedConfig,
+            PretokenizedPerSourceValidationConfig,
+            PretokenizedPerSourceValidationSourceConfig,
             SourceConfig,
         )
     except ModuleNotFoundError as error:
@@ -175,7 +180,14 @@ def _register_mistral_pretokenized_config_safe_global() -> None:
             raise
         return
 
-    torch.serialization.add_safe_globals([PretokenizedConfig, SourceConfig])
+    torch.serialization.add_safe_globals(
+        [
+            PretokenizedConfig,
+            PretokenizedPerSourceValidationConfig,
+            PretokenizedPerSourceValidationSourceConfig,
+            SourceConfig,
+        ]
+    )
 
 
 @contextmanager
@@ -495,6 +507,10 @@ from nemo_rl.models.megatron.hybridep import (
     configure_hybridep_packed_input_padding,
 )
 from nemo_rl.models.megatron.memory_saver import inference_model_alloc_region
+from nemo_rl.models.megatron.mimo import (
+    resolve_mimo_sft_config,
+    validate_mimo_parallelism,
+)
 from nemo_rl.models.megatron.router_replay import (
     clear_global_router_replay_instances,
     router_replay_enabled,
@@ -1237,8 +1253,21 @@ def setup_model_config(
         fp8_cfg and fp8_cfg.get("enabled", False) and fp8_cfg.get("fp8_param", False)
     )
 
+    # With pretrained_checkpoint.load_weights=false, the model is built as above
+    # but keeps its random initialization.
+    random_init = (
+        pretrained_ckpt is not None and pretrained_ckpt.get("load_weights") is False
+    )
+    if random_init and not skip_weight_load and rank == 0:
+        print(
+            "pretrained_checkpoint.load_weights=false: the policy does not load the "
+            f"weights of {pretrained_path} and keeps its random initialization.",
+            flush=True,
+        )
     # Refit-fed policies never read the pretrained checkpoint (weights arrive via refit).
-    ckpt_pretrained_path: Optional[str] = None if skip_weight_load else pretrained_path
+    ckpt_pretrained_path: Optional[str] = (
+        None if skip_weight_load or random_init else pretrained_path
+    )
 
     # A pretrained checkpoint initializes model weights only. Do not pass its
     # state dict to the optimizer: ChainedOptimizer does not support that path.
@@ -1248,12 +1277,16 @@ def setup_model_config(
 
     # Create checkpoint configs. A refit-fed policy neither saves nor loads checkpoints.
     checkpoint_config = _create_checkpoint_config(
-        ckpt_pretrained_path,
+        None if skip_weight_load else pretrained_path,
         weights_path,
         optimizer_path,
         load_main_params_from_ckpt,
         ckpt_cfg=None if skip_weight_load else config["megatron_cfg"].get("checkpoint"),
     )
+    if random_init:
+        # Nothing loads from the pretrained path. A fresh run with async_save still
+        # uses it above as the save placeholder.
+        checkpoint_config.pretrained_checkpoint = None
 
     # Validate training configuration
     _validate_training_config(config, model_cfg)
@@ -2110,7 +2143,9 @@ def _create_checkpoint_config(
         pretrained_checkpoint=pretrained_path,
         fully_parallel_save=True,
         fully_parallel_load=True,
-        load_rng=False,
+        # Optimizer resumes must continue the saved model RNG streams, including MTP HSM.
+        # Weights-only initialization keeps the fresh run's RNG state.
+        load_rng=optimizer_path is not None,
         load_main_params_from_ckpt=load_main_params_from_ckpt,
     )
     # Forward checkpoint knobs only when explicitly set in YAML; otherwise Megatron
@@ -2145,6 +2180,14 @@ def _validate_training_config(config: PolicyConfig, model_cfg: Any) -> None:
         "train_iters must be set in megatron_cfg. For an example, see "
         "https://github.com/NVIDIA-NeMo/RL/blob/bccbc377705a81a1f4b3c31ad9767bcc15f735a8/nemo_rl/algorithms/sft.py#L175-L179."
     )
+    # Unlike Bridge, nemo-rl does not collect around evaluation, so the
+    # interval collection is the only one once automatic GC is off.
+    if config["megatron_cfg"].get("manual_gc"):
+        manual_gc_interval = config["megatron_cfg"].get("manual_gc_interval")
+        assert manual_gc_interval is not None and manual_gc_interval > 0, (
+            "policy.megatron_cfg.manual_gc=true requires manual_gc_interval > 0, "
+            f"got {manual_gc_interval!r}."
+        )
 
     ## These settings are required for correct gradient computations in mcore
     ## when calculate_per_token_loss is True, there is no scaling of the gradient in mcore,
@@ -2261,6 +2304,13 @@ def _create_megatron_config(
             "use_gloo_process_groups"
         ]
 
+    # Omitted keys keep the Megatron Bridge defaults (automatic GC).
+    manual_gc_kwargs = {
+        key: config["megatron_cfg"][key]
+        for key in ("manual_gc", "manual_gc_interval")
+        if key in config["megatron_cfg"]
+    }
+
     return ConfigContainer(
         model=model_cfg,
         checkpoint=checkpoint_config,
@@ -2270,6 +2320,7 @@ def _create_megatron_config(
             micro_batch_size=1,  # ignored
             global_batch_size=config["train_global_batch_size"],  # ignored
             train_iters=config["megatron_cfg"]["train_iters"],
+            **manual_gc_kwargs,
         ),
         optimizer=OptimizerConfig(**optimizer_kwargs),
         ddp=DistributedDataParallelConfig(
@@ -2966,6 +3017,149 @@ def setup_model_and_optimizer(
     )
 
 
+def _validate_mimo_encoder_media_split(
+    ddp_config: DistributedDataParallelConfig,
+) -> None:
+    """Check the stack for encoder DP > language DP, where the loader splits media.
+
+    The encoder ranks of a lane send ranges of different sizes to the language
+    leader. Backward must return each range its own gradient rows, which needs
+    Megatron Core's fan-in split by forward sizes (an even split corrupts the
+    encoder gradients). Core provides it with nv-mistralai-megatron#557
+    (``recv_forward(expect_backward=...)``). An encoder rank can get an empty
+    range, which never fires the DDP gradient hooks that ``overlap_grad_reduce``
+    waits for.
+    """
+    # Deferred like the other MIMO imports: ordinary Megatron setup does not load it.
+    from megatron.core.pipeline_parallel.bridge_communicator import (
+        BridgeCommunicator,
+    )
+
+    if ddp_config.overlap_grad_reduce:
+        raise ValueError(
+            "Encoder DP > language DP gives some encoder ranks empty media ranges, "
+            "which overlap_grad_reduce does not support. Set policy.megatron_cfg."
+            "distributed_data_parallel_config.overlap_grad_reduce=false."
+        )
+    recv_forward = inspect.signature(BridgeCommunicator.recv_forward).parameters
+    if "expect_backward" not in recv_forward:
+        raise NotImplementedError(
+            "Encoder DP > language DP needs a Megatron Core with "
+            "NVIDIA-NeMo/nv-mistralai-megatron#557, whose bridge splits fan-in "
+            "gradients by the forward sizes."
+        )
+
+
+def configure_megatron_mimo(
+    policy_cfg: PolicyConfig,
+    megatron_cfg: ConfigContainer,
+    *,
+    world_size: int,
+) -> "MegatronMIMOParallelismConfig":
+    """Replace the standard provider with Bridge's MIMO adapter and finalize config."""
+    # Keep experimental MIMO imports out of ordinary Megatron setup.
+    from megatron.bridge.models.megatron_mimo import MegatronMIMOProvider
+    from megatron.bridge.training.config import megatron_mimo_runtime_config_update
+    from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+
+    mimo_config = resolve_mimo_sft_config(policy_cfg)
+    if mimo_config is None:
+        raise ValueError("configure_megatron_mimo requires policy.megatron_cfg.mimo.")
+    parallelism = validate_mimo_parallelism(
+        mimo_config,
+        world_size=world_size,
+        megatron_config=policy_cfg["megatron_cfg"],
+    )
+
+    standard_provider = megatron_cfg.model
+    if not hasattr(standard_provider, "build_mimo_modality_submodules_spec"):
+        raise TypeError(
+            "The selected Megatron-Bridge provider does not expose a MIMO modality adapter: "
+            f"{type(standard_provider).__name__}."
+        )
+    encoder_parallelisms = [
+        config
+        for name, config in parallelism.module_parallelisms.items()
+        if name != MIMO_LANGUAGE_MODULE_KEY
+    ]
+    if any(
+        config.data_parallel_size
+        > parallelism.get_parallelism(MIMO_LANGUAGE_MODULE_KEY).data_parallel_size
+        for config in encoder_parallelisms
+    ):
+        _validate_mimo_encoder_media_split(megatron_cfg.ddp)
+    mimo_provider = MegatronMIMOProvider.from_standard_provider(
+        standard_provider,
+        parallelism,
+    )
+    for field_name in (
+        "fp16",
+        "bf16",
+        "use_cpu_initialization",
+        "init_model_with_meta_device",
+    ):
+        if hasattr(standard_provider, field_name):
+            setattr(mimo_provider, field_name, getattr(standard_provider, field_name))
+    mimo_provider.freeze_language_model = bool(
+        getattr(standard_provider, "freeze_language_model", False)
+    )
+    encoder_module_names = [
+        name for name in parallelism.module_names if name != MIMO_LANGUAGE_MODULE_KEY
+    ]
+    mimo_provider.freeze_modality_encoders = {
+        name: bool(getattr(standard_provider, "freeze_vision_model", False))
+        for name in encoder_module_names
+    }
+    mimo_provider.freeze_modality_projections = {
+        name: bool(getattr(standard_provider, "freeze_vision_projection", False))
+        for name in encoder_module_names
+    }
+
+    megatron_cfg.model = mimo_provider
+    megatron_mimo_runtime_config_update(megatron_cfg)
+    return parallelism
+
+
+def setup_mimo_model_and_optimizer(
+    policy_cfg: PolicyConfig,
+    megatron_cfg: ConfigContainer,
+    *,
+    load_optimizer: bool,
+    load_weights: bool,
+) -> ModelAndOptimizerState:
+    """Construct the MIMO runtime through Bridge while NeMo-RL owns the outer loop."""
+    from megatron.bridge.training.setup_megatron_mimo import setup_megatron_mimo
+
+    if not load_optimizer:
+        raise NotImplementedError("The initial SFT v2 MIMO path requires an optimizer.")
+    if not load_weights:
+        raise NotImplementedError(
+            "The initial SFT v2 MIMO path requires checkpoint weight loading."
+        )
+
+    state = GlobalState()
+    _patch_bridge_signal_handler_for_worker_threads()
+    state.cfg = megatron_cfg
+    _register_mistral_pretokenized_config_safe_global()
+    # Pass the configured layout as is; unset keeps Bridge's default.
+    layout = policy_cfg["megatron_cfg"].get("use_layer_wise_param_layout")
+    kwargs = {} if layout is None else {"use_layer_wise_param_layout": layout}
+    output = setup_megatron_mimo(state, build_data_iterators_fn=None, **kwargs)
+    local_scheduler = output.schedulers.get(output.active_module_name)
+    if local_scheduler is None and output.schedulers:
+        local_scheduler = next(iter(output.schedulers.values()))
+
+    return ModelAndOptimizerState(
+        state=output.global_state,
+        model=output.model,
+        optimizer=output.optimizer,
+        scheduler=local_scheduler,
+        checkpointing_context={},
+        param_sync_func=None,
+        mimo_runtime=output,
+    )
+
+
 def handle_model_import(
     config: PolicyConfig,
     hf_model_name: str,
@@ -3357,21 +3551,25 @@ def finalize_megatron_setup(
     worker_sharding_annotations: NamedSharding,
     model,
     optimizer,
+    *,
+    language_tensor_parallel_size: int | None = None,
+    active_data_parallel_size: int | None = None,
+    install_model_config_hooks: bool = True,
 ) -> tuple:
     """Finalize the setup with remaining configurations.
 
     Returns:
         Tuple of (megatron_tokenizer, megatron_bridge, should_disable_forward_pre_hook, dp_size)
     """
-    _update_model_config_funcs(
-        [model],
-        get_model_config(model),
-        megatron_cfg.ddp,
-        optimizer,
-        align_grad_reduce=megatron_cfg.dist.align_grad_reduce,
-        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
-    )
-
+    if install_model_config_hooks:
+        _update_model_config_funcs(
+            [model],
+            get_model_config(model),
+            megatron_cfg.ddp,
+            optimizer,
+            align_grad_reduce=megatron_cfg.dist.align_grad_reduce,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+        )
     tokenizer_config = TokenizerConfig(
         tokenizer_type="HuggingFaceTokenizer",
         tokenizer_model=config["tokenizer"]["name"],
@@ -3381,19 +3579,33 @@ def finalize_megatron_setup(
         },
     )
 
+    if language_tensor_parallel_size is None:
+        language_tensor_parallel_size = config["megatron_cfg"][
+            "tensor_model_parallel_size"
+        ]
+        language_provider = megatron_cfg.model
+    else:
+        language_provider = megatron_cfg.model.standard_provider
+        if language_provider is None:
+            raise RuntimeError("MegatronMIMOProvider has no standard provider.")
+
     megatron_tokenizer = build_tokenizer(
         tokenizer_config,
-        make_vocab_size_divisible_by=megatron_cfg.model.make_vocab_size_divisible_by
-        // config["megatron_cfg"]["tensor_model_parallel_size"],
-        tensor_model_parallel_size=config["megatron_cfg"]["tensor_model_parallel_size"],
+        make_vocab_size_divisible_by=(
+            language_provider.make_vocab_size_divisible_by
+            // language_tensor_parallel_size
+        ),
+        tensor_model_parallel_size=language_tensor_parallel_size,
     )
 
-    dp_size = worker_sharding_annotations.get_axis_size("data_parallel")
+    dp_size = active_data_parallel_size
+    if dp_size is None:
+        dp_size = worker_sharding_annotations.get_axis_size("data_parallel")
     megatron_bridge = AutoBridge.from_hf_pretrained(
         hf_model_name, trust_remote_code=True
     )
 
-    should_disable_forward_pre_hook = (
+    should_disable_forward_pre_hook = install_model_config_hooks and (
         config["megatron_cfg"]["optimizer"]["use_distributed_optimizer"]
         and config["megatron_cfg"]["distributed_data_parallel_config"][
             "overlap_param_gather"

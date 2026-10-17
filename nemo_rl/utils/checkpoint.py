@@ -141,11 +141,17 @@ class PretrainedCheckpointConfig(TypedDict):
         format: Checkpoint format.  Use ``"megatron_bridge"`` for checkpoints
             saved by megatron-bridge (e.g. produced by a prior NeMo-RL run) and
             ``"megatron_lm"`` for checkpoints saved by upstream Megatron-LM.
+        load_weights: Optional.  ``false`` builds the policy model as usual
+            but does not load the checkpoint's weights, so the model keeps its
+            random initialization (for step-time benchmarks).  A reference model
+            (DPO, GRPO) still loads them.  Not supported with PEFT.  When
+            absent, the weights are loaded.
 
     """
 
     path: str
     format: Literal["megatron_bridge", "megatron_lm"]
+    load_weights: NotRequired[bool]
 
 
 class CheckpointingConfig(TypedDict):

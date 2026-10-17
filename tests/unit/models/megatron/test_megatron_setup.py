@@ -26,11 +26,12 @@ nemo_rl.models.megatron.setup, focusing on:
 
 import os
 import pickle
+import sys
 import warnings
 from dataclasses import dataclass, field, fields
 from datetime import timedelta
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, call, patch
 
@@ -2935,7 +2936,29 @@ class TestCreateCheckpointConfig:
         assert checkpoint_config.async_save is False
         assert checkpoint_config.fully_parallel_save is True
         assert checkpoint_config.fully_parallel_load is True
-        assert checkpoint_config.load_rng is False
+        assert checkpoint_config.load_rng is True
+
+    @pytest.mark.parametrize(
+        ("weights_path", "optimizer_path", "expected_load_rng"),
+        [
+            pytest.param(None, None, False, id="pretrained-initialization"),
+            pytest.param("weights", None, False, id="weights-only-initialization"),
+            pytest.param("weights", "optimizer", True, id="training-resume"),
+        ],
+    )
+    def test_checkpoint_rng_loading_follows_training_resume(
+        self, weights_path, optimizer_path, expected_load_rng
+    ):
+        """Resume stochastic model operations while leaving weights-only loads fresh."""
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        checkpoint_config = _create_checkpoint_config(
+            pretrained_path="pretrained",
+            weights_path=weights_path,
+            optimizer_path=optimizer_path,
+        )
+
+        assert checkpoint_config.load_rng is expected_load_rng
 
     def test_resume_load_uses_concrete_iteration_payload_without_tracker(
         self, tmp_path
@@ -3171,6 +3194,38 @@ class TestValidateTrainingConfig:
         # Should not raise
         _validate_training_config(config, model_cfg)
 
+    @pytest.mark.parametrize(
+        "manual_gc_cfg",
+        [
+            {"manual_gc": True},
+            {"manual_gc": True, "manual_gc_interval": 0},
+            {"manual_gc": True, "manual_gc_interval": -1},
+        ],
+    )
+    def test_manual_gc_requires_positive_interval(self, manual_gc_cfg):
+        """With automatic GC off, the interval collection is the only one."""
+        from nemo_rl.models.megatron.setup import _validate_training_config
+
+        config = {"megatron_cfg": {"train_iters": 1000, **manual_gc_cfg}}
+
+        with pytest.raises(AssertionError, match="manual_gc_interval > 0"):
+            _validate_training_config(config, MagicMock())
+
+    @pytest.mark.parametrize(
+        "manual_gc_cfg",
+        [
+            {},
+            {"manual_gc": False, "manual_gc_interval": 0},
+            {"manual_gc": True, "manual_gc_interval": 100},
+        ],
+    )
+    def test_manual_gc_accepts_valid_config(self, manual_gc_cfg):
+        from nemo_rl.models.megatron.setup import _validate_training_config
+
+        config = {"megatron_cfg": {"train_iters": 1000, **manual_gc_cfg}}
+
+        _validate_training_config(config, MagicMock())
+
 
 @pytest.mark.mcore
 class TestValidateDtypeConfig:
@@ -3382,6 +3437,49 @@ class TestCreateMegatronConfigGlooProcessGroups:
             dist_config.use_gloo_process_groups
             == DistributedInitConfig().use_gloo_process_groups
         )
+
+
+@pytest.mark.mcore
+class TestCreateMegatronConfigManualGC:
+    """Tests for manual GC plumbing into the Bridge TrainingConfig."""
+
+    @staticmethod
+    def _train_config(**megatron_overrides):
+        from nemo_rl.models.megatron.setup import _create_megatron_config
+
+        config = TestCreateMegatronConfigGlooProcessGroups._config(**megatron_overrides)
+        with (
+            patch("nemo_rl.models.megatron.setup.ConfigContainer") as mock_container,
+            patch("nemo_rl.models.megatron.setup.OptimizerConfig"),
+            patch("nemo_rl.models.megatron.setup.DistributedDataParallelConfig"),
+            patch("nemo_rl.models.megatron.setup.SchedulerConfig"),
+            patch("nemo_rl.models.megatron.setup.TokenizerConfig"),
+            patch("nemo_rl.models.megatron.setup.LoggerConfig"),
+        ):
+            _create_megatron_config(
+                model_cfg=MagicMock(),
+                checkpoint_config=MagicMock(),
+                config=config,
+                hf_model_name="test-model",
+                dtype=torch.bfloat16,
+            )
+        return mock_container.call_args.kwargs["train"]
+
+    def test_explicit_values_are_forwarded(self):
+        train_config = self._train_config(manual_gc=True, manual_gc_interval=100)
+
+        assert train_config.manual_gc is True
+        assert train_config.manual_gc_interval == 100
+
+    def test_absent_keys_defer_to_bridge_defaults(self):
+        from megatron.bridge.training.config import TrainingConfig
+
+        train_config = self._train_config()
+        defaults = TrainingConfig()
+
+        assert defaults.manual_gc is False
+        assert train_config.manual_gc is defaults.manual_gc
+        assert train_config.manual_gc_interval == defaults.manual_gc_interval
 
 
 @pytest.mark.mcore
@@ -3917,6 +4015,66 @@ class TestSetupModelConfig:
 
         checkpoint_call = mocks["_create_checkpoint_config"].call_args
         assert checkpoint_call.args[3] is False
+
+    @pytest.mark.parametrize(
+        ("load_weights", "weights_path", "loads_pretrained"),
+        [
+            ({}, None, True),
+            ({"load_weights": False}, None, False),
+            ({"load_weights": False}, "/run/weights", False),
+        ],
+    )
+    def test_pretrained_load_weights_false_loads_no_weights(
+        self, tmp_path, request, load_weights, weights_path, loads_pretrained
+    ):
+        """load_weights=false loads no pretrained weights; async_save and resume still work."""
+        from nemo_rl.models.megatron.setup import (
+            _create_checkpoint_config,
+            setup_model_config,
+        )
+
+        mocks = self._apply_patches(request)
+        provider = MagicMock()
+        provider.to_megatron_provider.return_value = self._make_model_cfg_mock()
+        pretrained_path = str(tmp_path / "iter_0000000")
+        (tmp_path / "iter_0000000").mkdir()
+        config = {
+            "pretrained_checkpoint": {
+                "format": "megatron_lm",
+                "path": str(tmp_path),
+                **load_weights,
+            },
+            "megatron_cfg": {"checkpoint": {"async_save": True}},
+        }
+
+        with (
+            patch("transformers.AutoConfig.from_pretrained"),
+            patch("nemo_rl.models.megatron.setup.AutoBridge") as auto_bridge,
+            patch(
+                "nemo_rl.models.megatron.setup._create_checkpoint_config",
+                wraps=_create_checkpoint_config,
+            ),
+        ):
+            auto_bridge.from_hf_config.return_value = provider
+            setup_model_config(
+                config,
+                rank=0,
+                dtype=torch.bfloat16,
+                hf_model_name="test-model",
+                pretrained_path=pretrained_path,
+                weights_path=weights_path,
+                optimizer_path=None,
+            )
+
+        provider.to_megatron_provider.assert_called_once()
+        checkpoint_config = mocks["_create_megatron_config"].call_args.args[1]
+        assert checkpoint_config.pretrained_checkpoint == (
+            pretrained_path if loads_pretrained else None
+        )
+        assert checkpoint_config.load == weights_path
+        # A fresh run with async_save keeps the pretrained path as the save placeholder.
+        assert checkpoint_config.save == (weights_path or pretrained_path)
+        checkpoint_config.finalize()
 
     @pytest.mark.parametrize(
         ("pretrained_checkpoint", "skip_weight_load"),
@@ -4636,6 +4794,195 @@ class TestFinalizeMegatronSetup:
         mock_auto_bridge.from_hf_pretrained.assert_called_once_with(
             "test-model", trust_remote_code=True
         )
+
+        mock_update_model_config.reset_mock()
+        mock_build_tokenizer.reset_mock()
+        mock_worker_sharding.get_axis_size.reset_mock()
+        mock_megatron_cfg.model.standard_provider.make_vocab_size_divisible_by = 128
+        config["megatron_cfg"]["optimizer"]["use_distributed_optimizer"] = True
+        config["megatron_cfg"]["distributed_data_parallel_config"][
+            "overlap_param_gather"
+        ] = True
+
+        mimo_result = finalize_megatron_setup(
+            config=config,
+            megatron_cfg=mock_megatron_cfg,
+            hf_model_name="test-model",
+            worker_sharding_annotations=mock_worker_sharding,
+            model=mock_model,
+            optimizer=mock_optimizer,
+            language_tensor_parallel_size=8,
+            active_data_parallel_size=4,
+            install_model_config_hooks=False,
+        )
+
+        assert mimo_result[2:] == (False, 4)
+        assert mock_build_tokenizer.call_args.kwargs == {
+            "make_vocab_size_divisible_by": 16,
+            "tensor_model_parallel_size": 8,
+        }
+        mock_update_model_config.assert_not_called()
+        mock_worker_sharding.get_axis_size.assert_not_called()
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("overlap_grad_reduce", "fan_in_split", "error", "message"),
+    [
+        (True, True, ValueError, "overlap_grad_reduce=false"),
+        (False, False, NotImplementedError, "fan-in gradients"),
+    ],
+)
+def test_mimo_encoder_media_split_checks_the_stack(
+    overlap_grad_reduce: bool,
+    fan_in_split: bool,
+    error: type,
+    message: str,
+) -> None:
+    """Encoder DP > language DP: the loader splits media; Core must split fan-in grads."""
+    from megatron.core.pipeline_parallel import bridge_communicator
+
+    from nemo_rl.models.megatron.setup import configure_megatron_mimo
+
+    class _BridgeCommunicator:
+        if fan_in_split:
+
+            def recv_forward(self, recv_shape=None, *, expect_backward=True):
+                raise AssertionError("not called")
+
+        else:
+
+            def recv_forward(self, recv_shape=None):
+                raise AssertionError("not called")
+
+    provider = SimpleNamespace(
+        build_mimo_modality_submodules_spec=MagicMock(),
+    )
+    parallelism = SimpleNamespace(
+        module_parallelisms={
+            "images": SimpleNamespace(data_parallel_size=4),
+            "language": SimpleNamespace(data_parallel_size=1),
+        }
+    )
+    parallelism.get_parallelism = lambda name: parallelism.module_parallelisms[name]
+    with (
+        patch.object(bridge_communicator, "BridgeCommunicator", _BridgeCommunicator),
+        patch(
+            "nemo_rl.models.megatron.setup.resolve_mimo_sft_config",
+            return_value=object(),
+        ),
+        patch(
+            "nemo_rl.models.megatron.setup.validate_mimo_parallelism",
+            return_value=parallelism,
+        ),
+        pytest.raises(error, match=message),
+    ):
+        configure_megatron_mimo(
+            {"megatron_cfg": {}},
+            SimpleNamespace(
+                model=provider,
+                ddp=SimpleNamespace(overlap_grad_reduce=overlap_grad_reduce),
+            ),
+            world_size=8,
+        )
+
+
+@pytest.mark.mcore
+def test_mimo_setup_registers_mistral_pretokenized_config_before_loading(monkeypatch):
+    """Bridge loads the MIMO checkpoint, whose args pickle the pretokenized config."""
+    from nemo_rl.models.megatron.setup import setup_mimo_model_and_optimizer
+
+    names = [
+        "PretokenizedConfig",
+        "PretokenizedPerSourceValidationConfig",
+        "PretokenizedPerSourceValidationSourceConfig",
+        "SourceConfig",
+    ]
+    pretokenized_config = ModuleType("mistral_adapter.pretokenized_config")
+    for name in names:
+        setattr(pretokenized_config, name, type(name, (), {}))
+    monkeypatch.setitem(
+        sys.modules, "mistral_adapter.pretokenized_config", pretokenized_config
+    )
+    events = []
+
+    def setup_megatron_mimo(state, build_data_iterators_fn, **_):
+        events.append("setup_megatron_mimo")
+        return SimpleNamespace(
+            schedulers={},
+            active_module_name="language",
+            global_state=state,
+            model=[],
+            optimizer=None,
+        )
+
+    with (
+        patch("nemo_rl.models.megatron.setup.GlobalState"),
+        patch(
+            "nemo_rl.models.megatron.setup._patch_bridge_signal_handler_for_worker_threads"
+        ),
+        patch(
+            "torch.serialization.add_safe_globals",
+            side_effect=lambda classes: events.append([c.__name__ for c in classes]),
+        ),
+        patch(
+            "megatron.bridge.training.setup_megatron_mimo.setup_megatron_mimo",
+            side_effect=setup_megatron_mimo,
+        ),
+    ):
+        setup_mimo_model_and_optimizer(
+            {"megatron_cfg": {}}, MagicMock(), load_optimizer=True, load_weights=True
+        )
+
+    assert events == [names, "setup_megatron_mimo"]
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("layout", "expected"),
+    [
+        (None, {}),
+        (True, {"use_layer_wise_param_layout": True}),
+        (False, {"use_layer_wise_param_layout": False}),
+    ],
+)
+def test_mimo_setup_forwards_layer_wise_param_layout(layout, expected) -> None:
+    from nemo_rl.models.megatron.setup import setup_mimo_model_and_optimizer
+
+    calls = []
+
+    def setup_megatron_mimo(state, build_data_iterators_fn=None, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            schedulers={},
+            active_module_name="language",
+            global_state=state,
+            model=[],
+            optimizer=None,
+        )
+
+    megatron_cfg = {} if layout is None else {"use_layer_wise_param_layout": layout}
+    with (
+        patch("nemo_rl.models.megatron.setup.GlobalState"),
+        patch(
+            "nemo_rl.models.megatron.setup._patch_bridge_signal_handler_for_worker_threads"
+        ),
+        patch(
+            "nemo_rl.models.megatron.setup._register_mistral_pretokenized_config_safe_global"
+        ),
+        patch(
+            "megatron.bridge.training.setup_megatron_mimo.setup_megatron_mimo",
+            new=setup_megatron_mimo,
+        ),
+    ):
+        setup_mimo_model_and_optimizer(
+            {"megatron_cfg": megatron_cfg},
+            MagicMock(),
+            load_optimizer=True,
+            load_weights=True,
+        )
+
+    assert calls == [expected]
 
 
 @pytest.mark.mcore
