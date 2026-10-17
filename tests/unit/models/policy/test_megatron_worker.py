@@ -13,6 +13,7 @@
 # limitations under the License.
 import ast
 import asyncio
+import functools
 import os
 import tempfile
 import time
@@ -1752,6 +1753,7 @@ def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
     worker.model.training = False
     worker.optimizer = object()
     worker.scheduler = None
+    worker.mimo_runtime = None
     worker.optimizer_cpu_offload = False
     worker.should_disable_forward_pre_hook = False
     worker.checkpointing_context = None
@@ -1788,6 +1790,165 @@ def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
     assert worker.mcore_state.cfg.checkpoint.save == "original_path"
 
 
+def test_megatron_mimo_checkpoint_uses_module_aware_bridge_context(monkeypatch):
+    """MIMO save/finalize stays on the existing policy checkpoint lifecycle."""
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    worker.model = _FakeTrainableModel()
+    worker.model.training = True
+    worker.optimizer = object()
+    worker.scheduler = object()
+    worker.optimizer_cpu_offload = False
+    worker.should_disable_forward_pre_hook = False
+    worker.checkpointing_context = None
+    worker.cfg = {"generation": {}}
+    worker._async_checkpoint_cuda_cache_active = False
+    worker.mcore_state = SimpleNamespace(
+        cfg=SimpleNamespace(
+            checkpoint=SimpleNamespace(save="original_path", async_save=False)
+        ),
+        train_state=SimpleNamespace(floating_point_operations_so_far=7),
+    )
+    manager = MagicMock()
+    local_pg_collection = object()
+    worker.mimo_runtime = SimpleNamespace(
+        checkpoint_manager=manager,
+        local_pg_collection=local_pg_collection,
+        active_module_name="language",
+    )
+    worker.move_model = lambda model, device, move_params, move_grads: model
+    worker.move_optimizer = lambda device: None
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    functional_save = MagicMock()
+    monkeypatch.setattr(worker_module, "save_checkpoint", functional_save)
+
+    worker.save_checkpoint(weights_path="ckpt/weights", optimizer_path="ckpt/optim")
+    worker.finalize_async_save()
+
+    functional_save.assert_not_called()
+    context, callback_manager = manager.save.call_args.args
+    assert callback_manager is None
+    assert context.state is worker.mcore_state
+    assert context.model == [worker.model]
+    assert context.optimizer is worker.optimizer
+    assert context.opt_param_scheduler is worker.scheduler
+    assert context.pg_collection is local_pg_collection
+    assert context.module_name == "language"
+    assert context.num_floating_point_operations_so_far == 7
+    assert manager.finalize_async_saves.call_count == 3
+    assert worker.mcore_state.cfg.checkpoint.save == "original_path"
+
+
+def test_megatron_move_optimizer_supports_optimizer_containers(monkeypatch):
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    class _Tensor:
+        is_cuda = True
+
+        def to(self, device):
+            return f"moved-to-{device}"
+
+    tensor = _Tensor()
+    state = {"parameter": {"momentum": tensor}}
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    worker.optimizer = object.__new__(worker_module.MimoOptimizer)
+    worker.optimizer._active_optimizers = [SimpleNamespace(state=state)]
+    monkeypatch.setattr(worker_module.torch, "is_tensor", lambda value: value is tensor)
+
+    worker.move_optimizer("cpu")
+
+    assert state["parameter"]["momentum"] == "moved-to-cpu"
+
+
+def test_megatron_move_model_moves_mimo_submodules_through_ddp_buffers():
+    from megatron.core.models.mimo import MimoModel
+
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    buffer = MagicMock()
+    language_model = MagicMock(spec=worker_module.DistributedDataParallel)
+    language_model.buffers = [buffer]
+    language_model.expert_parallel_buffers = []
+    model = MagicMock(spec=MimoModel)
+    model.language_model = language_model
+    model.modality_submodules = {"images": None}
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+
+    assert worker.move_model(model, "cpu", move_grads=False) is model
+
+    buffer.offload_to_cpu.assert_called_once_with(move_params=True, move_grads=False)
+    model.to.assert_not_called()
+
+
+def _run_mimo_move_model_keeps_fp8_param_grad_hooks(
+    rank: int, world_size: int, recipe_name: str
+) -> None:
+    import transformer_engine.pytorch as te
+    from megatron.core import parallel_state
+    from megatron.core.distributed import (
+        DistributedDataParallel,
+        DistributedDataParallelConfig,
+    )
+    from megatron.core.models.mimo import MimoModel
+    from megatron.core.transformer import TransformerConfig
+    from transformer_engine.common import recipe
+
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    parallel_state.initialize_model_parallel()
+    fp8_recipe = (
+        recipe.MXFP8BlockScaling()
+        if recipe_name == "mxfp8"
+        else recipe.Float8CurrentScaling()
+    )
+    with te.quantized_model_init(enabled=True, recipe=fp8_recipe):
+        linear = te.Linear(64, 64, bias=False, params_dtype=torch.bfloat16)
+    language_model = DistributedDataParallel(
+        config=TransformerConfig(num_layers=1, hidden_size=64, num_attention_heads=1),
+        ddp_config=DistributedDataParallelConfig(grad_reduce_in_fp32=True),
+        module=linear,
+    )
+    # MimoModel.__init__ builds its modules from specs; only the layout matters here.
+    model = object.__new__(MimoModel)
+    torch.nn.Module.__init__(model)
+    model.language_model = language_model
+    model.modality_submodules = torch.nn.ModuleDict({"images": None})
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+
+    # prepare_for_training() makes this call before SFT v2 training starts.
+    worker.move_model(model, "cuda")
+
+    main_grad = linear.weight.main_grad
+    with te.autocast(enabled=True, recipe=fp8_recipe):
+        output = language_model(
+            torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
+        )
+    output.float().sum().backward()
+    assert main_grad.abs().sum() > 0
+    parallel_state.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("recipe_name", ["fp8_current_scaling", "mxfp8"])
+def test_megatron_move_model_keeps_mimo_fp8_param_grad_hooks(
+    distributed_test_runner, recipe_name
+):
+    import transformer_engine.pytorch as te
+
+    if not torch.cuda.is_available() or not (
+        te.is_mxfp8_available() if recipe_name == "mxfp8" else te.is_fp8_available()
+    ):
+        pytest.skip(f"{recipe_name} is not supported on this device")
+    distributed_test_runner(
+        functools.partial(
+            _run_mimo_move_model_keeps_fp8_param_grad_hooks, recipe_name=recipe_name
+        ),
+        world_size=1,
+    )
+
+
 @pytest.mark.parametrize("cache_active", [True, False])
 def test_megatron_finalize_async_save_releases_colocated_nvrx_cache(
     monkeypatch, cache_active
@@ -1808,6 +1969,7 @@ def test_megatron_finalize_async_save_releases_colocated_nvrx_cache(
         )
     )
     worker._async_checkpoint_cuda_cache_active = cache_active
+    worker.mimo_runtime = None
     events = []
 
     monkeypatch.setattr(

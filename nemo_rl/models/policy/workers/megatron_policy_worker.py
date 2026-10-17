@@ -31,6 +31,7 @@ from megatron.bridge.training.checkpointing import (
     maybe_finalize_async_save,
     save_checkpoint,
 )
+from megatron.bridge.training.train import maybe_run_manual_gc
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.training.utils.train_utils import (
     logical_and_across_model_parallel_group,
@@ -43,7 +44,11 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallelV1,
     FullyShardedDataParallelV2,
 )
-from megatron.core.optimizer import ChainedOptimizer
+from megatron.core.models.mimo import MimoModel
+from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+from megatron.core.models.mimo.optimizer import MimoOptimizer
+from megatron.core.optimizer import ChainedOptimizer, MegatronOptimizer
+from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_model_config, unwrap_model
 from transformers import PreTrainedTokenizerBase
@@ -90,6 +95,7 @@ from nemo_rl.models.megatron.draft.step_state import (
     DraftStepPayload,
     DraftStepState,
 )
+from nemo_rl.models.megatron.mimo import resolve_mimo_sft_config
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
     broadcast_obj_from_pp_rank,
@@ -101,10 +107,12 @@ from nemo_rl.models.megatron.router_replay import (
 )
 from nemo_rl.models.megatron.setup import (
     build_inference_model,
+    configure_megatron_mimo,
     finalize_megatron_setup,
     handle_model_import,
     load_teacher_output_layer_weight,
     setup_distributed,
+    setup_mimo_model_and_optimizer,
     setup_model_and_optimizer,
     setup_reference_model_state,
     validate_and_set_config,
@@ -118,6 +126,7 @@ from nemo_rl.models.megatron.train import (
     TopkLogitsPostProcessor,
     aggregate_training_statistics,
     megatron_forward_backward,
+    megatron_mimo_forward_backward,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -462,6 +471,9 @@ class MegatronPolicyWorkerImpl(
     _train_step_state: Optional[dict[str, Any]] = None
     _remote_sparse_refit: Any = None
     _async_checkpoint_cuda_cache_active: bool = False
+    # Training updates completed since manual GC started; None while
+    # automatic GC is active.
+    _manual_gc_steps: Optional[int] = None
 
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
@@ -504,6 +516,15 @@ class MegatronPolicyWorkerImpl(
         """
         if not torch.distributed.is_initialized():
             return None
+        if self.mimo_runtime is not None:
+            # Bridge has already installed this rank's module-local process
+            # groups. Reuse them for the V2 leader-fetch path so language
+            # CP0/TP0 fetches once for its TP×CP replicas and encoder TP0
+            # fetches once for its TP replicas. PP is restricted to one by the
+            # initial MIMO data placement.
+            if self.mimo_runtime.active_module_name == MIMO_LANGUAGE_MODULE_KEY:
+                return self.mimo_runtime.local_pg_collection.tp_cp
+            return self.mimo_runtime.local_pg_collection.tp
         cached = getattr(self, "_replica_group_cache", "uninit")
         if cached != "uninit":
             return cached
@@ -616,6 +637,8 @@ class MegatronPolicyWorkerImpl(
         init_telemetry_worker()
 
         self.cfg = config
+        self.mimo_parallelism_config = None
+        self.mimo_runtime = None
         self._router_replay_enabled = router_replay_enabled(config)
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
@@ -703,6 +726,13 @@ class MegatronPolicyWorkerImpl(
         self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
         self.sampling_params = runtime_config.sampling_params
 
+        if resolve_mimo_sft_config(config) is not None:
+            self.mimo_parallelism_config = configure_megatron_mimo(
+                config,
+                self.megatron_cfg,
+                world_size=torch.distributed.get_world_size(),
+            )
+
         self.defer_fp32_logits = self.cfg["megatron_cfg"].get(
             "defer_fp32_logits", None
         ) and (runtime_config.model_cfg.fp16 or runtime_config.model_cfg.bf16)
@@ -714,27 +744,45 @@ class MegatronPolicyWorkerImpl(
 
         # Full-iteration CUDA graphs cannot be interrupted, so disable the
         # NaN-in-loss check that would otherwise require breaking out of the graph.
-        if self.megatron_cfg.model.cuda_graph_impl == "full_iteration":
+        if (
+            self.mimo_parallelism_config is None
+            and self.megatron_cfg.model.cuda_graph_impl == "full_iteration"
+        ):
             warnings.warn(
                 "Disabling check_for_nan_in_loss: full-iteration CUDA graph cannot be interrupted."
             )
             self.megatron_cfg.rerun_state_machine.check_for_nan_in_loss = False
 
         # Validate configuration
-        validate_megatron_config(self.megatron_cfg, self.cfg)
+        if self.mimo_parallelism_config is None:
+            validate_megatron_config(self.megatron_cfg, self.cfg)
 
         # Step 4: Setup Megatron model and components
         assert not (skip_weight_load and (init_optimizer or init_reference_model)), (
             "skip_weight_load is only valid for inference-only policies "
             "(init_optimizer=False, init_reference_model=False)."
         )
-        model_and_optimizer_state = setup_model_and_optimizer(
-            config,
-            self.megatron_cfg,
-            init_optimizer,
-            pre_load_checkpoint_hook=getattr(self, "_pre_load_checkpoint_hook", None),
-            load_weights=not skip_weight_load,
-        )
+        if self.mimo_parallelism_config is not None:
+            if init_reference_model:
+                raise NotImplementedError(
+                    "The initial SFT v2 MIMO path does not construct a reference model."
+                )
+            model_and_optimizer_state = setup_mimo_model_and_optimizer(
+                config,
+                self.megatron_cfg,
+                load_optimizer=init_optimizer,
+                load_weights=not skip_weight_load,
+            )
+        else:
+            model_and_optimizer_state = setup_model_and_optimizer(
+                config,
+                self.megatron_cfg,
+                init_optimizer,
+                pre_load_checkpoint_hook=getattr(
+                    self, "_pre_load_checkpoint_hook", None
+                ),
+                load_weights=not skip_weight_load,
+            )
 
         self.mcore_state = model_and_optimizer_state.state
         self.model = model_and_optimizer_state.model
@@ -744,6 +792,7 @@ class MegatronPolicyWorkerImpl(
         param_sync_func = model_and_optimizer_state.param_sync_func
         self.draft_model = model_and_optimizer_state.draft_model
         self._colocated_reshard_plan = model_and_optimizer_state.colocated_reshard_plan
+        self.mimo_runtime = model_and_optimizer_state.mimo_runtime
         log_gpu_memory_diagnostics(
             label="after_model_setup", worker_type="MegatronPolicyWorker"
         )
@@ -769,6 +818,23 @@ class MegatronPolicyWorkerImpl(
             )
 
         # Step 6: Finalize setup
+        if self.mimo_parallelism_config is not None:
+            assert self.mimo_runtime is not None
+            language_tensor_parallel_size = (
+                self.mimo_parallelism_config.get_parallelism(
+                    MIMO_LANGUAGE_MODULE_KEY
+                ).tensor_model_parallel_size
+            )
+            active_data_parallel_size = self.mimo_parallelism_config.get_parallelism(
+                self.mimo_runtime.active_module_name
+            ).data_parallel_size
+            if active_data_parallel_size is None:
+                raise RuntimeError(
+                    f"MIMO module {self.mimo_runtime.active_module_name!r} has no finalized DP size."
+                )
+        else:
+            language_tensor_parallel_size = None
+            active_data_parallel_size = None
         (
             self.megatron_tokenizer,
             self.megatron_bridge,
@@ -781,6 +847,9 @@ class MegatronPolicyWorkerImpl(
             worker_sharding_annotations,
             self.model,
             self.optimizer,
+            language_tensor_parallel_size=language_tensor_parallel_size,
+            active_data_parallel_size=active_data_parallel_size,
+            install_model_config_hooks=self.mimo_parallelism_config is None,
         )
         self._first_train_step_forward_pre_hook_disabled = False
         self._first_train_step_param_sync_func = None
@@ -798,7 +867,8 @@ class MegatronPolicyWorkerImpl(
             not self.delegate_mtp_loss_mask_to_model or self.delegate_pack_to_model
         ), "A model cannot own MTP-mask packing without owning sequence packing"
         self.model_slices_context_parallel_inputs = (
-            _model_slices_context_parallel_inputs(self.model)
+            self.mimo_runtime is not None
+            or _model_slices_context_parallel_inputs(self.model)
         )
         mtp_num_layers = self._get_model_config().mtp_num_layers
         self.mtp_enabled = mtp_num_layers is not None and mtp_num_layers > 0
@@ -1117,6 +1187,7 @@ class MegatronPolicyWorkerImpl(
             ctx = nullcontext()
             # Ensure model is in training mode
             self.model.train()
+            self._maybe_start_manual_gc()
             saved_extra_state = None
             reenable_forward_pre_hook_after_eval = False
 
@@ -1376,6 +1447,7 @@ class MegatronPolicyWorkerImpl(
             # passing increment=gbs cancels that scaling and one tick == one
             # train() call regardless of batch size.
             self.scheduler.step(increment=gbs)
+            self._maybe_run_manual_gc()
 
         # Aggregate metrics across all microbatches
         mb_metrics, global_loss = aggregate_training_statistics(
@@ -1662,6 +1734,7 @@ class MegatronPolicyWorkerImpl(
                 "a train step is already open; "
                 "call finish_train_step or abort_train_step before begin"
             )
+        self._maybe_start_manual_gc()
         # Match sync train() inference-state reset (line 332-340).
         if hasattr(self.model, "inference_params"):
             self.model.inference_params = None
@@ -1672,8 +1745,27 @@ class MegatronPolicyWorkerImpl(
                 module._inference_key_value_memory = None
 
         self.model.train()
+        if self.mimo_runtime is not None:
+            # Bridge's MIMO utility is optional on ordinary policy paths.
+            from megatron.bridge.training.megatron_mimo_parallel_utils import (
+                zero_grad_buffer_for_multimodule,
+            )
+
+            zero_grad_buffer_for_multimodule(self.mimo_runtime.module_to_grid_tuple)
+            self.optimizer.zero_grad()
+            if self._uses_mxfp8_overlap_shared_param_buffer():
+                # MIMO wraps each component in DDP, so the single-model staging
+                # helper cannot restore the parameter buffers cleared above.
+                self.optimizer.prepare_model_params_for_param_sync()
+            state = self._split_step_state_init(loss_fn=loss_fn, gbs=gbs, mbs=mbs)
+            state["mimo"] = True
+            state["mimo_losses_reduced"] = []
+            self._train_step_state = state
+            return
+
         self.model.zero_grad_buffer()
         self.optimizer.zero_grad()
+        self._copy_main_params_to_param_buffer()
 
         state = self._split_step_state_init(loss_fn=loss_fn, gbs=gbs, mbs=mbs)
 
@@ -1733,7 +1825,9 @@ class MegatronPolicyWorkerImpl(
     @wrap_with_nvtx_name("megatron_policy_worker/train_microbatch")
     def train_microbatch(
         self,
-        data: BatchedDataDict[Any],
+        data: Optional[BatchedDataDict[Any]],
+        num_microbatches: Optional[int] = None,
+        sequence_length: Optional[int] = None,
     ) -> None:
         """One DP slice of data → one ``forward_backward_func`` invocation.
 
@@ -1748,6 +1842,16 @@ class MegatronPolicyWorkerImpl(
         regular ``train`` path.
         """
         state = self._assert_step_open()
+        if self.mimo_runtime is not None:
+            self._train_mimo_microbatch_body(
+                state,
+                data,
+                num_microbatches=num_microbatches,
+                sequence_length=sequence_length,
+            )
+            return
+        if data is None:
+            raise ValueError("A non-MIMO train microbatch requires data.")
         try:
             self._train_microbatch_body(state, data)
         except Exception:
@@ -1770,6 +1874,66 @@ class MegatronPolicyWorkerImpl(
                     "failed to restore mcore hooks after train_microbatch error"
                 )
             raise
+
+    def _train_mimo_microbatch_body(
+        self,
+        state: dict[str, Any],
+        data: Optional[BatchedDataDict[Any]],
+        *,
+        num_microbatches: Optional[int],
+        sequence_length: Optional[int],
+    ) -> None:
+        """Run one synchronized heterogeneous schedule invocation."""
+        if num_microbatches is None or num_microbatches <= 0:
+            raise ValueError("MIMO training requires a positive num_microbatches.")
+        if sequence_length is None or sequence_length <= 0:
+            raise ValueError("MIMO training requires a positive sequence_length.")
+        if state["num_chunks"]:
+            raise RuntimeError(
+                "The initial MIMO SFT v2 path accepts one placed batch per step."
+            )
+        if data is None:
+            data_iterator: Iterator[Any] = iter([None] * num_microbatches)
+            micro_batch_size = state["mbs"]
+        else:
+            (
+                data_iterator,
+                actual_num_microbatches,
+                micro_batch_size,
+                _,
+                actual_sequence_length,
+            ) = get_microbatch_iterator(
+                data,
+                self.cfg,
+                state["mbs"],
+                straggler_timer=self.mcore_state.straggler_timer,
+                delegate_pack_to_model=self.delegate_pack_to_model,
+                delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+                model_slices_context_parallel_inputs=True,
+                mtp_enabled=self.mtp_enabled,
+            )
+            if actual_num_microbatches != num_microbatches:
+                raise ValueError(
+                    "MIMO role batch produced a different microbatch count: "
+                    f"expected {num_microbatches}, got {actual_num_microbatches}."
+                )
+            if actual_sequence_length != sequence_length:
+                raise ValueError(
+                    "MIMO role batch produced a different sequence length: "
+                    f"expected {sequence_length}, got {actual_sequence_length}."
+                )
+
+        state["num_chunks"] = 1
+        state["total_num_microbatches"] = num_microbatches
+        losses_reduced = megatron_mimo_forward_backward(
+            model=self.model,
+            data_iterator=data_iterator,
+            num_microbatches=num_microbatches,
+            seq_length=sequence_length,
+            mbs=micro_batch_size,
+            mimo_runtime=self.mimo_runtime,
+        )
+        state["mimo_losses_reduced"] = list(losses_reduced or [])
 
     def _train_microbatch_body(
         self,
@@ -1949,6 +2113,8 @@ class MegatronPolicyWorkerImpl(
     @wrap_with_nvtx_name("megatron_policy_worker/finish_train_step")
     def finish_train_step(self) -> dict[str, Any]:
         state = self._assert_step_open()
+        if self.mimo_runtime is not None:
+            return self._finish_train_step_body(state)
         try:
             return self._finish_train_step_body(state)
         except Exception:
@@ -1971,7 +2137,126 @@ class MegatronPolicyWorkerImpl(
                 )
             raise
 
+    def _maybe_start_manual_gc(self) -> None:
+        """Disable automatic GC at the first update, like Bridge's ``train.manual_gc``.
+
+        Automatic GC pauses one rank at a time while the others wait for it at
+        the next collective; manual GC collects at the same update on every rank.
+        """
+        if self._manual_gc_steps is not None or not self.megatron_cfg.train.manual_gc:
+            return
+        # Forked children such as data loader workers never run the schedule.
+        os.register_at_fork(after_in_child=gc.enable)
+        gc.disable()
+        gc.collect()
+        self._manual_gc_steps = 0
+
+    def _maybe_run_manual_gc(self) -> None:
+        """Count one completed update and collect every ``manual_gc_interval``."""
+        if self._manual_gc_steps is None:
+            return
+        self._manual_gc_steps += 1
+        train_cfg = self.megatron_cfg.train
+        maybe_run_manual_gc(
+            train_cfg.manual_gc, train_cfg.manual_gc_interval, self._manual_gc_steps
+        )
+
+    def _assemble_step_metrics(
+        self,
+        *,
+        global_loss: torch.Tensor,
+        grad_norm: Optional[float],
+        all_mb_metrics: dict[str, list[Any]],
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Apply common finish-step cleanup and build the worker result."""
+        self._maybe_run_manual_gc()
+        if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
+            torch.cuda.empty_cache()
+        if grad_norm is not None:
+            warn_if_inf_grad_norm(grad_norm)
+        self._log_gpu_mem("step_finish")
+        return {
+            "global_loss": global_loss.detach().cpu(),
+            "rank": torch.distributed.get_rank(),
+            "gpu_name": torch.cuda.get_device_name(),
+            "model_dtype": self.dtype,
+            "all_mb_metrics": all_mb_metrics,
+            "grad_norm": torch.tensor(
+                [grad_norm if grad_norm is not None else float("nan")]
+            ),
+            "step_phases": dict(state.get("step_phases") or {}),
+        }
+
     def _finish_train_step_body(self, state: dict[str, Any]) -> dict[str, Any]:
+        if self.mimo_runtime is not None:
+            opt_started = time.monotonic()
+            update_successful, grad_norm, _ = self.optimizer.step()
+            self._add_step_phase("finish_opt", time.monotonic() - opt_started)
+
+            is_language_role = (
+                self.mimo_runtime.active_module_name == MIMO_LANGUAGE_MODULE_KEY
+            )
+            curr_lr: Optional[float] = None
+            curr_wd: Optional[float] = None
+            if is_language_role:
+                curr_lr = self.scheduler.get_lr(self.optimizer.param_groups[0])
+                curr_wd = self.scheduler.get_wd()
+            if update_successful:
+                for scheduler in self.mimo_runtime.schedulers.values():
+                    scheduler.step(increment=state["gbs"])
+
+            loss_dict: dict[str, torch.Tensor] = {}
+            if is_language_role:
+                losses_reduced = state["mimo_losses_reduced"]
+                if not losses_reduced:
+                    raise RuntimeError(
+                        "The MIMO language role produced no loss metrics."
+                    )
+                for name in losses_reduced[0]:
+                    values = [loss[name].view(-1) for loss in losses_reduced]
+                    if values[0].numel() == 2:
+                        totals = torch.vstack(values).sum(dim=0)
+                        torch.distributed.all_reduce(
+                            totals,
+                            group=self.mimo_runtime.local_pg_collection.dp_cp,
+                        )
+                        loss_dict[name] = torch.where(
+                            totals[1] > 0,
+                            totals[0] / totals[1],
+                            torch.zeros_like(totals[0]),
+                        )
+                    elif values[0].numel() == 1:
+                        loss_dict[name] = torch.cat(values).mean()
+                    else:
+                        raise ValueError(f"Invalid MIMO metric shape for {name}.")
+
+            language_loss = loss_dict.get("lm loss")
+            global_loss = (
+                language_loss if language_loss is not None else torch.zeros(())
+            )
+            all_mb_metrics: dict[str, list[Any]] = {
+                name: [value.detach().cpu()] for name, value in loss_dict.items()
+            }
+            if loss_dict:
+                all_mb_metrics["lr"] = [curr_lr]
+                all_mb_metrics["wd"] = [curr_wd]
+
+            metrics = self._assemble_step_metrics(
+                global_loss=global_loss,
+                grad_norm=grad_norm,
+                all_mb_metrics=all_mb_metrics,
+                state=state,
+            )
+            if is_language_role:
+                self._collect_mtp_metrics(
+                    metrics,
+                    state["total_num_microbatches"],
+                    mtp_grad_norm=None,
+                )
+            self._train_step_state = None
+            return metrics
+
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         reduce_started = time.monotonic()
@@ -2121,9 +2406,6 @@ class MegatronPolicyWorkerImpl(
         # param all-gather never runs and each forward sees only its own shard.
         self._restore_first_train_step_param_sync(update_successful)
 
-        if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
-            torch.cuda.empty_cache()
-
         # Pair this step's chunk count with the gradient norm it produced on one
         # line. Any dependence of grad_norm on chunks is a bug in the streaming
         # accumulation, so making the two directly greppable together is the
@@ -2145,10 +2427,6 @@ class MegatronPolicyWorkerImpl(
                 global_valid_toks.item(),
                 grad_norm,
             )
-        # Last worker call before the controller re-enters the select() wait, so
-        # this is also the "idle wait start" marker.
-        self._log_gpu_mem("step_finish")
-
         # Restore the mcore hooks before scheduler.step / further state.
         self._restore_saved_mcore_hooks(state)
 
@@ -2243,14 +2521,12 @@ class MegatronPolicyWorkerImpl(
             data_parallel_group=parallel_state.get_data_parallel_group(),
         )
 
-        metrics = {
-            "global_loss": global_loss.cpu(),
-            "rank": torch.distributed.get_rank(),
-            "gpu_name": torch.cuda.get_device_name(),
-            "model_dtype": self.dtype,
-            "all_mb_metrics": mb_metrics,
-            "grad_norm": torch.tensor([grad_norm]),
-        }
+        metrics = self._assemble_step_metrics(
+            global_loss=global_loss,
+            grad_norm=grad_norm,
+            all_mb_metrics=mb_metrics,
+            state=state,
+        )
         if draft_grad_norm is not None:
             metrics["draft_grad_norm"] = torch.tensor([draft_grad_norm])
 
@@ -2291,6 +2567,16 @@ class MegatronPolicyWorkerImpl(
     def abort_train_step(self) -> None:
         state = getattr(self, "_train_step_state", None)
         if state is None:
+            return
+        if self.mimo_runtime is not None:
+            # Bridge's MIMO utility is optional on ordinary policy paths.
+            from megatron.bridge.training.megatron_mimo_parallel_utils import (
+                zero_grad_buffer_for_multimodule,
+            )
+
+            zero_grad_buffer_for_multimodule(self.mimo_runtime.module_to_grid_tuple)
+            self.optimizer.zero_grad()
+            self._train_step_state = None
             return
         # Drop the step-local MTP scaler and restore the mcore hooks before
         # zero_grad_buffer touches anything.
@@ -3051,12 +3337,18 @@ class MegatronPolicyWorkerImpl(
         if self.mtp_enabled:
             from nemo_rl.models.megatron.common import get_mtp_metrics
 
-            # MTP layers live only on the last pipeline stage, so the tracker is
-            # populated there alone. Broadcast to all stages so downstream metric
-            # aggregation (which reads rank 0's results) sees them when PP > 1.
             mtp_loss_scale = 1.0 / max(1, total_num_microbatches)
             mtp_metrics = get_mtp_metrics(loss_scale=mtp_loss_scale)
-            mtp_metrics = broadcast_loss_metrics_from_last_stage(mtp_metrics)
+            # Only the last language stage owns MTP. Share its metrics with
+            # earlier stages using MIMO's explicit language PP group when present.
+            pp_group = (
+                self.mimo_runtime.local_pg_collection.pp
+                if self.mimo_runtime is not None
+                else None
+            )
+            mtp_metrics = broadcast_loss_metrics_from_last_stage(
+                mtp_metrics, pp_group=pp_group
+            )
             # mtp_grad_norm is already MP-reduced (same value on every rank); expose it
             # under the "mtp/" namespace so it logs as train/mtp/grad_norm.
             if mtp_grad_norm is not None:
@@ -4590,7 +4882,21 @@ class MegatronPolicyWorkerImpl(
         move_grads: bool = True,
     ) -> torch.nn.Module:
         # move all param and grad buffers to the device
-        if isinstance(model, DistributedDataParallel):
+        if isinstance(model, MimoModel):
+            # MimoModel is not DDP-wrapped; its submodules are. Module.to() would
+            # swap quantized (FP8) parameters away from their DDP gradient hooks.
+            for submodule in (
+                model.language_model,
+                *model.modality_submodules.values(),
+            ):
+                if submodule is not None:
+                    self.move_model(
+                        submodule,
+                        device,
+                        move_params=move_params,
+                        move_grads=move_grads,
+                    )
+        elif isinstance(model, DistributedDataParallel):
             # DDP case
             for buffers in [model.buffers, model.expert_parallel_buffers]:
                 for buffer_idx in range(len(buffers)):
@@ -4627,26 +4933,86 @@ class MegatronPolicyWorkerImpl(
 
     def move_optimizer(self, device: str):
         # Iterate through the state dictionaries for each parameter group
-        if isinstance(self.optimizer, ChainedOptimizer):
-            optimizer_state = self.optimizer.state
-        else:
-            optimizer_state = self.optimizer._get_state()
-        for _, state in optimizer_state.items():
-            # Iterate through the state items (e.g., momentum, variance) for a parameter
-            for k, v in state.items():
-                # Check if the item is a tensor
-                if torch.is_tensor(v):
-                    # Move the tensor to device and update the state dictionary
-                    if device == "cpu":
-                        if v.is_cuda:
-                            state[k] = v.to("cpu")
-                    elif device == "cuda":
-                        if not v.is_cuda:
-                            state[k] = v.to("cuda")
-                    else:
-                        raise ValueError(
-                            f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
-                        )
+        optimizers = (
+            self.optimizer.chained_optimizers
+            if isinstance(self.optimizer, (ChainedOptimizer, MimoOptimizer))
+            else None
+        )
+        optimizer_states = (
+            [optimizer.state for optimizer in optimizers]
+            if optimizers is not None
+            else [self.optimizer._get_state()]
+        )
+        for optimizer_state in optimizer_states:
+            for _, state in optimizer_state.items():
+                # Iterate through the state items (e.g., momentum, variance) for a parameter
+                for k, v in state.items():
+                    # Check if the item is a tensor
+                    if torch.is_tensor(v):
+                        # Move the tensor to device and update the state dictionary
+                        if device == "cpu":
+                            if v.is_cuda:
+                                state[k] = v.to("cpu")
+                        elif device == "cuda":
+                            if not v.is_cuda:
+                                state[k] = v.to("cuda")
+                        else:
+                            raise ValueError(
+                                f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
+                            )
+
+    def _save_checkpoint_state(
+        self,
+        *,
+        optimizer: Optional[MegatronOptimizer],
+        scheduler: Optional[OptimizerParamScheduler],
+    ) -> None:
+        """Save through the checkpoint backend selected during worker setup."""
+        if self.mimo_runtime is not None:
+            # Bridge's MIMO checkpoint type is optional on ordinary workers.
+            from megatron.bridge.training.checkpointing import CheckpointSaveContext
+
+            self.mimo_runtime.checkpoint_manager.save(
+                CheckpointSaveContext(
+                    state=self.mcore_state,
+                    model=[self.model],
+                    optimizer=optimizer,
+                    opt_param_scheduler=scheduler,
+                    num_floating_point_operations_so_far=self.mcore_state.train_state.floating_point_operations_so_far,
+                    pg_collection=self.mimo_runtime.local_pg_collection,
+                    module_name=self.mimo_runtime.active_module_name,
+                ),
+                None,
+            )
+            return
+
+        save_checkpoint(
+            state=self.mcore_state,
+            model=[self.model],
+            optimizer=optimizer,
+            opt_param_scheduler=scheduler,
+            num_floating_point_operations_so_far=self.mcore_state.train_state.floating_point_operations_so_far,
+            checkpointing_context=self.checkpointing_context,
+        )
+
+    def _finalize_checkpoint_save(
+        self, *, blocking: bool, terminate: bool = False
+    ) -> None:
+        """Finalize through the checkpoint backend selected during worker setup."""
+        if self.mimo_runtime is not None:
+            self.mimo_runtime.checkpoint_manager.finalize_async_saves(
+                state=self.mcore_state,
+                blocking=blocking,
+                terminate=terminate,
+            )
+            return
+
+        maybe_finalize_async_save(
+            self.mcore_state,
+            ckpt_cfg=self.mcore_state.cfg.checkpoint,
+            blocking=blocking,
+            terminate=terminate,
+        )
 
     def save_checkpoint(
         self,
@@ -4687,11 +5053,7 @@ class MegatronPolicyWorkerImpl(
         try:
             # Block until any previous async save is fully written to disk.
             # With sync save this is a no-op.
-            maybe_finalize_async_save(
-                self.mcore_state,
-                ckpt_cfg=self.mcore_state.cfg.checkpoint,
-                blocking=True,
-            )
+            self._finalize_checkpoint_save(blocking=True)
 
             # Onload model before saving it.
             self.model = self.move_model(
@@ -4730,22 +5092,14 @@ class MegatronPolicyWorkerImpl(
 
             if self.should_disable_forward_pre_hook:
                 self.disable_forward_pre_hook()
-            save_checkpoint(
-                state=self.mcore_state,
-                model=[self.model],
+            self._save_checkpoint_state(
                 optimizer=optimizer_to_save,
-                opt_param_scheduler=scheduler_to_save,
-                num_floating_point_operations_so_far=self.mcore_state.train_state.floating_point_operations_so_far,
-                checkpointing_context=self.checkpointing_context,
+                scheduler=scheduler_to_save,
             )
 
             if not is_async:
                 # Sync path: finalize immediately (runs finalize_fns + barrier).
-                maybe_finalize_async_save(
-                    self.mcore_state,
-                    ckpt_cfg=self.mcore_state.cfg.checkpoint,
-                    blocking=True,
-                )
+                self._finalize_checkpoint_save(blocking=True)
             if self.should_disable_forward_pre_hook:
                 self.enable_forward_pre_hook()
 
@@ -4784,9 +5138,7 @@ class MegatronPolicyWorkerImpl(
             self._async_checkpoint_cuda_cache_active
             and self._requires_nvrx_cuda_cache_release()
         )
-        maybe_finalize_async_save(
-            self.mcore_state,
-            ckpt_cfg=self.mcore_state.cfg.checkpoint,
+        self._finalize_checkpoint_save(
             blocking=True,
             terminate=release_cuda_cache,
         )

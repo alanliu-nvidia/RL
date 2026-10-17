@@ -1149,7 +1149,9 @@ class TQWorkerMixin:
     @wrap_with_nvtx_name("policy_worker/train_microbatch_presharded")
     def train_microbatch_presharded(
         self,
-        meta: "KVBatchMeta",
+        meta: Optional["KVBatchMeta"],
+        num_microbatches: Optional[int] = None,
+        sequence_length: Optional[int] = None,
     ) -> None:
         """Per-rank microbatch entrypoint. Fetch → packing prep → forward+backward.
 
@@ -1159,21 +1161,29 @@ class TQWorkerMixin:
         ``finish_train_step_presharded``.
         """
         started = time.monotonic()
-        data = self._fetch(meta)
+        data = None if meta is None else self._fetch(meta)
         self._add_step_phase("fetch", time.monotonic() - started)
         started = time.monotonic()
-        data = self._attach_or_repack_pack_metadata(data, meta)
+        if meta is not None:
+            assert data is not None
+            data = self._attach_or_repack_pack_metadata(data, meta)
         self._add_step_phase("attach_pack", time.monotonic() - started)
         started = time.monotonic()
         self.train_microbatch(  # type: ignore[attr-defined]
             data=data,
+            num_microbatches=num_microbatches,
+            sequence_length=sequence_length,
         )
         self._add_step_phase("train_microbatch", time.monotonic() - started)
 
     @accepts_trace_context
     @wrap_with_nvtx_name("policy_worker/finish_train_step_presharded")
-    def finish_train_step_presharded(self) -> dict[str, Any]:
+    def finish_train_step_presharded(self, after: Any = None) -> dict[str, Any]:
         """Close a logical train step. No fetch — pure lifecycle.
+
+        ``after`` is ignored. With ``mimo.async_finish`` the driver passes this
+        worker's train-call ObjectRef here, so that Ray starts this call only
+        after that train call returned.
 
         Backend all-reduces accumulated ``local_valid_seqs/toks``,
         rescales gradients to the final global normalization, runs grad

@@ -47,6 +47,7 @@ The bugs these catch:
 
 from __future__ import annotations
 
+import gc
 import logging
 from types import SimpleNamespace
 from typing import Any
@@ -133,6 +134,7 @@ def _make_worker(loss_type):
     w.scheduler = MagicMock()
     w.scheduler.get_lr.return_value = 1e-4
     w.scheduler.get_wd.return_value = 0.01
+    w.mimo_runtime = None
     w.mcore_state = MagicMock()
     w.mcore_state.straggler_timer = None
     w.cfg = {
@@ -153,6 +155,7 @@ def _make_worker(loss_type):
     w.megatron_cfg = SimpleNamespace(
         optimizer=SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=False),
         ddp=SimpleNamespace(overlap_param_gather=False),
+        train=SimpleNamespace(manual_gc=False, manual_gc_interval=0),
     )
     w.dp_size = 2
     w.cp_size = 1
@@ -206,7 +209,7 @@ def mock_module_symbols():
         ],
         "get_microbatch_iterator": (iter([]), 2, 4, 16, 16),  # 2 pipeline mbs per call
         "LossPostProcessor": MagicMock(),
-        "broadcast_loss_metrics_from_last_stage": lambda m: m,
+        "broadcast_loss_metrics_from_last_stage": lambda m, **kwargs: m,
         "get_pg_collection": MagicMock(mp=MagicMock()),
         "logical_and_across_model_parallel_group": lambda v, mp_group: v,
         "reduce_max_stat_across_model_parallel_group": lambda v, mp_group: v,
@@ -483,6 +486,23 @@ class TestTrainMicrobatch:
             is True
         )
 
+    def test_mimo_prepares_mtp_position_ids(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.mtp_enabled = True
+        with patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker.megatron_mimo_forward_backward",
+            return_value=[],
+        ):
+            w._train_mimo_microbatch_body(
+                {"num_chunks": 0, "mbs": 4},
+                _fake_batch(),
+                num_microbatches=2,
+                sequence_length=16,
+            )
+        assert mock_module_symbols["gmi"].call_args.kwargs["mtp_enabled"] is True
+
     @pytest.mark.parametrize(
         (
             "delegate_pack_to_model",
@@ -646,11 +666,194 @@ class TestTrainMicrobatch:
 
 
 class TestFinish:
+    def test_mimo_loss_reduction_weights_tokens_in_language_dp_cp_group(
+        self, mock_module_symbols
+    ):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+        from nemo_rl.models.policy.workers.megatron_policy_worker import (
+            MIMO_LANGUAGE_MODULE_KEY,
+        )
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        group = object()
+        w.mimo_runtime = SimpleNamespace(
+            active_module_name=MIMO_LANGUAGE_MODULE_KEY,
+            local_pg_collection=SimpleNamespace(dp_cp=group),
+            schedulers={"language": w.scheduler},
+        )
+        w._assemble_step_metrics = MagicMock(return_value={})
+        state = {
+            "gbs": 1,
+            "total_num_microbatches": 2,
+            "mimo_losses_reduced": [
+                {"lm loss": torch.tensor([0.0, 0.0])},
+                {"lm loss": torch.tensor([6.0, 3.0])},
+            ],
+        }
+        with patch(
+            "torch.distributed.all_reduce",
+            side_effect=lambda totals, **kwargs: totals.add_(torch.tensor([10.0, 2.0])),
+        ) as reduce:
+            w._finish_train_step_body(state)
+        assert reduce.call_args.kwargs["group"] is group
+        torch.testing.assert_close(
+            w._assemble_step_metrics.call_args.kwargs["global_loss"],
+            torch.tensor(16.0 / 5.0),
+        )
+
     def _setup_open_step(self, mock_module_symbols, loss_type):
         w = _make_worker(loss_type)
         w.begin_train_step(loss_fn=w._test_loss_fn)
         w.train_microbatch(_fake_batch())
         return w
+
+    @pytest.mark.parametrize("update_successful", [True, False])
+    def test_mimo_steps_optimizer_schedulers_and_reports_language_loss(
+        self, mock_module_symbols, update_successful
+    ):
+        from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        dp_cp_group = object()
+        w.mimo_runtime = SimpleNamespace(
+            active_module_name=MIMO_LANGUAGE_MODULE_KEY,
+            local_pg_collection=SimpleNamespace(dp_cp=dp_cp_group),
+            schedulers={MIMO_LANGUAGE_MODULE_KEY: w.scheduler},
+        )
+        w.optimizer.step.return_value = (
+            update_successful,
+            0.5 if update_successful else None,
+            0,
+        )
+        w._train_step_state = {
+            "gbs": 4,
+            "total_num_microbatches": 2,
+            "mimo_losses_reduced": [
+                {"lm loss": torch.tensor([2.0, 2.0])},
+                {"lm loss": torch.tensor([4.0, 2.0])},
+            ],
+            "step_phases": {},
+        }
+
+        metrics = w.finish_train_step()
+
+        w.optimizer.step.assert_called_once_with()
+        if update_successful:
+            w.scheduler.step.assert_called_once_with(increment=4)
+        else:
+            w.scheduler.step.assert_not_called()
+        mock_module_symbols["all_reduce"].assert_called_once_with(
+            pytest.approx(torch.tensor([6.0, 4.0])), group=dp_cp_group
+        )
+        assert metrics["global_loss"] == pytest.approx(torch.tensor(1.5))
+        assert metrics["all_mb_metrics"]["lm loss"] == [pytest.approx(1.5)]
+        assert w._train_step_state is None
+
+    @pytest.mark.parametrize("role", ["language", "images"])
+    @pytest.mark.parametrize("mtp_enabled", [True, False])
+    @pytest.mark.parametrize("token_weighted", [True, False])
+    def test_mimo_reports_and_resets_mtp_metrics_on_language_ranks(
+        self,
+        mock_module_symbols: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+        role: str,
+        mtp_enabled: bool,
+        token_weighted: bool,
+    ) -> None:
+        from megatron.core.transformer.multi_token_prediction import (
+            MTPLossLoggingHelper,
+        )
+
+        from nemo_rl.algorithms.loss.interfaces import LossType
+        from nemo_rl.models.policy.tq_policy import _aggregate_train_results
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.mtp_enabled = mtp_enabled
+        language_group = object()
+        language_pp_group = object()
+        w.mimo_runtime = SimpleNamespace(
+            active_module_name=role,
+            local_pg_collection=SimpleNamespace(
+                dp_cp=language_group, pp=language_pp_group
+            ),
+            schedulers={role: w.scheduler},
+        )
+
+        # Execute two steps with different losses to catch a missing tracker reset.
+        for step in (1, 2):
+            tracker = {
+                "loss_values": torch.tensor([8.0, 12.0]) * step,
+                "correct_values": torch.tensor([2.0, 3.0]),
+                "total_values": torch.tensor([4.0, 6.0]),
+                "avg_group": language_group,
+                "token_weighted_logging": token_weighted,
+            }
+            if token_weighted:
+                tracker.update(
+                    loss_sum_values=torch.tensor([12.0, 18.0]) * step,
+                    loss_total_values=torch.tensor([4.0, 5.0]),
+                    main_total_values=torch.tensor([6.0, 6.0]),
+                )
+            monkeypatch.setattr(MTPLossLoggingHelper, "tracker", tracker)
+            w._train_step_state = {
+                "gbs": 4,
+                "total_num_microbatches": 4,
+                "mimo_losses_reduced": (
+                    [{"lm loss": torch.tensor([2.0, 4.0])}]
+                    if role == "language"
+                    else []
+                ),
+                "step_phases": {},
+            }
+
+            metrics = w.finish_train_step()
+            aggregated = _aggregate_train_results([metrics])
+
+            assert metrics["global_loss"].item() == pytest.approx(
+                0.5 if role == "language" else 0.0
+            )
+            if role == "language" and mtp_enabled:
+                assert aggregated["mtp_metrics"] == pytest.approx(
+                    {
+                        "mtp_1_loss": 2.0 * step,
+                        "mtp_2_loss": 3.0 * step,
+                        "mtp_1_acceptance_rate": 50.0,
+                        "mtp_2_acceptance_rate": 50.0,
+                    }
+                )
+                for value in tracker.values():
+                    if isinstance(value, torch.Tensor):
+                        assert torch.count_nonzero(value).item() == 0
+                assert tracker["avg_group"] is None
+            else:
+                assert "mtp_metrics" not in aggregated
+                torch.testing.assert_close(
+                    tracker["loss_values"], torch.tensor([8.0, 12.0]) * step
+                )
+            assert w._train_step_state is None
+
+        # MIMO has no homogeneous parallel_state groups. Only language DP/CP
+        # ranks may participate in loss/metric reductions; encoder ranks skip them.
+        broadcasts = mock_module_symbols["bcast"].call_args_list
+        if role == "language" and mtp_enabled:
+            assert len(broadcasts) == 2
+            assert all(
+                call.kwargs["pp_group"] is language_pp_group for call in broadcasts
+            )
+        else:
+            assert broadcasts == []
+        assert mock_module_symbols["pstate"].mock_calls == []
+        reductions = mock_module_symbols["all_reduce"].call_args_list
+        if role == "images":
+            assert reductions == []
+        else:
+            if mtp_enabled:
+                assert len(reductions) > 2
+            else:
+                assert len(reductions) == 2
+            assert all(call.kwargs["group"] is language_group for call in reductions)
 
     def test_rescales_grads_with_inv_n(self, mock_module_symbols):
         """The 1/N rescale must happen ON the local main_grad BEFORE the
@@ -1236,6 +1439,25 @@ class TestFinish:
 
 
 class TestAbort:
+    def test_mimo_uses_multimodule_gradient_reset(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.mimo_runtime = MagicMock()
+        w._train_step_state = {"mimo": True}
+
+        with patch(
+            "megatron.bridge.training.megatron_mimo_parallel_utils."
+            "zero_grad_buffer_for_multimodule"
+        ) as zero_grad:
+            w.abort_train_step()
+
+        zero_grad.assert_called_once_with(w.mimo_runtime.module_to_grid_tuple)
+        w.model.zero_grad_buffer.assert_not_called()
+        w.optimizer.zero_grad.assert_called_once()
+        assert w.model.config.grad_sync_func == "ORIGINAL_GRAD_SYNC_FUNC"
+        assert w._train_step_state is None
+
     def test_restores_grad_sync_func(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
 
@@ -1722,3 +1944,133 @@ class TestPrepareForLpInference:
         w.finish_train_step()
         assert self._grad_offload_calls(w) == []
         assert sentinel.call_count == 1
+
+
+# ── manual GC schedule ───────────────────────────────────────────────────
+
+
+@pytest.fixture
+def mock_gc():
+    """Record GC calls without changing this process's collector state."""
+    with (
+        patch("gc.disable") as disable,
+        patch("gc.collect") as collect,
+        patch("os.register_at_fork") as register_at_fork,
+    ):
+        yield SimpleNamespace(
+            disable=disable, collect=collect, register_at_fork=register_at_fork
+        )
+
+
+def _manual_gc_worker(interval):
+    from nemo_rl.algorithms.loss.interfaces import LossType
+
+    w = _make_worker(LossType.TOKEN_LEVEL)
+    w.megatron_cfg.train = SimpleNamespace(manual_gc=True, manual_gc_interval=interval)
+    return w
+
+
+def _run_split_updates(w, mock_gc, num_updates):
+    """Run full split-API updates; return the gc.collect count after each."""
+    counts = []
+    for _ in range(num_updates):
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+        w.finish_train_step()
+        counts.append(mock_gc.collect.call_count)
+    return counts
+
+
+class TestManualGC:
+    def test_off_by_default(self, mock_module_symbols, mock_gc):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        _run_split_updates(w, mock_gc, 3)
+        mock_gc.disable.assert_not_called()
+        mock_gc.collect.assert_not_called()
+        mock_gc.register_at_fork.assert_not_called()
+        assert w._manual_gc_steps is None
+
+    def test_disables_gc_once_and_collects_every_interval(
+        self, mock_module_symbols, mock_gc
+    ):
+        """The first update disables automatic GC and collects; afterwards
+        every rank collects after the same completed updates."""
+        w = _manual_gc_worker(interval=2)
+        assert _run_split_updates(w, mock_gc, 5) == [1, 2, 2, 3, 3]
+        mock_gc.disable.assert_called_once_with()
+        mock_gc.register_at_fork.assert_called_once_with(after_in_child=gc.enable)
+
+    def test_aborted_update_is_not_counted(self, mock_module_symbols, mock_gc):
+        w = _manual_gc_worker(interval=1)
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.abort_train_step()
+        assert _run_split_updates(w, mock_gc, 1) == [2]
+        assert w._manual_gc_steps == 1
+
+    @pytest.mark.parametrize("is_language_role", [True, False])
+    @pytest.mark.parametrize("update_successful", [True, False])
+    def test_mimo_roles_collect_after_the_same_completed_updates(
+        self, mock_module_symbols, mock_gc, is_language_role, update_successful
+    ):
+        from nemo_rl.models.policy.workers.megatron_policy_worker import (
+            MIMO_LANGUAGE_MODULE_KEY,
+        )
+
+        w = _manual_gc_worker(interval=2)
+        module_name = MIMO_LANGUAGE_MODULE_KEY if is_language_role else "vision"
+        w.mimo_runtime = SimpleNamespace(
+            active_module_name=module_name,
+            module_to_grid_tuple={},
+            schedulers={module_name: w.scheduler},
+        )
+        w.optimizer.step.return_value = (update_successful, None, 0)
+
+        counts = []
+        with patch(
+            "megatron.bridge.training.megatron_mimo_parallel_utils."
+            "zero_grad_buffer_for_multimodule"
+        ):
+            for step in range(5):
+                w.begin_train_step(loss_fn=w._test_loss_fn)
+                assert w._manual_gc_steps == step
+                if is_language_role:
+                    w._train_step_state["mimo_losses_reduced"] = [
+                        {"lm loss": torch.tensor(0.5)}
+                    ]
+                w.finish_train_step()
+                assert w._manual_gc_steps == step + 1
+                assert w._train_step_state is None
+                counts.append(mock_gc.collect.call_count)
+
+        assert counts == [1, 2, 2, 3, 3]
+        mock_gc.disable.assert_called_once_with()
+        mock_gc.register_at_fork.assert_called_once_with(after_in_child=gc.enable)
+
+    def test_sync_train_counts_updates_but_not_evaluation(
+        self, mock_module_symbols, mock_gc
+    ):
+        w = _manual_gc_worker(interval=1)
+        w.timer = MagicMock()
+        w.fp8_cfg = None
+        w.should_disable_forward_pre_hook = False
+        data = SimpleNamespace(size=w.cfg["train_global_batch_size"])
+        global_batch = {
+            "batch": _fake_batch(),
+            "global_valid_seqs": torch.tensor(8.0),
+            "global_valid_toks": torch.tensor(2048.0),
+        }
+        with (
+            patch(f"{WORKER_MOD}.process_global_batch", return_value=global_batch),
+            patch("torch.distributed.barrier"),
+            patch("torch.cuda.synchronize"),
+        ):
+            w.train(data, w._test_loss_fn, eval_mode=True)
+            assert mock_gc.collect.call_count == 0
+            w.train(data, w._test_loss_fn)
+            assert mock_gc.collect.call_count == 2
+            w.train(data, w._test_loss_fn, eval_mode=True)
+            assert mock_gc.collect.call_count == 2
+        mock_gc.disable.assert_called_once_with()
+        assert w._manual_gc_steps == 1

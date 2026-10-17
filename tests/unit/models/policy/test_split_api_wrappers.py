@@ -42,6 +42,7 @@ from nemo_rl.data_plane.schema import (
     ROUTED_EXPERTS_FIELD,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
+from nemo_rl.models.megatron.mimo import MIMOSFTConfig
 from nemo_rl.models.policy.tq_policy import TQPolicy
 
 
@@ -67,8 +68,8 @@ class _SplitStubWorker(TQWorkerMixin):
     def begin_train_step(self, loss_fn, gbs=None, mbs=None):
         self.calls.append(("begin", loss_fn, gbs, mbs))
 
-    def train_microbatch(self, data):
-        self.calls.append(("train_microbatch", data))
+    def train_microbatch(self, data, num_microbatches=None, sequence_length=None):
+        self.calls.append(("train_microbatch", data, num_microbatches, sequence_length))
 
     def finish_train_step(self):
         self.calls.append(("finish",))
@@ -101,7 +102,11 @@ class TestPreshardedWrappers:
         w = _SplitStubWorker()
         w._train_step_state = {"step_phases": {}}
         meta = _meta()
-        out = w.train_microbatch_presharded(meta=meta)
+        out = w.train_microbatch_presharded(
+            meta=meta,
+            num_microbatches=2,
+            sequence_length=128,
+        )
         assert out is None  # metrics accumulate in the open-step state
         assert [c[0] for c in w.calls] == ["fetch", "attach", "train_microbatch"]
         assert w.calls[-1][1] == {"data_from": meta}
@@ -130,11 +135,13 @@ def _make_tq_policy() -> tuple[TQPolicy, MagicMock]:
     """Bare TQPolicy with the attributes the split fan-out touches."""
     p = object.__new__(TQPolicy)
     p.cfg = {"train_global_batch_size": 8, "train_micro_batch_size": 2}
+    p.mimo_config = None
     p._router_replay_enabled = False
     # opd_full off, as __init__ leaves it when the config block is absent.
     p._opd_full_field = None
     p._opd_full_teacher_index_field = None
     p.flops_tracker = None
+    p._queued_finish_refs = None
     wg = MagicMock()
     wg.run_all_workers_single_data.return_value = ["f0", "f1"]
     p.worker_group = wg
@@ -287,6 +294,31 @@ class TestTQPolicySplitFanout:
             "mtp_1_acceptance_rate": 75.0,
             "grad_norm": 1.25,
         }
+
+    def test_mimo_finish_uses_language_leader(self):
+        def _result(loss: float) -> dict:
+            return {
+                "global_loss": loss,
+                "grad_norm": 0.5,
+                "all_mb_metrics": {"lm loss": [loss]},
+                "is_replica_leader": True,
+            }
+
+        p, _ = _make_tq_policy()
+        p.mimo_config = MIMOSFTConfig(
+            parallelism={"module_parallelisms": {"language": {"rank_offset": 2}}}
+        )
+        with patch("nemo_rl.models.policy.tq_policy.ray") as mock_ray:
+            mock_ray.get.return_value = [
+                _result(10.0),
+                _result(11.0),
+                _result(1.0),
+                _result(1.0),
+            ]
+            out = p.finish_train_step()
+
+        assert out["loss"] == 1.0
+        assert out["all_mb_metrics"] == {"lm loss": [1.0]}
 
     def test_abort_consumes_single_data_futures_with_ray_get(self):
         p, wg = _make_tq_policy()
