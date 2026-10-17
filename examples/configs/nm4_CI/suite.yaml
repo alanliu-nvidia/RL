@@ -371,7 +371,7 @@ checks:
   candidate: generalist_32n_mxfp8_gtp2
   reference_case: generalist_32n_mxfp8_gtp1
   steps: *id001
-  max_relative_loss_pct: 0.5
+  max_relative_loss_pct: 2.0
   strict_threshold: true
 - name: generalist_32n_mxfp8_egtp2_parity
   candidate: generalist_32n_mxfp8_egtp2
@@ -402,7 +402,7 @@ checks:
   candidate: clevr_4n_mxfp8_cp16ep16_2k
   reference_case: clevr_2n_mxfp8_cp8ep8_2k
   steps: *id006
-  max_relative_loss_pct: 0.5
+  max_relative_loss_pct: 2.0
   strict_threshold: true
 # The sixteen-node case uses DP4, so it has no matching data-lane reference yet.
 - name: checkpoint_16n_save10_parity

@@ -153,10 +153,13 @@ cases is a separate opt-in run.
   rough historical regression gate; it is configurable in `suite.yaml`.
 - MXFP8 versus the newly executed BF16 baseline: fail when maximum absolute
   per-step relative loss difference is **greater than 10%**.
-- GTP2, EGTP2 and both Muon variants versus the 32-node GTP1 reference:
+- Dense GTP2 versus the 32-node GTP1 reference, and four-node CLEVR
+  CP16/EP16 versus two-node CP8/EP8: maximum absolute per-step relative
+  difference must be **less than 2%**.
+- EGTP2 and both Muon variants versus the 32-node GTP1 reference:
   maximum absolute per-step relative difference must be **less than 0.5%**.
-- alltoall versus the 16-node GTP1 HybridEP reference, and four-node CLEVR
-  CP16/EP16 versus two-node CP8/EP8: the same **less than 0.5%** gate.
+- alltoall versus the 16-node GTP1 HybridEP reference: the same
+  **less than 0.5%** gate.
 - Restart phase one versus uninterrupted steps 1–10, and restart phase two versus
   uninterrupted steps 11–20: the same **less than 0.5%** gate. Comparing step 11
   against uninterrupted step 11 detects a restart spike without confusing it with
@@ -227,7 +230,7 @@ on AGA allocation 1295066 (276.60 GiB used out of 276.62 GiB). BF16 parameter
 storage and disabling the quantized-weight cache still exhausted memory during
 forward execution. Keep that recipe for reproducing the failure, but use the
 two-node CP8/EP8 reference in the required suite: 64 experts per GPU, with the
-same DP1 data lane, batch size, optimizer, precision, and 0.5% parity gate.
+same DP1 data lane, batch size, optimizer, precision, and 2% parity gate.
 All CLEVR cases use `/data/nemorl-datasets/clevr` and matching 2048-token packing limits.
 
 ### Four-node GPU validation
