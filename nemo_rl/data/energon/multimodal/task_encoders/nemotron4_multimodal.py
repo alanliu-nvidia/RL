@@ -27,7 +27,12 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from megatron.energon import Cooker, CrudeSample, FileStore, edataclass, stateless
+from megatron.energon.errors import FatalSampleError
 
+from nemo_rl.data.energon.mimo_image_split import (
+    EncoderShard,
+    select_encoder_shard_media,
+)
 from nemo_rl.data.energon.multimodal.model_families import supports_model_families
 from nemo_rl.data.energon.multimodal.nemotron4_diagnostics import record_sample_drop
 from nemo_rl.data.energon.multimodal.task_encoders.base import SFTCooker
@@ -60,9 +65,11 @@ from nemo_rl.data.energon.multimodal.types import (
     CanonicalSFTSample,
     EncodedSFTSample,
     MediaRef,
+    PackedSFTSample,
 )
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data.packing import SequencePacker
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 SOUND_TOKEN = SOUND_PLACEHOLDER = "<so_embedding>"
 SOUND_START = "<so_start>"
@@ -423,6 +430,7 @@ class Nemotron4MultiModalProcessorAdapter(_NemotronVisualProcessorAdapter):
         allow_large_videos: bool = False,
         tiling_augment_prob: float = 0.4,
         video_decode_thread_count: int = 8,
+        mimo_role: str | None = None,
         audio_subsampling_factor: int | None = None,
         audio_num_mel_bins: int = 128,
         audio_clip_duration_seconds: float = 30.0,
@@ -451,6 +459,7 @@ class Nemotron4MultiModalProcessorAdapter(_NemotronVisualProcessorAdapter):
             allow_large_videos=allow_large_videos,
             tiling_augment_prob=tiling_augment_prob,
             video_decode_thread_count=video_decode_thread_count,
+            mimo_role=mimo_role,
             add_bos=add_bos,
             add_eos=add_eos,
             add_generation_prompt=add_generation_prompt,
@@ -922,6 +931,10 @@ class Nemotron4MultiModalTaskEncoder(GenericSFTTaskEncoder):
         allow_large_videos: bool = False,
         tiling_augment_prob: float = 0.4,
         video_decode_thread_count: int = 8,
+        mimo_role: str | None = None,
+        pixel_transport_dtype: torch.dtype | None = None,
+        mimo_encoder_shard: EncoderShard | None = None,
+        encoder_media_split_frame_weight: int | None = None,
         audio_subsampling_factor: int | None = None,
         audio_num_mel_bins: int = 128,
         audio_clip_duration_seconds: float = 30.0,
@@ -950,6 +963,7 @@ class Nemotron4MultiModalTaskEncoder(GenericSFTTaskEncoder):
                 allow_large_videos=allow_large_videos,
                 tiling_augment_prob=tiling_augment_prob,
                 video_decode_thread_count=video_decode_thread_count,
+                mimo_role=mimo_role,
                 audio_subsampling_factor=audio_subsampling_factor,
                 audio_num_mel_bins=audio_num_mel_bins,
                 audio_clip_duration_seconds=audio_clip_duration_seconds,
@@ -975,6 +989,34 @@ class Nemotron4MultiModalTaskEncoder(GenericSFTTaskEncoder):
             loss_mask_mode="precomputed",
         )
         self._multimodal_adapter = omni_adapter
+        self._mimo_role = mimo_role
+        self._pixel_transport_dtype = pixel_transport_dtype
+        if mimo_encoder_shard is not None and mimo_role != "encoder":
+            raise ValueError("mimo_encoder_shard requires mimo_role='encoder'.")
+        # One shard is the whole pack: keep the encoder batch as it is.
+        self._mimo_encoder_shard = (
+            mimo_encoder_shard
+            if mimo_encoder_shard is not None and mimo_encoder_shard.count > 1
+            else None
+        )
+        if (
+            self._mimo_encoder_shard is not None
+            and encoder_media_split_frame_weight is None
+        ):
+            raise ValueError(
+                "mimo_encoder_shard requires encoder_media_split_frame_weight."
+            )
+        # Unused without a shard.
+        self._encoder_media_split_frame_weight: int = (
+            0
+            if encoder_media_split_frame_weight is None
+            else encoder_media_split_frame_weight
+        )
+        self._image_token_id = (
+            _token_id(omni_adapter.processor.tokenizer, "<image>")
+            if self._mimo_encoder_shard is not None
+            else None
+        )
 
     @stateless(restore_seeds=True)
     def preencode_sample(self, sample: CanonicalSFTSample) -> EncodedSFTSample:
@@ -991,6 +1033,65 @@ class Nemotron4MultiModalTaskEncoder(GenericSFTTaskEncoder):
         except Exception as exception:
             record_sample_drop("postencode", sample, exception)
             raise
+
+    @stateless
+    def encode_batch(self, batch: BatchedDataDict[Any]) -> BatchedDataDict[Any]:
+        if self._mimo_encoder_shard is not None:
+            # Keep this encoder rank's media range of each pack. Every rank of
+            # the lane decoded the same media, so sample drops stay identical.
+            try:
+                selected = select_encoder_shard_media(
+                    batch,
+                    shard=self._mimo_encoder_shard,
+                    patch_dim=self._multimodal_adapter.patch_dim,
+                    temporal_patch_size=self._multimodal_adapter.temporal_patch_size,
+                    frame_weight=self._encoder_media_split_frame_weight,
+                    image_token_id=self._image_token_id,
+                )
+            except FatalSampleError:
+                raise
+            except Exception as error:
+                # Any error here is fatal: Energon's handler would skip the batch
+                # on the encoder shards only, so the lane's loaders would diverge
+                # or lose the batch. FatalSampleError stops the loader instead.
+                raise FatalSampleError(
+                    f"The encoder media split failed: {error!r}"
+                ) from error
+            batch.update(selected)
+        # Match MLM: keep transforms/normalization in FP32, then cast pixels
+        # inside the loader worker, before IPC/prefetch retains the batch.
+        # Reuse PackedTensor's conversion without flattening/copying metadata.
+        if self._pixel_transport_dtype is not None:
+            batch.update(
+                batch.get_multimodal_dict(pixel_dtype=self._pixel_transport_dtype)
+            )
+        return batch
+
+    @stateless
+    def batch(
+        self, samples: list[EncodedSFTSample | PackedSFTSample]
+    ) -> BatchedDataDict[Any]:
+        if self._mimo_role == "language":
+            pixel_values = [
+                value
+                for sample in samples
+                for source in (
+                    sample.samples if isinstance(sample, PackedSFTSample) else [sample]
+                )
+                for message in source.message_log
+                for value in (message.get("pixel_values"),)
+                if isinstance(value, PackedTensor)
+            ]
+            if any(
+                tensor is not None and tensor.is_meta
+                for value in pixel_values
+                for tensor in value.tensors
+            ):
+                # Mixed image/video packs must concatenate pixels on one device.
+                # The language role discards these shape-only pixels before publishing.
+                for value in pixel_values:
+                    value.to("meta")
+        return super().batch(samples)
 
     @stateless
     def cook_crude_sample(

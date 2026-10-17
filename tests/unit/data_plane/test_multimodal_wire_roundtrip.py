@@ -42,12 +42,73 @@ from nemo_rl.data.multimodal_utils import (
     multimodal_row_tags,
 )
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
+from nemo_rl.data_plane.codec import packed_batch_to_wire
 from nemo_rl.data_plane.column_io import kv_first_write, read_columns
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import GLOBAL_FORWARD_PAD_SEQLEN
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 from ._rollout_shapes import keys_from_uids, register_train_partition
+
+
+def test_sft_single_owner_role_views(tq_client):
+    """One stored batch serves both roles, preserving packed row geometry."""
+    from nemo_rl.data.energon.mimo_batch import mimo_data_plane_batch
+
+    batch, _, _ = _make_vlm_rollout_output()
+    batch["cu_seqlens"] = PackedTensor(
+        [
+            torch.tensor([0, 8, 32]),
+            torch.tensor([0, 32]),
+            torch.tensor([0, 16, 32]),
+            torch.tensor([0, 32]),
+        ],
+        dim_to_pack=0,
+    )
+    batch["cu_seqlens_padded"] = batch["cu_seqlens"]
+    batch["mimo_media_output_counts"] = PackedTensor(
+        [torch.tensor([3]), torch.tensor([5]), None, torch.tensor([2])],
+        dim_to_pack=0,
+    )
+    fields, tags = packed_batch_to_wire(dict(batch), batch_size=4)
+    partition = "sft-single-owner-wire"
+    tq_client.register_partition(
+        partition_id=partition,
+        fields=list(fields.keys()),
+        num_samples=4,
+        consumer_tasks=["train"],
+    )
+    meta = tq_client.put_samples(
+        sample_ids=[f"{partition}-{i}" for i in range(4)],
+        partition_id=partition,
+        fields=fields,
+        tags=tags,
+    )
+    try:
+        for role in ("encoder", "language"):
+            projected = mimo_data_plane_batch(batch, role=role)
+            view = replace(meta, fields=list(projected))
+            # Reordered rows and a single-row fetch exercise both jagged and
+            # TQ's equal-shape/dense reconstruction paths.
+            for indices in ([3, 0, 2], [1]):
+                selected = view.subset(indices)
+                selected.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] = 64
+                fetched = read_columns(tq_client, selected, selected.fields)
+                assert set(fetched) == set(projected)
+                for key, expected in projected.items():
+                    actual = fetched[key]
+                    if isinstance(expected, PackedTensor):
+                        assert isinstance(actual, PackedTensor), key
+                        want = expected.slice(indices)
+                        assert actual.row_shapes() == want.row_shapes(), key
+                        torch.testing.assert_close(actual.as_tensor(), want.as_tensor())
+                    else:
+                        want = expected[indices]
+                        if want.ndim >= 2:
+                            actual = actual[:, : want.shape[1]]
+                        torch.testing.assert_close(actual, want)
+    finally:
+        tq_client.clear_samples(sample_ids=meta.sample_ids, partition_id=partition)
 
 
 def _make_vlm_rollout_output(
@@ -314,7 +375,9 @@ def _stub_tq_policy(monkeypatch, captured: dict[str, KVBatchMeta]):
     pol._opd_full_field = None  # opd_full off, as __init__ leaves it
     pol._opd_full_teacher_index_field = None
     pol.flops_tracker = None
-    pol.sharding_annotations = SimpleNamespace(get_axis_size=lambda _axis: 1)
+    pol.sharding_annotations = SimpleNamespace(
+        get_axis_size=lambda _axis: 1, names=["data_parallel"]
+    )
     pol.worker_group = SimpleNamespace(
         run_all_workers_sharded_data=lambda *a, **k: [],
         get_all_worker_results=lambda _futures: [

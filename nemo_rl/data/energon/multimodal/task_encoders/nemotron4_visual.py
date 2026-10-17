@@ -51,6 +51,7 @@ from nemo_rl.data.energon.multimodal.types import (
     MediaRef,
 )
 from nemo_rl.data.multimodal_utils import (
+    MIMO_MEDIA_OUTPUT_COUNTS_KEY,
     PackedTensor,
     resolve_to_image,
 )
@@ -571,6 +572,7 @@ class _NemotronVisualProcessorAdapter:
         allow_large_videos: bool = False,
         tiling_augment_prob: float = 0.4,
         video_decode_thread_count: int = 8,
+        mimo_role: str | None = None,
         add_bos: bool = False,
         add_eos: bool = False,
         add_generation_prompt: bool = False,
@@ -648,6 +650,7 @@ class _NemotronVisualProcessorAdapter:
         # so it is deliberately left out of the fingerprint below to avoid
         # invalidating checkpoint resume.
         self.video_decode_thread_count = video_decode_thread_count
+        self.mimo_role = mimo_role
         self.add_bos = add_bos
         self.add_eos = add_eos
         self.add_generation_prompt = add_generation_prompt
@@ -674,6 +677,8 @@ class _NemotronVisualProcessorAdapter:
             "add_eos": add_eos,
             "add_generation_prompt": add_generation_prompt,
         }
+        if mimo_role is not None:
+            fingerprint_data["mimo_role"] = mimo_role
         encoded = json.dumps(fingerprint_data, sort_keys=True, default=str).encode()
         self._fingerprint = hashlib.sha256(encoded).hexdigest()
 
@@ -1242,6 +1247,53 @@ class _NemotronVisualProcessorAdapter:
                 f"Nemotron visual plan expected {plan.modality!r}, got "
                 f"{ref.modality!r}."
             )
+        skip_video_decode = self.mimo_role == "language" and ref.modality in {
+            "video",
+            "video_frame",
+        }
+        if skip_video_decode:
+            # The exact frame selection, geometry, placeholder expansion, and
+            # packing decisions were already fixed by ``preencode``. Language
+            # ranks need those decisions but never consume pixels. Meta tensors
+            # preserve the selected shapes without touching the video payload.
+            sizes = [
+                (patch_height * self.patch_dim, patch_width * self.patch_dim)
+                for patch_width, patch_height in plan.patch_sizes
+            ]
+            first_height, first_width = sizes[0]
+            if any(
+                (height, width) != (first_height, first_width)
+                for height, width in sizes
+            ):
+                raise ValueError(
+                    "MIMO language video bypass requires one selected frame shape "
+                    "per visual occurrence."
+                )
+            pixel_values = torch.empty(
+                (len(sizes), 3, first_height, first_width),
+                dtype=torch.float32,
+                device="meta",
+            )
+            packed_inputs = {
+                "pixel_values": PackedTensor(
+                    pixel_values,
+                    dim_to_pack=0,
+                    preprocess_mode="patchify",
+                    preprocess_kwargs={"patch_dim": self.patch_dim},
+                ),
+                "imgs_sizes": PackedTensor(
+                    torch.tensor(sizes, dtype=torch.int32), dim_to_pack=0
+                ),
+                "num_frames": PackedTensor(
+                    torch.tensor([plan.num_frames], dtype=torch.long), dim_to_pack=0
+                ),
+                MIMO_MEDIA_OUTPUT_COUNTS_KEY: PackedTensor(
+                    torch.tensor(plan.embedding_widths, dtype=torch.int32),
+                    dim_to_pack=0,
+                ),
+            }
+            return packed_inputs, plan.num_embeddings
+
         if ref.modality == "image":
             value = (
                 ref.value.get(sample)
@@ -1374,6 +1426,11 @@ class _NemotronVisualProcessorAdapter:
                 dim_to_pack=0,
             ),
         }
+        if self.mimo_role is not None:
+            packed_inputs[MIMO_MEDIA_OUTPUT_COUNTS_KEY] = PackedTensor(
+                torch.tensor(plan.embedding_widths, dtype=torch.int32),
+                dim_to_pack=0,
+            )
         return packed_inputs, plan.num_embeddings
 
     def postencode(self, sample: EncodedSFTSample) -> EncodedSFTSample:
