@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -162,6 +163,7 @@ def _fake_worker(mtp_num_layers):
     """A minimal stand-in for MegatronPolicyWorkerImpl for calling _collect_mtp_metrics."""
     return SimpleNamespace(
         mtp_enabled=mtp_num_layers > 0,
+        mimo_runtime=None,
         model=SimpleNamespace(config=SimpleNamespace(mtp_num_layers=mtp_num_layers)),
     )
 
@@ -186,7 +188,9 @@ def test_collect_mtp_metrics_scales_loss_and_adds_grad_norm(monkeypatch):
         "nemo_rl.models.megatron.common.get_mtp_metrics", fake_get_mtp_metrics
     )
     # Single-process test: the last-stage broadcast is an identity passthrough.
-    monkeypatch.setattr(mpw, "broadcast_loss_metrics_from_last_stage", lambda d: d)
+    monkeypatch.setattr(
+        mpw, "broadcast_loss_metrics_from_last_stage", lambda d, *, pp_group=None: d
+    )
 
     metrics: dict = {}
     mpw.MegatronPolicyWorkerImpl._collect_mtp_metrics(
@@ -210,7 +214,9 @@ def test_collect_mtp_metrics_omits_grad_norm_when_none(monkeypatch):
         "nemo_rl.models.megatron.common.get_mtp_metrics",
         lambda loss_scale=1.0: {"mtp_1_loss": 0.5},
     )
-    monkeypatch.setattr(mpw, "broadcast_loss_metrics_from_last_stage", lambda d: d)
+    monkeypatch.setattr(
+        mpw, "broadcast_loss_metrics_from_last_stage", lambda d, *, pp_group=None: d
+    )
 
     metrics: dict = {}
     mpw.MegatronPolicyWorkerImpl._collect_mtp_metrics(
@@ -246,3 +252,93 @@ def test_collect_mtp_metrics_noop_when_mtp_disabled(monkeypatch):
     )
     assert "mtp_metrics" not in metrics
     assert not called["get_mtp_metrics"]
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("pipeline_ranks", "rank"),
+    [([8], 8), ([8, 12, 16], 8), ([8, 12, 16], 12), ([8, 12, 16], 16)],
+)
+def test_mimo_mtp_metrics_use_explicit_language_pipeline_group(
+    monkeypatch: pytest.MonkeyPatch,
+    pipeline_ranks: list[int],
+    rank: int,
+) -> None:
+    from nemo_rl.models.megatron import pipeline_parallel
+    from nemo_rl.models.policy.workers import megatron_policy_worker as mpw
+
+    worker = _fake_worker(mtp_num_layers=2)
+    language_pp_group = object()
+    worker.mimo_runtime = SimpleNamespace(
+        local_pg_collection=SimpleNamespace(pp=language_pp_group)
+    )
+    expected = {"mtp_1_loss": 0.5, "mtp_2_loss": 0.75}
+    local_metrics = expected.copy() if rank == pipeline_ranks[-1] else {}
+    monkeypatch.setattr(
+        "nemo_rl.models.megatron.common.get_mtp_metrics",
+        lambda loss_scale: local_metrics,
+    )
+    group_ranks = MagicMock(return_value=pipeline_ranks)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", group_ranks)
+    for name in (
+        "get_pipeline_model_parallel_group",
+        "get_pipeline_model_parallel_last_rank",
+        "is_pipeline_last_stage",
+    ):
+        monkeypatch.setattr(
+            pipeline_parallel,
+            name,
+            MagicMock(
+                side_effect=AssertionError("MIMO must use its explicit PP group")
+            ),
+        )
+
+    def broadcast(values, *, src, group):
+        assert src == pipeline_ranks[-1]
+        assert group is language_pp_group
+        assert values == [local_metrics]
+        values[0] = expected.copy()
+
+    collective = MagicMock(side_effect=broadcast)
+    monkeypatch.setattr(torch.distributed, "broadcast_object_list", collective)
+    metrics: dict = {}
+    mpw.MegatronPolicyWorkerImpl._collect_mtp_metrics(
+        worker, metrics, total_num_microbatches=4, mtp_grad_norm=None
+    )
+
+    assert metrics["mtp_metrics"] == expected
+    group_ranks.assert_called_once_with(language_pp_group)
+    collective.assert_called_once()
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("is_last_stage", [True, False])
+def test_loss_metric_broadcast_keeps_legacy_pipeline_group(
+    monkeypatch: pytest.MonkeyPatch, is_last_stage: bool
+) -> None:
+    from nemo_rl.models.megatron import pipeline_parallel
+
+    pp_group = object()
+    group_lookup = MagicMock(return_value=pp_group)
+    last_rank_lookup = MagicMock(return_value=12)
+    monkeypatch.setattr(
+        pipeline_parallel, "get_pipeline_model_parallel_group", group_lookup
+    )
+    monkeypatch.setattr(
+        pipeline_parallel, "get_pipeline_model_parallel_last_rank", last_rank_lookup
+    )
+    expected = [{"loss": 1.25}]
+
+    def broadcast(values, *, src, group):
+        assert src == 12
+        assert group is pp_group
+        values[0] = expected
+
+    monkeypatch.setattr(torch.distributed, "broadcast_object_list", broadcast)
+    result = pipeline_parallel.broadcast_loss_metrics_from_last_stage(
+        expected if is_last_stage else None
+    )
+
+    assert result == expected
+    group_lookup.assert_called_once_with()
+    last_rank_lookup.assert_called_once_with()

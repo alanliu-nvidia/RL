@@ -961,8 +961,199 @@ class TestForwardWithPostProcessingFn:
         assert data_dict["student_logits"] is student_logits
 
 
+class TestMIMOForwardStep:
+    def test_radio_encoder_is_rejected(self):
+        from nemo_rl.data.multimodal_utils import PackedTensor
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+        from nemo_rl.models.megatron.train import _mimo_encoder_batch
+
+        model = SimpleNamespace(
+            modality_submodules={
+                "images": SimpleNamespace(
+                    encoders={"radio": SimpleNamespace(patch_dim=2)}
+                )
+            }
+        )
+        microbatch = SimpleNamespace(
+            input_ids=torch.tensor([[1, 2]]),
+            data_dict=BatchedDataDict(
+                {
+                    "pixel_values": PackedTensor(torch.zeros(1, 4, 12), dim_to_pack=0),
+                    "imgs_sizes": PackedTensor(torch.tensor([[4, 4]]), dim_to_pack=0),
+                }
+            ),
+        )
+        with pytest.raises(NotImplementedError, match="supports Pixtral"):
+            _mimo_encoder_batch(microbatch, model)
+
+    def test_language_batch_and_loss_use_existing_processed_microbatch(self):
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.train import (
+            mimo_forward_with_post_processing_fn,
+        )
+
+        input_ids = torch.tensor([[10, 99, 99, 20, 30]])
+        microbatch = ProcessedMicrobatch(
+            data_dict=BatchedDataDict(
+                {
+                    "token_mask": torch.tensor([[0, 0, 0, 1, 1]]),
+                    "sample_mask": torch.tensor([1.0]),
+                }
+            ),
+            input_ids=input_ids,
+            input_ids_cp_sharded=input_ids,
+            attention_mask=None,
+            position_ids=torch.arange(input_ids.shape[1]).unsqueeze(0),
+            packed_seq_params=None,
+            cu_seqlens_padded=None,
+        )
+        mimo_model = SimpleNamespace(
+            role=SimpleNamespace(has_language_module=True),
+            special_token_ids={"images": 99},
+        )
+        model = MagicMock()
+        model.side_effect = lambda **batch: (
+            torch.ones_like(batch["loss_mask"]),
+            batch["loss_mask"],
+        )
+
+        with patch(
+            "megatron.bridge.training.megatron_mimo_parallel_utils."
+            "unwrap_megatron_mimo_model",
+            return_value=mimo_model,
+        ):
+            output, loss_func = mimo_forward_with_post_processing_fn(
+                iter([microbatch]), model
+            )
+
+        batch = model.call_args.kwargs
+        assert batch["labels"].tolist() == [[-100, -100, 20, 30, -100]]
+        assert batch["loss_mask"].tolist() == [[0, 0, 1, 1, 0]]
+        assert batch["position_ids"].tolist() == [[0, 1, 2, 3, 4]]
+        loss_sum, num_tokens, metrics = loss_func(output)
+        assert loss_sum.item() == 2.0
+        assert num_tokens.item() == 2
+        assert metrics["lm loss"].tolist() == [2.0, 2.0]
+
+    @pytest.mark.parametrize("packed", [False, True])
+    def test_language_batch_binds_to_mimo_model_forward(self, packed):
+        import inspect
+
+        from megatron.core.models.mimo import MimoModel
+        from megatron.core.packed_seq_params import PackedSeqParams
+
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.train import (
+            mimo_forward_with_post_processing_fn,
+        )
+
+        input_ids = torch.tensor([[10, 99, 20, 0, 30, 40, 0, 0]])
+        cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
+        cu_seqlens_padded = torch.tensor([0, 4, 8], dtype=torch.int32)
+        packed_seq_params = (
+            PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                cu_seqlens_q_padded=cu_seqlens_padded,
+                cu_seqlens_kv_padded=cu_seqlens_padded,
+                max_seqlen_q=4,
+                max_seqlen_kv=4,
+            )
+            if packed
+            else None
+        )
+        microbatch = ProcessedMicrobatch(
+            data_dict=BatchedDataDict(
+                {
+                    "token_mask": torch.ones_like(input_ids),
+                    "sample_mask": torch.tensor([1.0]),
+                }
+            ),
+            input_ids=input_ids,
+            input_ids_cp_sharded=input_ids,
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=packed_seq_params,
+            cu_seqlens_padded=cu_seqlens_padded if packed else None,
+        )
+        mimo_model = SimpleNamespace(
+            role=SimpleNamespace(has_language_module=True),
+            special_token_ids={"images": 99},
+        )
+        model = MagicMock(return_value=(torch.ones(1, 8), torch.ones(1, 8)))
+
+        with patch(
+            "megatron.bridge.training.megatron_mimo_parallel_utils."
+            "unwrap_megatron_mimo_model",
+            return_value=mimo_model,
+        ):
+            mimo_forward_with_post_processing_fn(iter([microbatch]), model)
+
+        arguments = (
+            inspect.signature(MimoModel.forward)
+            .bind(None, **model.call_args.kwargs)
+            .arguments
+        )
+        if packed:
+            torch.testing.assert_close(arguments["cu_seqlens"], cu_seqlens.unsqueeze(0))
+            torch.testing.assert_close(
+                arguments["cu_seqlens_padded"], cu_seqlens_padded.unsqueeze(0)
+            )
+            torch.testing.assert_close(
+                arguments["max_seqlen"], torch.tensor([4], dtype=torch.int32)
+            )
+        else:
+            assert not {"cu_seqlens", "cu_seqlens_padded", "max_seqlen"} & set(
+                arguments
+            )
+
+
 class TestMegatronForwardBackward:
     """Tests for megatron_forward_backward function."""
+
+    @patch("nemo_rl.models.megatron.train.get_forward_backward_func")
+    def test_mimo_uses_bridge_runtime_for_schedule(self, mock_get_fb):
+        from nemo_rl.models.megatron.train import (
+            megatron_mimo_forward_backward,
+            mimo_forward_with_post_processing_fn,
+        )
+
+        mock_fb_func = MagicMock(return_value=[{"lm loss": torch.ones(2)}])
+        mock_get_fb.return_value = mock_fb_func
+        model = MagicMock()
+        data_iterator = iter([])
+        runtime = SimpleNamespace(
+            multimodule_pg_collection=object(),
+            multimodule_communicator=object(),
+        )
+
+        result = megatron_mimo_forward_backward(
+            model=model,
+            data_iterator=data_iterator,
+            num_microbatches=4,
+            seq_length=128,
+            mbs=1,
+            mimo_runtime=runtime,
+        )
+
+        mock_get_fb.assert_called_once_with(
+            schedule_pg_collection=runtime.multimodule_pg_collection
+        )
+        mock_fb_func.assert_called_once_with(
+            forward_step_func=mimo_forward_with_post_processing_fn,
+            data_iterator=data_iterator,
+            model=[model],
+            num_microbatches=4,
+            seq_length=128,
+            micro_batch_size=1,
+            forward_only=False,
+            p2p_communicator=runtime.multimodule_communicator,
+            pg_collection=runtime.multimodule_pg_collection,
+        )
+        assert result == mock_fb_func.return_value
 
     @patch("nemo_rl.models.megatron.train.get_forward_backward_func")
     def test_megatron_forward_backward_calls_forward_backward_func(self, mock_get_fb):

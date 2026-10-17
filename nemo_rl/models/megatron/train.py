@@ -15,7 +15,17 @@
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from functools import partial
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import torch
 from megatron.core import tensor_parallel
@@ -53,6 +63,7 @@ from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.utils import _pack_input_ids
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
+from nemo_rl.data.multimodal_utils import MIMO_MEDIA_OUTPUT_COUNTS_KEY, PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
@@ -74,6 +85,9 @@ from nemo_rl.models.megatron.router_replay import (
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.utils.sequence_lengths import CpuIntTuple, to_cpu_int_tuple
 
+if TYPE_CHECKING:
+    from megatron.bridge.training.setup_megatron_mimo import MegatronMIMOSetupOutput
+
 # Union type for any post-processing function (defined after classes below)
 PostProcessingFunction = Union[
     "LossPostProcessor",
@@ -81,6 +95,8 @@ PostProcessingFunction = Union[
     "TeacherFullPayloadPostProcessor",
     "TopkLogitsPostProcessor",
 ]
+
+_MIMO_IGNORE_INDEX = -100
 
 
 def _prepare_padding_mask_for_model(
@@ -483,6 +499,284 @@ def forward_with_post_processing_fn(
         )
 
     return output_tensor, post_processing_fn_wrapped
+
+
+def _mimo_packing_kwargs(
+    packed_seq_params: Optional[PackedSeqParams],
+) -> dict[str, torch.Tensor]:
+    """Expose NeMo-RL's prepared THD boundaries as ``MimoModel`` arguments."""
+    if packed_seq_params is None:
+        return {}
+    cu_seqlens = packed_seq_params.cu_seqlens_q
+    # MimoModel takes [1, N + 1] boundaries and a tensor max_seqlen.
+    return {
+        "cu_seqlens": cu_seqlens.unsqueeze(0),
+        "cu_seqlens_padded": packed_seq_params.cu_seqlens_q_padded.unsqueeze(0),
+        "max_seqlen": torch.tensor(
+            [packed_seq_params.max_seqlen_q],
+            dtype=torch.int32,
+            device=cu_seqlens.device,
+        ),
+    }
+
+
+def _mimo_language_batch(
+    microbatch: ProcessedMicrobatch,
+    mimo_model: Any,
+) -> dict[str, Any]:
+    """Project one existing processed SFT microbatch into the language role."""
+    input_ids = microbatch.input_ids
+    data = microbatch.data_dict
+    token_mask = data["token_mask"]
+    sample_mask = data["sample_mask"]
+    if token_mask.shape != input_ids.shape or sample_mask.shape != (
+        input_ids.shape[0],
+    ):
+        raise ValueError("MIMO language masks do not match the processed input batch.")
+
+    labels = torch.full_like(input_ids, _MIMO_IGNORE_INDEX)
+    loss_mask = torch.zeros_like(token_mask, dtype=torch.float32)
+    if input_ids.shape[1] > 1:
+        labels[:, :-1] = input_ids[:, 1:]
+        loss_mask[:, :-1] = token_mask[:, 1:].to(torch.float32) * sample_mask.unsqueeze(
+            -1
+        )
+        for token_id in mimo_model.special_token_ids.values():
+            loss_mask[:, :-1].masked_fill_(input_ids[:, 1:] == token_id, 0)
+    labels[loss_mask == 0] = _MIMO_IGNORE_INDEX
+
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "loss_mask": loss_mask,
+        "position_ids": microbatch.position_ids,
+        "attention_mask": None,
+        "modality_inputs": {},
+        **_mimo_packing_kwargs(microbatch.packed_seq_params),
+    }
+
+
+def _mimo_encoder_names(mimo_model: Any) -> tuple[str, str]:
+    """Return Bridge's single modality and nested encoder names."""
+    if len(mimo_model.modality_submodules) != 1:
+        raise ValueError(
+            "The initial MIMO SFT v2 path requires exactly one modality component."
+        )
+    modality_name, modality = next(iter(mimo_model.modality_submodules.items()))
+    modality = unwrap_model(modality)
+    if len(modality.encoders) != 1:
+        raise ValueError(
+            "The initial MIMO SFT v2 path requires exactly one modality encoder."
+        )
+    return modality_name, next(iter(modality.encoders))
+
+
+def _mimo_encoder_batch(
+    microbatch: Optional[ProcessedMicrobatch],
+    mimo_model: Any,
+) -> dict[str, Any]:
+    """Project this encoder rank's media range of one pack.
+
+    Encoder ranks pass no ``input_ids``: when encoder DP > language DP, the
+    pack's image placeholders also cover media of other encoder ranks.
+    """
+    if microbatch is None:
+        return {
+            "input_ids": None,
+            "modality_inputs": {},
+        }
+
+    data = microbatch.data_dict
+    multimodal = data.get_multimodal_dict(
+        as_tensors=True,
+        device=microbatch.input_ids.device,
+    )
+    if any(key in multimodal for key in ("sound_clips", "sound_length")):
+        raise ValueError("The initial MIMO SFT v2 path does not support audio.")
+    pixels = multimodal.get("pixel_values")
+    if pixels is None:
+        return {"input_ids": None, "modality_inputs": {}}
+
+    image_sizes = multimodal.get("imgs_sizes")
+    if image_sizes is None:
+        raise ValueError("MIMO visual packs require imgs_sizes.")
+
+    if pixels.ndim == 2:
+        pixels = pixels.unsqueeze(0)
+    if pixels.ndim != 3 or pixels.shape[0] != 1:
+        raise ValueError(
+            "MIMO vision requires NeMo-RL's existing patchify media mode to produce "
+            f"[1, patches, features], got {tuple(pixels.shape)}."
+        )
+    image_sizes = image_sizes.to(dtype=torch.int32)
+    modality_name, encoder_name = _mimo_encoder_names(mimo_model)
+    modality = unwrap_model(mimo_model.modality_submodules[modality_name])
+    encoder = modality.encoders[encoder_name]
+    if encoder_name != "pixtral":
+        raise NotImplementedError(
+            "The MIMO SFT image adapter currently supports Pixtral."
+        )
+    patch_dim = int(encoder.patch_dim)
+    patch_lengths = torch.prod(image_sizes // patch_dim, dim=1, dtype=torch.int32)
+    boundaries = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.int32, device=image_sizes.device),
+            torch.cumsum(patch_lengths, dim=0, dtype=torch.int32),
+        )
+    )
+    if int(boundaries[-1].item()) != pixels.shape[1]:
+        raise ValueError(
+            "MIMO vision patchified pixels disagree with imgs_sizes: "
+            f"pixels={pixels.shape[1]}, described={int(boundaries[-1].item())}."
+        )
+    boundaries = boundaries.to(device=pixels.device)
+    payload = {
+        "x": pixels,
+        "imgs_sizes": image_sizes,
+        "packed_seq_params": PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=boundaries,
+            cu_seqlens_kv=boundaries.clone(),
+            max_seqlen_q=int(patch_lengths.max().item()),
+            max_seqlen_kv=int(patch_lengths.max().item()),
+        ),
+    }
+    # The Nemotron4 task encoder also emits frames per occurrence and output rows
+    # per image or tubelet; the MIMO vision encoder accepts both. The counts stay
+    # on the host.
+    num_frames = multimodal.get("num_frames")
+    if num_frames is not None:
+        payload["num_frames"] = num_frames.to(dtype=torch.int32).reshape(-1)
+    counts = data.get(MIMO_MEDIA_OUTPUT_COUNTS_KEY)
+    expected_output_counts = (
+        counts.as_tensor() if isinstance(counts, PackedTensor) else None
+    )
+    if expected_output_counts is not None:
+        payload["expected_output_counts"] = expected_output_counts.to(
+            dtype=torch.int32
+        ).reshape(-1)
+    return {
+        "input_ids": None,
+        "modality_inputs": {modality_name: {encoder_name: payload}},
+    }
+
+
+def _mimo_encoder_media_split_active(mimo_model: Any) -> bool:
+    """Return whether the loader splits media (encoder DP > language DP)."""
+    grids = mimo_model.mimo_config.module_to_grid_map
+
+    def dp(grid: Any) -> int:
+        return grid.shape[grid.dim_names.index("dp")]
+
+    language_dp = dp(grids["language"])
+    return any(
+        dp(grid) > language_dp for name, grid in grids.items() if name != "language"
+    )
+
+
+def _check_mimo_encoder_rows(
+    output: Any,
+    microbatch: Optional[ProcessedMicrobatch],
+    *,
+    require_counts: bool,
+) -> None:
+    """Require this encoder rank's output rows to equal its media output counts.
+
+    Core checks only the lane's total rows against the image tokens. A rank that
+    produced the right total with wrong rows per image would place embeddings at
+    wrong token positions. The counts are host metadata and the rows are a
+    shape, so this check needs no device sync. Only the Nemotron4 task encoder
+    emits counts; ``require_counts`` makes them mandatory when the loader splits
+    media over the encoder ranks.
+    """
+    if microbatch is None:
+        return
+    counts = microbatch.data_dict.get(MIMO_MEDIA_OUTPUT_COUNTS_KEY)
+    if not isinstance(counts, PackedTensor):
+        pixels = microbatch.data_dict.get("pixel_values")
+        if (
+            require_counts
+            and isinstance(pixels, PackedTensor)
+            and any(tensor is not None for tensor in pixels.tensors)
+        ):
+            raise RuntimeError(
+                "This encoder rank's batch has pixels but no MIMO media output "
+                "counts, so its encoder rows cannot be checked."
+            )
+        return
+    count_tensor = counts.as_tensor()
+    if count_tensor is not None and count_tensor.device.type != "cpu":
+        raise RuntimeError("MIMO media output counts must stay on the host.")
+    expected = 0 if count_tensor is None else int(count_tensor.sum())
+    outputs = output.values() if isinstance(output, dict) else [output]
+    rows = sum(tensor.shape[0] for tensor in outputs if tensor is not None)
+    if rows != expected:
+        raise RuntimeError(
+            f"The encoder produced {rows} media embedding rows, but this rank's "
+            f"media range expects {expected} (its media output counts)."
+        )
+
+
+def mimo_forward_with_post_processing_fn(
+    data_iterator: Iterator[Optional[ProcessedMicrobatch]],
+    model: Any,
+) -> tuple[Any, Callable]:
+    """Run one role-local NeMo-RL microbatch through ``MimoModel``."""
+    # Keep Bridge's experimental MIMO utilities out of ordinary Megatron imports.
+    from megatron.bridge.training.megatron_mimo_parallel_utils import (
+        unwrap_megatron_mimo_model,
+    )
+    from megatron.bridge.training.megatron_mimo_step import loss_func
+
+    microbatch = next(data_iterator)
+    mimo_model = unwrap_megatron_mimo_model(model)
+    if mimo_model.role.has_language_module:
+        if microbatch is None:
+            raise RuntimeError("Every language rank requires its role batch.")
+        batch = _mimo_language_batch(microbatch, mimo_model)
+    else:
+        batch = _mimo_encoder_batch(microbatch, mimo_model)
+
+    output = model(**batch)
+    if isinstance(output, tuple):
+        output_tensor, loss_mask = output
+    else:
+        output_tensor = output
+        loss_mask = batch.get("loss_mask")
+    if not mimo_model.role.has_language_module:
+        _check_mimo_encoder_rows(
+            output_tensor,
+            microbatch,
+            require_counts=_mimo_encoder_media_split_active(mimo_model),
+        )
+
+    return output_tensor, partial(loss_func, loss_mask)
+
+
+def megatron_mimo_forward_backward(
+    *,
+    model: Any,
+    data_iterator: Iterator[Optional[ProcessedMicrobatch]],
+    num_microbatches: int,
+    seq_length: int,
+    mbs: int,
+    mimo_runtime: "MegatronMIMOSetupOutput",
+) -> Any:
+    """Invoke Megatron-LM's selected multi-module forward/backward schedule."""
+    forward_backward_func = get_forward_backward_func(
+        schedule_pg_collection=mimo_runtime.multimodule_pg_collection
+    )
+    return forward_backward_func(
+        forward_step_func=mimo_forward_with_post_processing_fn,
+        data_iterator=data_iterator,
+        model=[model],
+        num_microbatches=num_microbatches,
+        seq_length=seq_length,
+        micro_batch_size=mbs,
+        forward_only=False,
+        p2p_communicator=mimo_runtime.multimodule_communicator,
+        pg_collection=mimo_runtime.multimodule_pg_collection,
+    )
 
 
 def megatron_forward_backward(

@@ -76,37 +76,34 @@ def broadcast_obj_from_pp_rank(obj: Any) -> Any:
     return obj_list[0]
 
 
-def broadcast_loss_metrics_from_last_stage(loss_metrics: Optional[list] = None) -> list:
+def broadcast_loss_metrics_from_last_stage(
+    loss_metrics: Any = None,
+    *,
+    pp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> Any:
     """Broadcast loss metrics from the last pipeline stage to all stages.
 
-    This utility handles the common pattern where loss computation happens on the last
-    pipeline stage and needs to be broadcast to all other stages.
-
     Args:
-        loss_metrics: List of loss metrics if on last stage, None otherwise
+        loss_metrics: Metrics on the last stage; ignored on other stages.
+        pp_group: Explicit pipeline group, such as MIMO's language PP group.
+            If omitted, use Megatron's global pipeline group and last rank.
 
     Returns:
-        List of loss metrics on all ranks
+        The last pipeline stage's metrics on every rank in the group.
     """
-    pp_group = get_pipeline_model_parallel_group()
-    last_rank = get_pipeline_model_parallel_last_rank()
-
-    if is_pipeline_last_stage(ignore_virtual=True):
-        metrics_to_broadcast = [loss_metrics]
-        torch.distributed.broadcast_object_list(
-            metrics_to_broadcast,
-            src=last_rank,
-            group=pp_group,
-        )
-        return loss_metrics
+    if pp_group is None:
+        pp_group = get_pipeline_model_parallel_group()
+        last_rank = get_pipeline_model_parallel_last_rank()
     else:
-        metrics_to_broadcast = [None]
-        torch.distributed.broadcast_object_list(
-            metrics_to_broadcast,
-            src=last_rank,
-            group=pp_group,
-        )
-        return metrics_to_broadcast[0]
+        last_rank = torch.distributed.get_process_group_ranks(pp_group)[-1]
+
+    metrics_to_broadcast = [loss_metrics]
+    torch.distributed.broadcast_object_list(
+        metrics_to_broadcast,
+        src=last_rank,
+        group=pp_group,
+    )
+    return metrics_to_broadcast[0]
 
 
 def broadcast_tensors_from_last_stage(
