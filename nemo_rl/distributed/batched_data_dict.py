@@ -32,6 +32,7 @@ import torch
 from typing_extensions import Self
 
 from nemo_rl.data.multimodal_utils import (
+    MIMO_MEDIA_OUTPUT_COUNTS_KEY,
     MULTIMODAL_CONTENT_TYPES,
     PACKED_MULTIMODAL_FIELDS,
     PER_TOKEN_MULTIMODAL_FIELDS,
@@ -188,7 +189,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
         result: dict[str, Any] = {}
         for k, v in self.data.items():
-            if k in ("cu_seqlens", "cu_seqlens_padded"):
+            if k in ("cu_seqlens", "cu_seqlens_padded") or (
+                as_tensors and k == MIMO_MEDIA_OUTPUT_COUNTS_KEY
+            ):
                 continue
             if isinstance(v, PackedTensor):
                 # In-memory PackedTensor (or a per-token field a caller
@@ -197,7 +200,14 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 if pixel_dtype is not None and k in self._PIXEL_DTYPE_CAST_KEYS:
                     v = v.to_dtype(pixel_dtype)
                 preprocess_mode = pixel_preprocess_mode if k == "pixel_values" else None
-                result[k] = v.as_tensor(device, preprocess_mode) if as_tensors else v
+                result[k] = (
+                    v.as_tensor(
+                        device="cpu" if k == "imgs_sizes" else device,
+                        mode=preprocess_mode,
+                    )
+                    if as_tensors
+                    else v
+                )
             elif k in PER_TOKEN_MULTIMODAL_FIELDS:
                 # Plain per-token tensor: emit as-is.
                 result[k] = v
@@ -1126,6 +1136,10 @@ class BatchedDataDict(UserDict, Generic[DictT]):
     def to(self, device: str | torch.device) -> Self:
         """Move tensors in batched dict to device."""
         for k, v in self.data.items():
+            # ViT reads image geometry on the host; keep it off CUDA. MIMO media
+            # output counts are host metadata for shape checks only.
+            if k in ("imgs_sizes", MIMO_MEDIA_OUTPUT_COUNTS_KEY):
+                continue
             if torch.is_tensor(v):
                 self.data[k] = v.to(device)
             elif isinstance(v, PackedTensor):

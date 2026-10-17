@@ -15,6 +15,7 @@
 """Lightweight value types shared by the SFTv2 driver and policy workers."""
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 
@@ -32,6 +33,9 @@ class StepEnvelope:
     load_seconds: float
     valid_tokens: int
     load_phase_seconds: dict[str, float] = field(default_factory=dict)
+    mimo_role: Literal["language", "encoder"] | None = None
+    # Additional deliveries may use another data plane, with their own metadata.
+    role_metas: dict[str, KVBatchMeta] = field(default_factory=dict)
 
 
 __all__ = ["StepEnvelope"]

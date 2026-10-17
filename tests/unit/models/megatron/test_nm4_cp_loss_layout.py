@@ -60,7 +60,7 @@ def _check_layout_loss(
     }
     cfg = yaml.safe_load(
         Path(
-            "examples/configs/sft_v2_tests/nm4_generalist_16n_mxfp8_cp64ep64_gbs1.yaml"
+            "examples/configs/sft_v2_tests/nm4_generalist_16n_mxfp8_cp64ep64_gbs4.yaml"
         ).read_text()
     )
     overrides = cfg["policy"]["megatron_cfg"]["model_overrides"]

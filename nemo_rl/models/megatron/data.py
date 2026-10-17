@@ -570,6 +570,15 @@ def process_microbatch(
         )
     ctx = straggler_timer(bdata=True) if straggler_timer is not None else nullcontext()
     with ctx:
+        if "cu_seqlens_padded" in data_dict and model_slices_context_parallel_inputs:
+            # Batched transport pads rows to a shared width. MIMO's variable-length
+            # schedule consumes only this pack, retaining its per-source alignment.
+            physical_length = int(
+                _prepacked_boundary(
+                    data_dict, "cu_seqlens_padded", data_dict["input_ids"].device
+                )[-1]
+            )
+            data_dict.truncate_tensors(dim=1, truncated_len=physical_length)
         input_ids = data_dict["input_ids"]
         original_seq_length = input_ids.shape[1]
         if not pack_sequences:

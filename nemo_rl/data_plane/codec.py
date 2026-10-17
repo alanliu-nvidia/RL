@@ -260,6 +260,34 @@ def pack_jagged_fields(
         return out
 
 
+def packed_batch_to_wire(
+    batch: dict[str, Any], *, batch_size: int
+) -> tuple[TensorDict, list[dict[str, Any]] | None]:
+    """Encode a prepared batch, including non-media PackedTensor columns.
+
+    SFT packing boundaries use the same PackedTensor representation as media.
+    Reuse its wire payload and row-geometry tags without registering boundaries
+    as model media inputs. The returned tags must travel with the batch metadata.
+    """
+    # Avoid importing the processor stack until a producer needs this codec.
+    from nemo_rl.data.multimodal_utils import PackedTensor, multimodal_row_tags
+
+    packed_fields = frozenset(
+        key for key, value in batch.items() if isinstance(value, PackedTensor)
+    )
+    tags = multimodal_row_tags(batch, batch_size, packed_fields=packed_fields)
+    fields = {}
+    for key, value in batch.items():
+        if key in packed_fields:
+            value, _ = value.to_wire()
+            if value is None:
+                continue
+        fields[key] = value
+    # The producer already prepared rectangular token fields. Only packed
+    # columns need a layout change here; retain the existing token padding.
+    return TensorDict(fields, batch_size=[batch_size]), tags
+
+
 def pack_per_token_field(val: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
     """Force-jaggedize a known per-token field, tolerating SP padding.
 
@@ -367,11 +395,20 @@ def materialize(
 
     from nemo_rl.data.multimodal_utils import (
         PACKED_MULTIMODAL_FIELDS,
+        ROW_SHAPES_SUFFIX,
         reassemble_packed_multimodal,
     )
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
     pads = pad_value_dict or {}
+    # Row geometry is the existing wire contract for PackedTensor. SFT also
+    # uses it for packing boundaries and counts, not just model media inputs.
+    packed_fields = PACKED_MULTIMODAL_FIELDS | frozenset(
+        key.removesuffix(ROW_SHAPES_SUFFIX)
+        for tag in tags or ()
+        for key in tag
+        if key.endswith(ROW_SHAPES_SUFFIX)
+    )
     out: dict[str, Any] = {}
     # pyrefly: inference cycle on tensordict.items() loop var.
     for key, val in td.items(include_nested=False):  # type: ignore[bad-assignment]
@@ -407,7 +444,7 @@ def materialize(
         # ``per_sample_shapes`` records flat lengths and the true shapes ride
         # ``KVBatchMeta.tags`` (see ``multimodal_row_tags``). Hence the ``tags``
         # argument to ``reassemble_packed_multimodal`` below.
-        if val.is_nested and layout == "padded" and key not in PACKED_MULTIMODAL_FIELDS:
+        if val.is_nested and layout == "padded" and key not in packed_fields:
             pad = pads.get(key, 0)
             padded = torch.nested.to_padded_tensor(val, padding=pad)
         else:
@@ -445,7 +482,7 @@ def materialize(
             and not padded.is_nested
             and padded.dim() >= 2
             and padded.shape[1] < pad_to_seqlen
-            and key not in PACKED_MULTIMODAL_FIELDS
+            and key not in packed_fields
             and key not in OPD_FULL_FIELDS
         ):
             pad_spec = [0, 0] * (padded.dim() - 2) + [
@@ -458,5 +495,5 @@ def materialize(
     # per-sample ``tags`` rows. The multimodal layer owns that encoding; the
     # codec only asks it to fix up its own fields so no raw nested value
     # reaches a BatchedDataDict consumer.
-    reassemble_packed_multimodal(out, tags)
+    reassemble_packed_multimodal(out, tags, packed_fields=packed_fields)
     return BatchedDataDict(out)

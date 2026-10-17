@@ -46,6 +46,7 @@ AUDIO_CONTENT_TYPES = frozenset({"input_audio", "audio", "audio_url"})
 MULTIMODAL_CONTENT_TYPES = frozenset(
     {*IMAGE_CONTENT_TYPES, *VIDEO_CONTENT_TYPES, *AUDIO_CONTENT_TYPES}
 )
+MIMO_MEDIA_OUTPUT_COUNTS_KEY = "mimo_media_output_counts"
 
 # List of allowed placeholder strings for different media types in the dataset string
 # e.g. "This is an example of <image>"
@@ -220,7 +221,10 @@ def present_multimodal_fields(meta: "KVBatchMeta") -> list[str]:
 
 
 def multimodal_row_tags(
-    multimodal: dict, sample_count: int
+    multimodal: dict,
+    sample_count: int,
+    *,
+    packed_fields: frozenset[str] = PACKED_MULTIMODAL_FIELDS,
 ) -> "Optional[list[dict[str, Any]]]":
     """Per-sample tag rows carrying what ``to_wire``'s flattening removes.
 
@@ -235,10 +239,13 @@ def multimodal_row_tags(
     width padding lands at is scratch that the model discards. Mcore consumes
     pre-patchified pixels without spatial dimensions, while AutoModel pads at
     materialization, so nothing batch-wide has to be agreed across shards.
+
+    ``packed_fields`` lets other PackedTensor producers (such as SFT packing
+    boundaries) reuse this geometry contract without becoming media inputs.
     """
     tags: list[dict[str, Any]] = [{} for _ in range(sample_count)]
     for key, value in multimodal.items():
-        if key not in PACKED_MULTIMODAL_FIELDS or not isinstance(value, PackedTensor):
+        if key not in packed_fields or not isinstance(value, PackedTensor):
             continue
         # ``row_shapes()`` rather than ``to_wire()``: the payload is encoded
         # separately by ``encode_multimodal_for_wire``, and ``to_wire``'s
@@ -267,13 +274,19 @@ def multimodal_row_tags(
 
 
 def reassemble_packed_multimodal(
-    fields: dict, tags: "Optional[list[dict[str, Any]]]" = None
+    fields: dict,
+    tags: "Optional[list[dict[str, Any]]]" = None,
+    *,
+    packed_fields: frozenset[str] = PACKED_MULTIMODAL_FIELDS,
 ) -> None:
     """In place: rebuild ``PackedTensor`` for packed fields, consuming companions.
 
     Called by the read path once its columns are materialized. Leaves anything
     that is not a wire-form packed field untouched, so it is safe to call on any
     column dict.
+
+    ``packed_fields`` may include non-media PackedTensor columns whose geometry
+    was encoded with :func:`multimodal_row_tags`.
 
     Raises:
         ValueError: A packed field arrived without its shapes companion. Every
@@ -284,13 +297,15 @@ def reassemble_packed_multimodal(
             the model 1-D pixels and train image-blind without an error.
     """
     for key in list(fields):
-        if key not in PACKED_MULTIMODAL_FIELDS:
+        if key not in packed_fields:
             continue
         value = fields[key]
-        if not (isinstance(value, torch.Tensor) and value.is_nested):
+        if not isinstance(value, torch.Tensor):
             continue
         rows = [t.get(row_shapes_key(key)) for t in tags] if tags is not None else None
         present = [r for r in rows if r] if rows else []
+        if not value.is_nested and not present:
+            continue
         if not present:
             raise ValueError(
                 f"{key!r} arrived as a nested wire value but no sample carries a "
@@ -306,6 +321,13 @@ def reassemble_packed_multimodal(
         # Indexed, not ``.get``-with-default: a producer-side rename of any key
         # must fail here rather than silently change what ``as_tensor`` hands
         # the vision encoder.
+        # TQ may stack equal-sized wire rows into a dense tensor. The shape
+        # tags still identify these as packed rows (e.g. one cu_seqlens row
+        # fetched for a microbatch), so restore the wire container first.
+        if not value.is_nested:
+            value = torch.nested.as_nested_tensor(
+                list(value.unbind()), layout=torch.jagged
+            )
         fields[key] = PackedTensor.from_wire(
             value,
             [[] if r is None else r[ROW_GEOMETRY_SHAPES] for r in rows],  # type: ignore[union-attr]
@@ -1390,11 +1412,24 @@ def get_preprocess(processor: Any, key: str) -> dict[str, Any]:
     return {"preprocess_mode": None, "preprocess_kwargs": {}}
 
 
+def _normalize_processor_image_sizes(processed: dict[str, Any], processor: Any) -> None:
+    """Normalize placeholder processors' image-size alias before patchification."""
+    if not uses_image_placeholder(processor) or "image_sizes" not in processed:
+        return
+    sizes = torch.as_tensor(processed.pop("image_sizes"))
+    if "imgs_sizes" in processed and not torch.equal(
+        torch.as_tensor(processed["imgs_sizes"]), sizes
+    ):
+        raise ValueError("Processor image_sizes and imgs_sizes disagree.")
+    processed["imgs_sizes"] = sizes
+
+
 def extract_multimodal_model_inputs(
     processor: Any, processed: dict[str, Any]
 ) -> dict[str, PackedTensor | torch.Tensor]:
     """Extract packed media inputs and sequence-aligned auxiliary tensors."""
     processed = dict(processed)
+    _normalize_processor_image_sizes(processed, processor)
     if (
         uses_image_placeholder(processor)
         and "pixel_values" in processed
@@ -1412,24 +1447,11 @@ def extract_multimodal_model_inputs(
         processed["num_frames"] = torch.ones(
             len(processed["imgs_sizes"]),
             dtype=torch.long,
-def _normalize_processor_image_sizes(processed: dict[str, Any], processor: Any) -> None:
-    """Normalize placeholder processors' image-size alias before patchification."""
-    if not uses_image_placeholder(processor) or "image_sizes" not in processed:
-        return
-    sizes = torch.as_tensor(processed.pop("image_sizes"))
-    if "imgs_sizes" in processed and not torch.equal(
-        torch.as_tensor(processed["imgs_sizes"]), sizes
-    ):
-        raise ValueError("Processor image_sizes and imgs_sizes disagree.")
-    processed["imgs_sizes"] = sizes
-
-
         )
     sizes = processed.get("imgs_sizes")
     if uses_image_placeholder(processor) and isinstance(sizes, torch.Tensor):
         pixels = processed["pixel_values"]
         segments = pixels if isinstance(pixels, list) else [pixels]
-    _normalize_processor_image_sizes(processed, processor)
         preprocess = get_preprocess(processor, "pixel_values")
         patch_dim = preprocess["preprocess_kwargs"]["patch_dim"]
         pixel_count = sum(
@@ -1623,6 +1645,7 @@ def _materialize_ragged_pixel_values(
     Tiles remain separate until ``PackedTensor.as_tensor`` materializes them.
     """
     processed = dict(processed)
+    _normalize_processor_image_sizes(processed, processor)
     pixel_values = processed.get("pixel_values")
 
     # pixel_values is only ragged when the images genuinely differ in size; two
@@ -1645,7 +1668,6 @@ def _materialize_ragged_pixel_values(
 
 def _stack_ragged_pixel_values(
     processed: dict[str, Any], tiles: list[torch.Tensor], processor: Any
-    _normalize_processor_image_sizes(processed, processor)
 ) -> None:
     """Derive image sizes and preserve native-shape tiles for patchification."""
     if uses_image_placeholder(processor) and "imgs_sizes" not in processed:
