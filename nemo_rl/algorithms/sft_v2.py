@@ -20,6 +20,7 @@ import os
 import statistics
 import time
 import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Optional, cast
@@ -38,20 +39,25 @@ from nemo_rl.data.energon.config import EnergonSourceConfig
 from nemo_rl.data.energon.sft_types import StepEnvelope
 from nemo_rl.data.energon.topology import (
     DataLoaderPlacementPlan,
+    LoaderCopy,
+    build_mimo_data_loader_placement,
     resolve_topology_mapper,
 )
 from nemo_rl.data.packing import PackingAlgorithm
-from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig
+from nemo_rl.data_plane.interfaces import DataPlaneRuntimeConfig, LocalDataPlaneConfig
 from nemo_rl.distributed.named_sharding import REPLICATED_AXES
 from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
     RayVirtualCluster,
+    get_node_block_counts,
+    node_block_constraints,
     prepare_segment_topology,
 )
 from nemo_rl.models.megatron.alignment import (
     get_fp8_token_alignment,
     get_parallel_token_alignment,
 )
+from nemo_rl.models.megatron.mimo import resolve_mimo_sft_config
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.telemetry.config import TelemetryConfig
@@ -109,7 +115,7 @@ class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     data: DataConfig
     sft: SFTConfig
-    data_plane: LocalDataPlaneConfig
+    data_plane: DataPlaneRuntimeConfig
     logger: LoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
@@ -179,6 +185,57 @@ def _max_train_steps(master_config: MasterConfig) -> int:
         master_config.sft.max_num_steps,
         master_config.sft.max_num_epochs * source.virtual_epoch_length,
     )
+
+
+def _validate_mimo_topology_mapper(mapper_name: str) -> None:
+    """Reject mapper selectors that the fixed initial MIMO placement cannot honor."""
+    if mapper_name != "default":
+        raise ValueError(
+            "MIMO SFT v2 currently requires "
+            "data.energon.topology_mapper='default'; "
+            f"got {mapper_name!r}."
+        )
+
+
+def check_mimo_lanes_agree(
+    copies: Sequence[LoaderCopy], envelopes: Sequence[StepEnvelope]
+) -> None:
+    """Require all loaders of a lane (encoder shards, language) to make one batch."""
+    first_by_lane: dict[int, StepEnvelope] = {}
+    for copy, envelope in zip(copies, envelopes, strict=True):
+        if envelope.logical_rank != copy.logical_rank:
+            raise RuntimeError(
+                f"A MiMo loader of lane {copy.logical_rank} returned lane "
+                f"{envelope.logical_rank}."
+            )
+        first = first_by_lane.setdefault(copy.logical_rank, envelope)
+        if (
+            envelope.source_ids != first.source_ids
+            or envelope.meta.tags != first.meta.tags
+            or envelope.sequence_lengths != first.sequence_lengths
+            or envelope.valid_tokens != first.valid_tokens
+        ):
+            raise RuntimeError(
+                "Independent MiMo loaders diverged on logical lane "
+                f"{copy.logical_rank}: sources, packs, or token counts differ."
+            )
+
+
+def mimo_accounting_envelopes(
+    copies: Sequence[LoaderCopy],
+    envelopes: Sequence[StepEnvelope],
+    *,
+    single_owner: bool,
+) -> list[StepEnvelope]:
+    """Return one envelope per logical lane for sample and token counts."""
+    if not single_owner:
+        return [envelope for envelope in envelopes if envelope.mimo_role == "language"]
+    # Encoder shards of a lane load the same batch; shard 0 counts for the lane.
+    return [
+        envelope
+        for copy, envelope in zip(copies, envelopes, strict=True)
+        if copy.encoder_shard in (None, 0)
+    ]
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -263,26 +320,47 @@ class SFTSingleControllerActor:
             "max_sequence_length": config.data["max_input_seq_length"],
             "placement_fingerprint": self._placement_plan.placement_hash,
             "only_unmask_final": config.sft.only_unmask_final,
+            "single_owner": bool(
+                self._trainer.mimo_config is not None
+                and self._trainer.mimo_config.single_owner_loader
+            ),
         }
         if self._loader_states is None:
             futures = self._trainer.worker_group.run_all_workers_single_data(
                 "setup_sft_dataloader",
-                run_rank_0_only_axes=list(REPLICATED_AXES),
+                run_rank_0_only_axes=(
+                    list(REPLICATED_AXES) if self._trainer.mimo_config is None else None
+                ),
                 **common_kwargs,
             )
         else:
-            if len(self._loader_states) != self._placement_plan.logical_world_size:
+            if len(self._loader_states) != len(self._placement_plan.copies):
                 raise ValueError(
-                    "The checkpoint must contain one loader state per logical DP shard."
+                    "The checkpoint must contain one state per loader owner."
                 )
+            restored_by_rank: list[dict[str, Any] | None] = [None] * (
+                self._train_cluster.world_size()
+            )
+            for copy, state in zip(
+                self._placement_plan.copies, self._loader_states, strict=True
+            ):
+                restored_by_rank[copy.owner_rank] = state
             futures = self._trainer.worker_group.run_all_workers_multiple_data(
                 "setup_sft_dataloader",
-                restored_state=self._loader_states,
-                run_rank_0_only_axes=list(REPLICATED_AXES),
+                run_rank_0_only_axes=(
+                    list(REPLICATED_AXES) if self._trainer.mimo_config is None else None
+                ),
+                restored_state=(
+                    self._loader_states
+                    if self._trainer.mimo_config is None
+                    else restored_by_rank
+                ),
                 common_kwargs=common_kwargs,
             )
-        results = ray.get(futures)
-        if results != [True] * self._placement_plan.logical_world_size:
+        results = self._ordered_owner_results(
+            ray.get(futures), operation="loader setup"
+        )
+        if results != [True] * len(self._placement_plan.copies):
             raise RuntimeError(f"Unexpected SFT loader setup results: {results!r}.")
         if config.data.get("validation") is not None:
             val_global_batch_size = config.sft.val_global_batch_size
@@ -312,20 +390,21 @@ class SFTSingleControllerActor:
     def _load_envelopes(self) -> list[StepEnvelope]:
         futures = self._trainer.worker_group.run_all_workers_single_data(
             "load_next_sft_batch",
-            run_rank_0_only_axes=list(REPLICATED_AXES),
+            run_rank_0_only_axes=(
+                list(REPLICATED_AXES) if self._trainer.mimo_config is None else None
+            ),
             only_unmask_final=self._master_config.sft.only_unmask_final,
             make_sequence_length_divisible_by=self._master_config.policy[
                 "make_sequence_length_divisible_by"
             ],
             **trace_context_kwargs(),
         )
-        envelopes = ray.get(futures)
-        logical_ranks = [envelope.logical_rank for envelope in envelopes]
-        expected = list(range(self._placement_plan.logical_world_size))
-        if logical_ranks != expected:
-            raise RuntimeError(
-                f"SFT loader envelopes arrived for ranks {logical_ranks}; expected {expected}."
-            )
+        envelopes = cast(
+            list[StepEnvelope],
+            self._ordered_owner_results(ray.get(futures), operation="batch loading"),
+        )
+        if self._trainer.mimo_config is not None:
+            check_mimo_lanes_agree(self._placement_plan.copies, envelopes)
         return envelopes
 
     @umbrella_trace_fn(RLSpanGroup.U_STEP, "rl.sft_v2.step")
@@ -334,8 +413,29 @@ class SFTSingleControllerActor:
         envelopes = self._load_envelopes()
         loader_wait = time.monotonic() - started
         train_started = time.monotonic()
+        accounting_envelopes = (
+            envelopes
+            if self._trainer.mimo_config is None
+            else mimo_accounting_envelopes(
+                self._placement_plan.copies,
+                envelopes,
+                single_owner=self._trainer.mimo_config.single_owner_loader,
+            )
+        )
         step_open = False
         try:
+            train_metas = [envelope.meta for envelope in envelopes]
+            delivery_ranks = None
+            if self._trainer.mimo_config is not None:
+                delivery_ranks = [
+                    copy.delivery_ranks for copy in self._placement_plan.copies
+                ]
+                for copy, envelope in zip(
+                    self._placement_plan.copies, envelopes, strict=True
+                ):
+                    for role, ranks in copy.role_delivery_ranks.items():
+                        train_metas.append(envelope.role_metas[role])
+                        delivery_ranks.append(ranks)
             with managed_span(
                 RLSpanGroup.POLICY_UPDATE,
                 "rl.sft_v2.policy_training",
@@ -347,7 +447,8 @@ class SFTSingleControllerActor:
                 step_open = True
                 phase_started = time.monotonic()
                 placed_phases = self._trainer.train_placed_microbatches(
-                    [envelope.meta for envelope in envelopes]
+                    train_metas,
+                    delivery_ranks=delivery_ranks,
                 )
                 train_placed_microbatches = time.monotonic() - phase_started
                 phase_started = time.monotonic()
@@ -356,7 +457,7 @@ class SFTSingleControllerActor:
                 step_open = False
                 phase_started = time.monotonic()
             policy_seconds = time.monotonic() - train_started
-            self._owner_call("commit_sft_batch")
+            self._loader_call("commit_sft_batch")
             commit_sft_batch = time.monotonic() - phase_started
         except Exception:
             if step_open:
@@ -365,15 +466,15 @@ class SFTSingleControllerActor:
                 except Exception as error:  # preserve the policy-step failure
                     warnings.warn(f"SFTv2 policy abort failed: {error}", stacklevel=2)
             try:
-                self._owner_call("abort_sft_batch")
+                self._loader_call("abort_sft_batch")
             except Exception as error:  # preserve the policy-step failure
                 warnings.warn(f"SFTv2 loader abort failed: {error}", stacklevel=2)
             raise
 
-        valid_tokens = sum(envelope.valid_tokens for envelope in envelopes)
+        valid_tokens = sum(envelope.valid_tokens for envelope in accounting_envelopes)
         self._save_state.total_steps += 1
         self._save_state.consumed_samples += sum(
-            len(envelope.source_ids) for envelope in envelopes
+            len(envelope.source_ids) for envelope in accounting_envelopes
         )
         self._save_state.total_valid_tokens += valid_tokens
         loader_seconds = [envelope.load_seconds for envelope in envelopes]
@@ -391,9 +492,11 @@ class SFTSingleControllerActor:
             "queue_depth": 1,
             TOTAL_STEP_TIME_KEY: time.monotonic() - started,
             "valid_tokens": valid_tokens,
-            "source_samples": sum(len(envelope.source_ids) for envelope in envelopes),
+            "source_samples": sum(
+                len(envelope.source_ids) for envelope in accounting_envelopes
+            ),
             "physical_packs": sum(
-                len(envelope.meta.sample_ids) for envelope in envelopes
+                len(envelope.meta.sample_ids) for envelope in accounting_envelopes
             ),
             VALID_TOKENS_PER_SECOND_KEY: valid_tokens
             / max(time.monotonic() - started, 1e-12),
@@ -569,15 +672,58 @@ class SFTSingleControllerActor:
             metrics[f"worker_{key}"] = float(value)
         return metrics
 
-    def _owner_call(self, method_name: str) -> list[Any]:
+    def _loader_call(self, method_name: str) -> list[Any]:
+        """Invoke a loader lifecycle method; non-owner workers return ``None``."""
         futures = self._trainer.worker_group.run_all_workers_single_data(
             method_name,
-            run_rank_0_only_axes=list(REPLICATED_AXES),
+            run_rank_0_only_axes=(
+                list(REPLICATED_AXES) if self._trainer.mimo_config is None else None
+            ),
         )
         return ray.get(futures)
 
+    def _owner_call(self, method_name: str) -> list[Any]:
+        """Call ordinary-SFT validation owners using the base's replica layout."""
+        futures = self._trainer.worker_group.run_all_workers_single_data(
+            method_name, run_rank_0_only_axes=list(REPLICATED_AXES)
+        )
+        return ray.get(futures)
+
+    def _ordered_owner_results(
+        self, results: list[Any], *, operation: str
+    ) -> list[Any]:
+        """Validate owner ranks and return their results in placement-copy order."""
+        if self._trainer.mimo_config is None:
+            if len(results) != len(self._placement_plan.copies):
+                raise RuntimeError(
+                    f"Unexpected {operation} result count: {len(results)}."
+                )
+            return results
+        world_size = self._train_cluster.world_size()
+        if len(results) != world_size:
+            raise RuntimeError(
+                f"{operation} returned {len(results)} worker results; "
+                f"expected {world_size}."
+            )
+        by_rank = {
+            rank: result for rank, result in enumerate(results) if result is not None
+        }
+        expected_ranks = {copy.owner_rank for copy in self._placement_plan.copies}
+        if set(by_rank) != expected_ranks:
+            raise RuntimeError(
+                f"Unexpected {operation} owners: actual={sorted(by_rank)}, "
+                f"expected={sorted(expected_ranks)}."
+            )
+        return [by_rank[copy.owner_rank] for copy in self._placement_plan.copies]
+
     def _loader_state_dicts(self) -> list[dict[str, Any]]:
-        return self._owner_call("sft_dataloader_state_dict")
+        return cast(
+            list[dict[str, Any]],
+            self._ordered_owner_results(
+                self._loader_call("sft_dataloader_state_dict"),
+                operation="loader checkpoint",
+            ),
+        )
 
     def _should_save(self, *, save_by_timeout: bool) -> bool:
         config = self._master_config.checkpointing
@@ -611,7 +757,8 @@ class SFTSingleControllerActor:
     def _save_checkpoint(self, metric: dict[str, float]) -> None:
         step = self._save_state.total_steps
         loader_states = self._loader_state_dicts()
-        if len(loader_states) != self._placement_plan.logical_world_size:
+        expected_loader_states = len(self._placement_plan.copies)
+        if len(loader_states) != expected_loader_states:
             raise RuntimeError("Refusing to save without every logical loader state.")
         # CheckpointManager ranks keep_top_k on metric_name read back out of
         # training_info, so the metric travels with the save state.
@@ -635,7 +782,7 @@ class SFTSingleControllerActor:
         )
 
     def _close_loaders(self) -> None:
-        self._owner_call("close_sft_dataloader")
+        self._loader_call("close_sft_dataloader")
 
 
 def setup_sft_v2(
@@ -643,9 +790,40 @@ def setup_sft_v2(
 ) -> SFTV2ActorArgs:
     """Build the V2 cluster, TQPolicy, placement, and resume state."""
     set_seed(master_config.sft.seed)
-    pretrained_checkpoint = master_config.checkpointing.get("pretrained_checkpoint")
-    if pretrained_checkpoint is not None:
-        master_config.policy["pretrained_checkpoint"] = pretrained_checkpoint
+    mimo_config = resolve_mimo_sft_config(master_config.policy)
+    local_plane = isinstance(master_config.data_plane, LocalDataPlaneConfig)
+    single_owner = mimo_config is not None and mimo_config.single_owner_loader
+    if single_owner and local_plane:
+        raise ValueError(
+            "MIMO single_owner_loader requires data_plane.impl=transfer_queue."
+        )
+    if not single_owner and not local_plane:
+        raise ValueError(
+            "Ordinary SFT and independent MiMo loaders require data_plane.impl=local."
+        )
+    if mimo_config is not None:
+        if master_config.data.get("validation") is not None:
+            raise NotImplementedError("MIMO SFT v2 validation is not supported yet.")
+        _validate_mimo_topology_mapper(master_config.data["energon"].topology_mapper)
+        if master_config.data["energon"].task_encoder.packing is None:
+            raise ValueError("MIMO SFT v2 requires Energon-owned sequence packing.")
+        if master_config.policy["train_micro_batch_size"] != 1:
+            raise ValueError("MIMO SFT v2 currently requires train_micro_batch_size=1.")
+        model_overrides = (
+            master_config.policy["megatron_cfg"].get("model_overrides") or {}
+        )
+        for name in ("gtp_weight_remat_size", "expert_gtp_weight_remat_size"):
+            size = model_overrides.get(name)
+            if size is not None and size != 1:
+                raise NotImplementedError(
+                    "The pinned Bridge MIMO provider constructs singleton GTP groups; "
+                    f"{name}={size} requires Bridge MIMO GTP support."
+                )
+    # Workers read policy.pretrained_checkpoint. YAML stores the block under
+    # checkpointing, so copy it here the same way SFT v1 does.
+    checkpointing_pretrained = master_config.checkpointing.get("pretrained_checkpoint")
+    if checkpointing_pretrained is not None:
+        master_config.policy["pretrained_checkpoint"] = checkpointing_pretrained
     if master_config.data.get("backend") != "energon":
         raise ValueError("SFTv2 requires data.backend=energon.")
     if not master_config.policy["megatron_cfg"]["enabled"]:
@@ -779,11 +957,44 @@ def setup_sft_v2(
 
     cluster_config = master_config.cluster
     num_nodes = cluster_config.num_nodes
+    gpu_bundles_per_node = [cluster_config.gpus_per_node] * num_nodes
+    if mimo_config is not None:
+        # The explicit module rank spans define the worker world. MiMo may
+        # use only part of the last allocated node (e.g. 64 language + 1 vision).
+        worker_count = max(
+            module["rank_offset"]
+            + module["tensor_model_parallel_size"]
+            * module["context_parallel_size"]
+            * module["pipeline_model_parallel_size"]
+            * module["data_parallel_size"]
+            for module in mimo_config.parallelism["module_parallelisms"].values()
+        )
+        last_node_workers = worker_count - sum(gpu_bundles_per_node[:-1])
+        if not 0 < last_node_workers <= cluster_config.gpus_per_node:
+            raise ValueError("cluster.num_nodes must fit the explicit MIMO rank spans.")
+        gpu_bundles_per_node[-1] = last_node_workers
     segment_size = cluster_config.segment_size
-    node_constraints, _, _ = prepare_segment_topology(segment_size, num_nodes)
+    node_block_counts = get_node_block_counts()
+    if node_block_counts:
+        # The launcher placed each node block (one NVLink segment per block);
+        # keep each block's range of global ranks on that block's nodes.
+        if segment_size is not None:
+            raise ValueError(
+                "cluster.segment_size must be null when nodes are split into node blocks "
+                "(node_block_<n> resources); give each NVLink segment its own block "
+                "(on Slurm: one het component with --nodes=N --segment=N)."
+            )
+        node_constraints = node_block_constraints(node_block_counts, num_nodes)
+        print(
+            "  ✓ Node blocks: global ranks follow block order, "
+            f"nodes per block {node_block_counts}",
+            flush=True,
+        )
+    else:
+        node_constraints, _, _ = prepare_segment_topology(segment_size, num_nodes)
     cluster = RayVirtualCluster(
         name="sft_v2_cluster",
-        bundle_ct_per_node_list=[cluster_config.gpus_per_node] * num_nodes,
+        bundle_ct_per_node_list=gpu_bundles_per_node,
         use_gpus=True,
         num_gpus_per_node=cluster_config.gpus_per_node,
         max_colocated_worker_groups=1,
@@ -806,11 +1017,19 @@ def setup_sft_v2(
             "nemo_rl.data.energon.sft_worker.SFTMegatronPolicyWorker"
         ),
         dp_cfg=master_config.data_plane,
+        allow_mimo_sft=True,
     )
     mapper_name = master_config.data["energon"].topology_mapper
-    placement_plan = resolve_topology_mapper(mapper_name).map(
-        trainer.sharding_annotations
-    )
+    if trainer.mimo_config is not None:
+        placement_plan = build_mimo_data_loader_placement(
+            trainer.mimo_config.parallelism,
+            world_size=cluster.world_size(),
+            single_owner=trainer.mimo_config.single_owner_loader,
+        )
+    else:
+        placement_plan = resolve_topology_mapper(mapper_name).map(
+            trainer.sharding_annotations
+        )
     global_batch_size = master_config.policy["train_global_batch_size"]
     if global_batch_size % placement_plan.logical_world_size != 0:
         raise ValueError(
@@ -845,5 +1064,7 @@ __all__ = [
     "SFTSingleControllerActor",
     "SFTV2ActorArgs",
     "SFTV2SaveState",
+    "check_mimo_lanes_agree",
+    "mimo_accounting_envelopes",
     "setup_sft_v2",
 ]

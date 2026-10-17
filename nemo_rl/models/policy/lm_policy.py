@@ -40,6 +40,11 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     RefitPayloadMode,
 )
+from nemo_rl.models.megatron.mimo import (
+    MIMOSFTConfig,
+    mimo_worker_sharding,
+    resolve_mimo_sft_config,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.draft_config import coerce_draft_config
 from nemo_rl.models.policy.interfaces import (
@@ -120,6 +125,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         skip_weight_load: bool = False,
         is_refit_destination: bool = False,
         reserved_http_server_ports: Optional[dict[int, int]] = None,
+        allow_mimo_sft: bool = False,
     ):
         self.debug_payload_metrics = False
         configured_extension_fqn = config.get("worker_extension_cls_fqn")
@@ -163,6 +169,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         gtp_size = 1
 
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
+        mimo_config = resolve_mimo_sft_config(config) if megatron_enable else None
+        if mimo_config is not None and not allow_mimo_sft:
+            raise ValueError(
+                "policy.megatron_cfg.mimo is supported only by the SFT v2 "
+                "entry point. Use examples/run_sft_v2.py."
+            )
+        self.mimo_config: MIMOSFTConfig | None = mimo_config
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
         # Normalize in place: every downstream reader (workers, setup, train)
         # accesses draft config by attribute, so a hand-built PolicyConfig has
@@ -322,7 +335,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 f"{sep_line}\n"
             )
 
-        if actual_world_size < model_parallel_size:
+        if self.mimo_config is None and actual_world_size < model_parallel_size:
             raise ValueError(
                 f"World size ({actual_world_size}) is insufficient for the parallelism configuration. "
                 f"Required minimum world size: PP({pp_size}) * CP({cp_size}) * TP({tp_size}) * GTP({gtp_size}) = {model_parallel_size}. "
@@ -330,7 +343,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 f"Please either increase the number of GPUs/nodes or reduce the parallelism parameters."
             )
 
-        if actual_world_size % model_parallel_size != 0:
+        if self.mimo_config is None and actual_world_size % model_parallel_size != 0:
             dp_size_float = actual_world_size / model_parallel_size
             raise ValueError(
                 f"World size ({actual_world_size}) must be divisible by PP * CP * TP * GTP ({model_parallel_size}). "
@@ -339,25 +352,28 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 f"Please adjust your cluster size or parallelism parameters."
             )
 
-        # MCore rank order is TP, CP, GTP, DP, PP, with TP varying fastest.
-        shape = [pp_size, -1, cp_size, tp_size]
-        axes = [
-            "pipeline_parallel",
-            "data_parallel",
-            "context_parallel",
-            "tensor_parallel",
-        ]
-        if gtp_size > 1:
-            shape.insert(2, gtp_size)
-            axes.insert(2, GTP_WEIGHT_REMAT_AXIS)
-        self.sharding_annotations = NamedSharding(
-            layout=np.arange(cluster.world_size()).reshape(shape),
-            names=axes,
-        )
+        if self.mimo_config is not None:
+            self.sharding_annotations = mimo_worker_sharding(actual_world_size)
+        else:
+            # MCore rank order is TP, CP, GTP, DP, PP, with TP varying fastest.
+            shape = [pp_size, -1, cp_size, tp_size]
+            axes = [
+                "pipeline_parallel",
+                "data_parallel",
+                "context_parallel",
+                "tensor_parallel",
+            ]
+            if gtp_size > 1:
+                shape.insert(2, gtp_size)
+                axes.insert(2, GTP_WEIGHT_REMAT_AXIS)
+            self.sharding_annotations = NamedSharding(
+                layout=np.arange(cluster.world_size()).reshape(shape),
+                names=axes,
+            )
 
         pre_init_queue = RayQueue()
 
-        worker_kwargs = dict(
+        worker_kwargs: dict[str, Any] = dict(
             init_optimizer=init_optimizer,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
@@ -483,6 +499,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     @property
     def data_parallel_size(self) -> int:
         """Data-parallel degree, read from the policy's sharding annotations."""
+        if self.mimo_config is not None:
+            return self.mimo_config.parallelism["module_parallelisms"]["language"][
+                "data_parallel_size"
+            ]
         return self.sharding_annotations.get_axis_size("data_parallel")
 
     def run_all_workers_single_data(self, method_name: str, *args, **kwargs) -> Any:

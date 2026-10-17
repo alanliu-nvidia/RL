@@ -156,7 +156,7 @@ class TQPolicy(TQDriverMixin, Policy):
         # depends on. Failing here surfaces a clear error at policy
         # construction; the same condition is re-checked inside
         # `shard_meta_for_dp` as a defensive invariant.
-        dp_world = self.sharding_annotations.get_axis_size("data_parallel")
+        dp_world = self.data_parallel_size
         if dp_world <= 0:
             raise ValueError(
                 f"TQPolicy requires data_parallel axis size > 0, got {dp_world}. "
@@ -187,6 +187,9 @@ class TQPolicy(TQDriverMixin, Policy):
         # process cannot interleave one baseline; the driver's own baseline
         # stays on the client, which covers a different set of processes.
         self._prev_cluster_snapshot: dict[str, Any] = {}
+        # Finish calls of the open step that train_placed_microbatches already
+        # submitted, one per worker (``mimo.async_finish``).
+        self._queued_finish_refs: Optional[list[ray.ObjectRef]] = None
 
         # Forward to workers (replaces ``Policy.setup_data_plane`` call
         # site in the trainer — TQPolicy bundles bootstrap + worker
@@ -693,13 +696,47 @@ class TQPolicy(TQDriverMixin, Policy):
         self,
         dp_metas: list[KVBatchMeta],
         timer: Optional[Timer] = None,
+        *,
+        delivery_ranks: Optional[list[tuple[int, ...]]] = None,
     ) -> dict[str, float]:
         """Dispatch one producer-assigned metadata batch per logical DP rank.
 
         The input order is the DP-major/GTP-minor order. Producer field lists
         remain unchanged because an SFT loader can provide a narrower schema
         than the rollout training path.
+
+        With ``mimo.async_finish``, each worker's finish call is submitted here
+        behind its own train call, and :meth:`finish_train_step` collects it.
         """
+        if self.mimo_config is not None:
+            if delivery_ranks is None:
+                raise ValueError("MIMO placed batches require explicit delivery ranks.")
+            started = time.monotonic()
+            train_metas = [
+                replace(meta, task_name="train")
+                for meta in self._stamp_placed_pad_seqlen(dp_metas)
+            ]
+            stamp_pad = time.monotonic() - started
+            started = time.monotonic()
+            train_refs = self._dispatch_mimo_train_microbatches(
+                train_metas, delivery_ranks=delivery_ranks, timer=timer
+            )
+            if self.mimo_config.async_finish:
+                # Each finish takes its own worker's train ref. The workers are
+                # asyncio actors, which do not keep call order; Ray starts a call
+                # only once its ObjectRef arguments resolve, and fails it without
+                # running it if one of them failed.
+                self._queued_finish_refs = (
+                    self.worker_group.run_all_workers_multiple_data(
+                        "finish_train_step_presharded",
+                        after=train_refs,
+                        common_kwargs=trace_context_kwargs(),
+                    )
+                )
+            ray.get(train_refs)
+            return {"stamp_pad": stamp_pad, "dispatch": time.monotonic() - started}
+        if delivery_ranks is not None:
+            raise ValueError("delivery_ranks is only valid for MIMO placed batches.")
         data_axes, logical_world = self._placed_data_layout()
         if len(dp_metas) != logical_world:
             raise ValueError(
@@ -731,6 +768,66 @@ class TQPolicy(TQDriverMixin, Policy):
             "stamp_pad": stamp_pad,
             "dispatch": time.monotonic() - started,
         }
+
+    def _dispatch_mimo_train_microbatches(
+        self,
+        role_metas: list[KVBatchMeta],
+        *,
+        delivery_ranks: list[tuple[int, ...]],
+        timer: Optional[Timer],
+    ) -> list[ray.ObjectRef]:
+        """Route role-local loader metadata over the flat physical worker layout.
+
+        Returns one train-call ref per worker, in worker order.
+        """
+        if len(role_metas) != len(delivery_ranks):
+            raise ValueError(
+                "MIMO role metadata and delivery plans must have the same length."
+            )
+        if not role_metas:
+            raise ValueError("MIMO placed training requires role metadata.")
+
+        microbatch_counts = {len(meta.sample_ids) for meta in role_metas}
+        if len(microbatch_counts) != 1:
+            raise ValueError(
+                "MIMO role loaders must publish the same number of physical packs; "
+                f"got {sorted(microbatch_counts)}."
+            )
+        num_microbatches = microbatch_counts.pop()
+        if num_microbatches <= 0:
+            raise ValueError("MIMO placed training requires at least one microbatch.")
+
+        targets: list[Optional[KVBatchMeta]] = [None] * (
+            self.worker_group.cluster.world_size()
+        )
+        for meta, ranks in zip(role_metas, delivery_ranks, strict=True):
+            for rank in ranks:
+                if not 0 <= rank < len(targets):
+                    raise ValueError(
+                        f"MIMO delivery rank {rank} is outside the cluster."
+                    )
+                if targets[rank] is not None:
+                    raise ValueError(
+                        f"MIMO worker rank {rank} received more than one role batch."
+                    )
+                targets[rank] = meta
+
+        sequence_length = int(role_metas[0].extra_info[GLOBAL_FORWARD_PAD_SEQLEN])
+
+        with (
+            timer.time("policy_training/submit_microbatch_futures")
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_multiple_data(
+                "train_microbatch_presharded",
+                meta=targets,
+                common_kwargs={
+                    "num_microbatches": num_microbatches,
+                    "sequence_length": sequence_length,
+                },
+            )
+        return futures
 
     def evaluate_placed_microbatches(
         self,
@@ -883,11 +980,14 @@ class TQPolicy(TQDriverMixin, Policy):
         :meth:`train_from_meta` so callers don't have to special-case
         the split path.
         """
-        futures = self.worker_group.run_all_workers_single_data(
-            "finish_train_step_presharded",
-            **trace_context_kwargs(),
-        )
+        futures = self._queued_finish_refs
+        if futures is None:
+            futures = self.worker_group.run_all_workers_single_data(
+                "finish_train_step_presharded",
+                **trace_context_kwargs(),
+            )
         results = ray.get(futures)
+        self._queued_finish_refs = None
         # Filter to DP-replica leaders only. ``run_all_workers_single_data``
         # returns one result per GPU (TP×CP×PP×DP), but TP/CP/non-last-PP
         # twins hold identical copies of their DP shard's metric list.
@@ -895,7 +995,13 @@ class TQPolicy(TQDriverMixin, Policy):
         # TP*CP*(1 if PP==1 else PP_last_stage_count). ``train_from_meta``
         # gets this for free via ``output_is_replicated`` on its sharded
         # dispatch; finish has no data to shard, so we dedupe here.
-        leader_results = [r for r in results if r.get("is_replica_leader", True)]
+        if self.mimo_config is not None:
+            language_rank = self.mimo_config.parallelism["module_parallelisms"][
+                "language"
+            ]["rank_offset"]
+            leader_results = [results[language_rank]]
+        else:
+            leader_results = [r for r in results if r.get("is_replica_leader", True)]
         aggregated_results = _aggregate_train_results(leader_results)
 
         if self.flops_tracker is not None:
@@ -906,6 +1012,12 @@ class TQPolicy(TQDriverMixin, Policy):
 
     def abort_train_step(self) -> None:
         """Drop partial step state on every worker. No optimizer.step."""
+        if self._queued_finish_refs is not None:
+            # Let queued finish calls end first so that none runs after the abort.
+            ray.wait(
+                self._queued_finish_refs, num_returns=len(self._queued_finish_refs)
+            )
+            self._queued_finish_refs = None
         futures = self.worker_group.run_all_workers_single_data(
             "abort_train_step_presharded",
             **trace_context_kwargs(),

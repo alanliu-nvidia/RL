@@ -30,6 +30,8 @@ from nemo_rl.algorithms.sft_v2 import (
     setup_sft_v2,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
+from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.telemetry.instrumentation import (
     dispatch_with_trace_context,
@@ -85,6 +87,8 @@ def main() -> None:
     try:
         with umbrella_span(RLSpanGroup.U_JOB, "rl.sft_v2.driver"):
             with startup_span():
+                if not isinstance(master_config.data_plane, LocalDataPlaneConfig):
+                    maybe_configure_data_plane_env(master_config.data_plane)
                 init_ray()
                 with setup_span("tokenizer"):
                     processor = get_tokenizer(
