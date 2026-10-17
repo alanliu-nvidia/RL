@@ -63,8 +63,8 @@ def test_case_geometry_and_resume_paths(suite: DictConfig, tmp_path: Path) -> No
     assert len(configs) == 14
     for case, config in configs.items():
         expected_nodes = 32 if "32n" in case else 16
-        if case.startswith("clevr_1n_"):
-            expected_nodes = 1
+        if case.startswith("clevr_2n_"):
+            expected_nodes = 2
         elif case.startswith("clevr_4n_"):
             expected_nodes = 4
         assert config.cluster.num_nodes == expected_nodes
@@ -92,7 +92,7 @@ def test_case_geometry_and_resume_paths(suite: DictConfig, tmp_path: Path) -> No
         == 2
     )
     for case, cp, ep in (
-        ("clevr_1n_mxfp8_cp4ep4_2k", 4, 4),
+        ("clevr_2n_mxfp8_cp8ep8_2k", 8, 8),
         ("clevr_4n_mxfp8_cp16ep16_2k", 16, 16),
         ("clevr_16n_mxfp8_cp16ep16_2k", 16, 16),
     ):

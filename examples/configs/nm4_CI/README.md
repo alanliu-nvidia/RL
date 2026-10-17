@@ -29,8 +29,8 @@ or overridden to readable paths. Training data is not copied by this suite.
 | `generalist_32n_mxfp8_egtp2.yaml` | 32 × 4 | 64 / 64 | 1 / 2 | 2 | Expert GTP2 parity |
 | `generalist_32n_mxfp8_muon_padded.yaml` | 32 × 4 | 64 / 64 | 1 / 1 | 2 | Explicit layer-wise padded layout |
 | `generalist_32n_mxfp8_muon_compact.yaml` | 32 × 4 | 64 / 64 | 1 / 1 | 2 | Compact layout, distributed optimizer disabled |
-| `clevr_1n_mxfp8_cp4ep4_2k.yaml` | 1 × 4 | 4 / 4 | 1 / 1 | 4 | CLEVR DP1 reference, 2K tokens |
-| `clevr_4n_mxfp8_cp16ep16_2k.yaml` | 4 × 4 | 16 / 16 | 1 / 1 | 4 | CLEVR CP/EP parity against one-node DP1 reference |
+| `clevr_2n_mxfp8_cp8ep8_2k.yaml` | 2 × 4 | 8 / 8 | 1 / 1 | 4 | CLEVR DP1 reference, 2K tokens |
+| `clevr_4n_mxfp8_cp16ep16_2k.yaml` | 4 × 4 | 16 / 16 | 1 / 1 | 4 | CLEVR CP/EP parity against two-node DP1 reference |
 | `clevr_16n_mxfp8_cp16ep16_2k.yaml` | 16 × 4 | 16 / 16 | 1 / 1 | 4 | CLEVR DP4 execution/finite-metric check, 2K tokens |
 | `checkpoint_16n_uninterrupted.yaml` | 16 × 4 | 64 / 64 | 1 / 1 | 1 | Uninterrupted 20-step reference |
 | `checkpoint_16n_save10.yaml` | 16 × 4 | 64 / 64 | 1 / 1 | 1 | Ten steps, then save weights/optimizer/loaders |
@@ -153,7 +153,7 @@ cases is a separate opt-in run.
 - GTP2, EGTP2 and both Muon variants versus the 32-node GTP1 reference:
   maximum absolute per-step relative difference must be **less than 0.5%**.
 - alltoall versus the 16-node GTP1 HybridEP reference, and four-node CLEVR
-  CP16/EP16 versus one-node CP4/EP4: the same **less than 0.5%** gate.
+  CP16/EP16 versus two-node CP8/EP8: the same **less than 0.5%** gate.
 - Restart phase one versus uninterrupted steps 1–10, and restart phase two versus
   uninterrupted steps 11–20: the same **less than 0.5%** gate. Comparing step 11
   against uninterrupted step 11 detects a restart spike without confusing it with
@@ -203,11 +203,11 @@ it does not independently prove equality of every saved RNG/optimizer tensor.
 
 ## CLEVR context parallelism
 
-The one-node case uses CP4/EP4. Both the four- and sixteen-node cases use
+The two-node reference uses CP8/EP8. Both the four- and sixteen-node cases use
 CP16/EP16. TP1, PP1, dense/expert GTP1, GBS4, microbatch1, 2048-token sequences
 and 20 optimizer steps are common to all three cases.
 
-The one- and four-node cases have DP1 and four microbatches per step. Their
+The two- and four-node cases have DP1 and four microbatches per step. Their
 loss comparison uses matching Energon data-lane geometry and tests the combined
 CP/EP change. The sixteen-node case has DP4 and one microbatch per step; it checks
 execution and finite losses/gradients without claiming loss parity against the
@@ -218,11 +218,14 @@ The four-node parallelism matches
 128 of the 512 experts on each GPU and exhausted memory while creating Muon's
 FP32 master parameters. EP16 places 32 experts on each GPU.
 
-The one-node CP4/EP4 case still has 128 experts per GPU. On HSG allocation
-7948255 it failed during Muon FP32 master-parameter initialization with CUDA OOM.
-It remains in the suite so that the failure is visible; CLEVR loss parity is
-not established. All CLEVR cases use `/data/nemorl-datasets/clevr` and matching
-2048-token packing limits.
+The historical one-node CP4/EP4 recipe has 128 experts per GPU. It failed
+during Muon initialization on HSG allocation 7948255 and checkpoint dequantization
+on AGA allocation 1295066 (276.60 GiB used out of 276.62 GiB). BF16 parameter
+storage and disabling the quantized-weight cache still exhausted memory during
+forward execution. Keep that recipe for reproducing the failure, but use the
+two-node CP8/EP8 reference in the required suite: 64 experts per GPU, with the
+same DP1 data lane, batch size, optimizer, precision, and 0.5% parity gate.
+All CLEVR cases use `/data/nemorl-datasets/clevr` and matching 2048-token packing limits.
 
 ### Four-node GPU validation
 

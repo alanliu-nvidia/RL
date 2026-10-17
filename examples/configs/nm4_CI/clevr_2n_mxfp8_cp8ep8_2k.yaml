@@ -1,0 +1,16 @@
+defaults: _clevr_common.yaml
+cluster:
+  num_nodes: 2
+  segment_size: 2
+policy:
+  megatron_cfg:
+    context_parallel_size: 8
+    expert_model_parallel_size: 8
+logger:
+  log_dir: logs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/clevr_2n_mxfp8_cp8ep8_2k
+  wandb:
+    name: nm4-ci-clevr_2n_mxfp8_cp8ep8_2k-${oc.env:NM4_CI_RUN_TAG}
+  tensorboard:
+    log_dir: logs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/clevr_2n_mxfp8_cp8ep8_2k
+checkpointing:
+  checkpoint_dir: /data/nemorl-runs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/clevr_2n_mxfp8_cp8ep8_2k

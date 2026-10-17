@@ -189,8 +189,8 @@ cases:
     - 18
     - 19
     - 20
-  clevr_1n_mxfp8_cp4ep4_2k:
-    config: clevr_1n_mxfp8_cp4ep4_2k.yaml
+  clevr_2n_mxfp8_cp8ep8_2k:
+    config: clevr_2n_mxfp8_cp8ep8_2k.yaml
     steps:
     - 1
     - 2
@@ -397,10 +397,10 @@ checks:
   steps: *id005
   max_relative_loss_pct: 0.5
   strict_threshold: true
-# The one- and four-node cases both use DP1, GBS4 and identical data settings.
+# The two- and four-node cases both use DP1, GBS4 and identical data settings.
 - name: clevr_4n_mxfp8_cp16ep16_2k_parity
   candidate: clevr_4n_mxfp8_cp16ep16_2k
-  reference_case: clevr_1n_mxfp8_cp4ep4_2k
+  reference_case: clevr_2n_mxfp8_cp8ep8_2k
   steps: *id006
   max_relative_loss_pct: 0.5
   strict_threshold: true
