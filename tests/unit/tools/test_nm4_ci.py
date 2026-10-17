@@ -74,6 +74,8 @@ def test_case_geometry_and_resume_paths(suite: DictConfig, tmp_path: Path) -> No
         assert config.policy.megatron_cfg.attention_backend == "auto"
         assert "saved_args" not in (config.policy.megatron_cfg.model_overrides or {})
         assert config.sft.max_num_steps == suite.cases[case].steps[-1]
+        if case.startswith(("generalist_16n_", "checkpoint_16n_")):
+            assert config.policy.train_global_batch_size == 1
     bf16 = configs["generalist_16n_bf16_hybridep"].policy.megatron_cfg
     assert not bf16.fp8_cfg.enabled
     assert bf16.model_overrides.fp8 is None

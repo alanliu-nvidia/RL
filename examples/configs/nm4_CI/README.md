@@ -16,6 +16,9 @@ Generalist recipes inherit the data path and sequence length from
 resolved plan/config rather than assuming those settings are identical.
 The CI common fragment selects `/data/models/nm4_nano_bridge`, seed 42 and Muon.
 MXFP8 uses `nm4_mxfp8_tp4_precision.yaml`; HybridEP is the default dispatcher.
+The 16-node MXFP8 recipe explicitly selects GBS1 to match the historical BF16
+reference. BF16, alltoall, checkpoint, and MIMO CI derivatives inherit GBS1,
+so both arms of each comparison use the same batch size.
 The checkpoint alias and CLEVR alias `/data/nemorl-datasets/clevr` must be mounted
 or overridden to readable paths. Training data is not copied by this suite.
 

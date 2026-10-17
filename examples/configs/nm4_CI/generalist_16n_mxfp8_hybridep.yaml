@@ -1,4 +1,7 @@
 defaults: _generalist_common.yaml
+policy:
+  # Match the historical BF16 reference and keep both precision arms at GBS1.
+  train_global_batch_size: 1
 logger:
   log_dir: logs/nm4-ci/${oc.env:NM4_CI_RUN_TAG}/generalist_16n_mxfp8_hybridep
   wandb:
