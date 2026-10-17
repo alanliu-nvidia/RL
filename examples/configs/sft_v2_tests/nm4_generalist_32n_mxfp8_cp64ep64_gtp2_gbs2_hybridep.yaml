@@ -1,5 +1,5 @@
 defaults:
-  - nm4_generalist_16n_mxfp8_cp64ep64_gbs1.yaml
+  - nm4_generalist_16n_mxfp8_cp64ep64_gbs4.yaml
 
 policy:
   train_global_batch_size: 2

@@ -9,15 +9,16 @@ sft:
   max_consecutive_step_failures: 3
 checkpointing:
   enabled: true
-  checkpoint_dir: /data/nemorl-runs/nm4-generalist-16n-mxfp8-cp64ep64-gbs1-nemotron4-4136020-unfusedce
+  checkpoint_dir: /data/nemorl-runs/nm4-generalist-16n-mxfp8-cp64ep64-gbs4-nemotron4-4136020-unfusedce
   metric_name: null
   higher_is_better: false
   keep_top_k: 5
-  save_period: 100
+  save_period: 200
   checkpoint_must_save_by: 00:03:40:00
   save_optimizer: true
   pretrained_checkpoint:
-    path: /data/models/nm4_nano_bridge
+    # path: /data/models/nm4_nano_bridge
+    path: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_post/checkpoints/nemotron4_nano_21t_phase2_iter_0568125_mbridge_reinit_sanitized_v8
     format: megatron_bridge
 policy:
   model_name: /data/nemotron4/Mistral-Medium-3.5-128B
@@ -25,9 +26,9 @@ policy:
     name: /data/nemotron4/processor
     chat_template: default
     chat_template_kwargs: null
-  train_global_batch_size: 1
+  train_global_batch_size: 4
   train_micro_batch_size: 1
-  max_total_sequence_length: 131072
+  max_total_sequence_length: 524288
   precision: bfloat16
   logprob_chunk_size: 32
   offload_optimizer_for_logprob: false
@@ -76,13 +77,15 @@ policy:
       async_save: false
       ckpt_assume_constant_structure: false
     use_fused_linear_logprobs: false
+    use_layer_wise_param_layout: false
     fused_linear_logprobs_chunk_size: 256
     force_reconvert_from_hf: false
     env_vars:
+      NCCL_NET_PLUGIN: none
       FLA_TILELANG: '0'
       NRL_SFT_MULTIMODAL_DIAGNOSTICS: '1'
-      # NVTE_CUTEDSL_FUSED_GROUPED_MLP: '1'
-      NVTE_USE_CUTLASS_GROUPED_GEMM: '0'
+      NVTE_CUTEDSL_FUSED_GROUPED_MLP: '1'
+      NVTE_USE_CUTLASS_GROUPED_GEMM: '1'
       NVTE_FWD_LAYERNORM_SM_MARGIN: '40'
       NVTE_BWD_LAYERNORM_SM_MARGIN: '40'
       NVTE_INF_LAYERNORM_SM_MARGIN: '40'
@@ -134,7 +137,7 @@ policy:
     hybridep_use_mnnvl: true
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
-    gradient_accumulation_fusion: false
+    gradient_accumulation_fusion: true
     use_fused_weighted_squared_relu: true
     peft:
       enabled: false
@@ -175,7 +178,7 @@ policy:
       muon_use_syrk: false
       muon_ns_batch_size: 1
       muon_concurrent_groups: true
-      use_distributed_optimizer: true
+      use_distributed_optimizer: false
       use_layer_wise_distributed_optimizer: true
       use_precision_aware_optimizer: false
       clip_grad: ${policy.max_grad_norm}
@@ -199,6 +202,7 @@ policy:
     freeze_vision_encoder: false
     freeze_vision_projector: false
     attention_backend: auto
+    flash_attention_version: 4
     high_priority_stream_groups: [ep]
     model_overrides:
       moe_hybridep_pad_uneven_dispatch_inputs: true
@@ -218,7 +222,7 @@ policy:
       linear_cp_mode: chunkwise
       linear_cp_layout: contiguous
       attention_cp_layout: zigzag
-      # gdp_cutedsl_kernel: true      # not present in Rohit's container. Guyue had a patch so it should work on her container
+      gdp_cutedsl_kernel: true
       residual_stream_recompute_num_layers: 4
       use_transformer_engine_op_fuser: false
       fp8: e4m3
@@ -246,7 +250,7 @@ policy:
     # te_precision_config_file: examples/configs/sft_v2_tests/nm4_mxfp8_experts_precision.yaml
     te_precision_config_file: examples/configs/sft_v2_tests/nm4_mxfp8_tp4_precision.yaml
 logger:
-  log_dir: logs/nm4-generalist-16n-mxfp8-cp64ep64-gbs1
+  log_dir: logs/nm4-generalist-16n-mxfp8-cp64ep64-gbs4
   wandb_enabled: true
   tensorboard_enabled: true
   mlflow_enabled: false
@@ -254,12 +258,12 @@ logger:
   monitor_gpus: true
   wandb:
     project: rohit-sft_v2_up_n4
-    name: nm4-generalist-16n-mxfp8-cp64ep64-gbs1
+    name: nm4-generalist-16n-mxfp8-cp64ep64-gbs4
   swanlab:
     project: sft-dev
     name: sft-qwen2.5-vl-3b-clevr-energon-v2
   tensorboard:
-    log_dir: logs/nm4-generalist-16n-mxfp8-cp64ep64-gbs1
+    log_dir: logs/nm4-generalist-16n-mxfp8-cp64ep64-gbs4
   mlflow:
     experiment_name: sft-dev
     run_name: sft-qwen2.5-vl-3b-clevr-energon-v2
@@ -270,7 +274,7 @@ logger:
 cluster:
   gpus_per_node: 4
   num_nodes: 16
-  segment_size: null
+  segment_size: 16
 data_plane:
   enabled: true
   impl: local
@@ -327,7 +331,7 @@ data:
     watchdog_timeout_seconds: 1200
     seed_offset: 0
   train:
-    path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/rohitkumarj/code/RL/nemo-rl-sft_v2_upstream/examples/configs/sft_v2_tests/sft_super35_generalist_full_cmh.yaml
+    path: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_post/sft-data/full_generalist/sft_from_super35_dualds_4k_1of8_recover_iter366_radio_v4_h_full_generalist_aga.yaml
     split: train
     virtual_epoch_length: 10000000
   validation: null

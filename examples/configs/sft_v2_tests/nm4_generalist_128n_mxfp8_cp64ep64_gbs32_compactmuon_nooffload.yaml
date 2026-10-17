@@ -109,7 +109,6 @@ policy:
     - moe_act
     - gdp_in_proj
     - gdp_qkv
-    - core_attn
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 64
@@ -205,6 +204,7 @@ policy:
     freeze_vision_encoder: false
     freeze_vision_projector: false
     attention_backend: auto
+    flash_attention_version: 4
     high_priority_stream_groups:
     - ep
     model_overrides:
@@ -223,7 +223,8 @@ policy:
       linear_cp_mode: chunkwise
       linear_cp_layout: contiguous
       attention_cp_layout: zigzag
-      residual_stream_recompute_num_layers: 1
+      gdp_cutedsl_kernel: true
+      residual_stream_recompute_num_layers: 4
       use_transformer_engine_op_fuser: false
       fp8: e4m3
       fp8_recipe: mxfp8

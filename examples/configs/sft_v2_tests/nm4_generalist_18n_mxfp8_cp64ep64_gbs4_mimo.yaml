@@ -1,0 +1,63 @@
+# Migrated Oct 15 production ablation; future launches use the oct6 checkout.
+defaults: nm4_generalist_16n_mxfp8_cp64ep64_gbs4.yaml
+cluster:
+  num_nodes: 18
+  segment_size: null
+checkpointing:
+  pretrained_checkpoint:
+    path: /data/models/nm4_nano_0568125_mimo_scaling
+    format: megatron_bridge
+  checkpoint_dir: /data/nemorl-runs/m18-prod-o15
+policy:
+  megatron_cfg:
+    # CI739 lacks the APEX fused_weight_gradient_mlp_cuda extension required by NM4.
+    # Set this explicitly instead of relying on Bridge to disable it at runtime.
+    gradient_accumulation_fusion: false
+    model_overrides:
+      # 524288 tokens / language CP 64
+      moe_hybridep_max_num_tokens_per_rank: 8192
+    distributed_data_parallel_config:
+      # Encoder DP8 > language DP1 can leave encoder ranks with no media.
+      # Those ranks do not fire the gradient hooks required by reduction overlap.
+      overlap_grad_reduce: false
+      # Disable for loss parity testing: overlapped gathers coincided with high startup loss.
+      overlap_param_gather: false
+    mimo:
+      single_owner_loader: true
+      async_finish: false
+      parallelism:
+        module_parallelisms:
+          images:
+            tensor_model_parallel_size: 1
+            pipeline_model_parallel_size: 1
+            context_parallel_size: 1
+            expert_model_parallel_size: 1
+            expert_tensor_parallel_size: 1
+            data_parallel_size: 8
+            rank_offset: 0
+          language:
+            tensor_model_parallel_size: 1
+            pipeline_model_parallel_size: 1
+            context_parallel_size: 64
+            expert_model_parallel_size: 64
+            expert_tensor_parallel_size: 1
+            data_parallel_size: 1
+            rank_offset: 8
+    use_layer_wise_param_layout: true
+    env_vars:
+      NCCL_NET_PLUGIN: none
+      PYTHONPATH: /scratch/fsw/portfolios/nemotron/projects/nemotron_n4_omni/users/rohitkumarj/code/RL/nemo-rl-sft_v2_n4_oct6_rebase:/scratch/fsw/portfolios/nemotron/projects/nemotron_n4_omni/users/rohitkumarj/code/RL/nemo-rl-sft_v2_n4_oct6_rebase/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:/scratch/fsw/portfolios/nemotron/projects/nemotron_n4_omni/users/rohitkumarj/code/RL/nemo-rl-sft_v2_n4_oct6_rebase/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM:/root/.cache/huggingface/modules
+data_plane:
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    storage_capacity: 1000000
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}
+logger:
+  wandb:
+    project: sft_v2_n4_oct6_rebase
+    name: m18-prod-o15
+  log_dir: /scratch/fsw/portfolios/nemotron/projects/nemotron_n4_omni/users/rohitkumarj/code/RL/nemo-rl-sft_v2_n4_oct6_rebase/artifacts/m18-prod-o15/logs
+  tensorboard:
+    log_dir: /scratch/fsw/portfolios/nemotron/projects/nemotron_n4_omni/users/rohitkumarj/code/RL/nemo-rl-sft_v2_n4_oct6_rebase/artifacts/m18-prod-o15/tensorboard

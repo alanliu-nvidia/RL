@@ -1,0 +1,76 @@
+# 8 encoder + 64 language GPUs: TP1 PP1 CP64 DP1 EP64, GBS4 MBS1 GA4.
+# Training settings inherit the current 16-node generalist recipe.
+defaults: ../nm4_generalist_16n_mxfp8_cp64ep64_gbs4.yaml
+
+checkpointing:
+  checkpoint_dir: /data/nemorl-runs/vlm_sft-mimo-nm4-18n4g-512k
+  pretrained_checkpoint:
+    # MIMO view with embedding/output rows reinitialized; also pinned in launch.sh.
+    path: /scratch/fsw/portfolios/nemotron/projects/nemotron_n4_pre/users/ykarnati/nm4_sft/embedding_reinitialized/iter_0568125
+
+policy:
+  model_name: /scratch/fsw/portfolios/nemotron/projects/nemotron_sw_post/users/guyueh/cache/huggingface/hub/models--mistralai--Mistral-Medium-3.5-128B/snapshots/22b2b868a15677cfa6061277ed2f653d1349a9ab
+  tokenizer:
+    name: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_post/checkpoints/nemotron4_processor
+  megatron_cfg:
+    manual_gc: true
+    manual_gc_interval: 100
+    env_vars:
+      NRL_DIST_TIMEOUT_MINUTES: '120'
+      NCCL_NET_PLUGIN: none
+    model_overrides:
+      cp_comm_type: all_gather
+      # 524288 tokens / language CP 64
+      moe_hybridep_max_num_tokens_per_rank: 8192
+      vision_bias_activation_fusion: true
+      vision_apply_rope_fusion: true
+    vision_recompute_num_layers: 26
+    mimo:
+      single_owner_loader: true
+      parallelism:
+        module_parallelisms:
+          images:
+            tensor_model_parallel_size: 1
+            pipeline_model_parallel_size: 1
+            context_parallel_size: 1
+            expert_model_parallel_size: 1
+            expert_tensor_parallel_size: 1
+            data_parallel_size: 8
+            rank_offset: 0
+          language:
+            tensor_model_parallel_size: 1
+            pipeline_model_parallel_size: 1
+            context_parallel_size: 64
+            expert_model_parallel_size: 64
+            expert_tensor_parallel_size: 1
+            data_parallel_size: 1
+            rank_offset: 8
+
+logger:
+  log_dir: logs/vlm_sft-mimo-nm4-18n4g-512k
+  gpu_monitoring:
+    collection_interval: 120
+    flush_interval: 120
+  wandb:
+    name: vlm_sft-mimo-nm4-18n4g-512k
+  tensorboard:
+    log_dir: ${logger.log_dir}
+
+data:
+  energon:
+    # Split loading decodes each lane's images on every encoder rank; 2 / 2 waits on data at 18 nodes.
+    num_workers: 4
+    prefetch_factor: 4
+
+data_plane:
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    storage_capacity: 1000000
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}
+
+cluster:
+  num_nodes: 18
+  # Slurm heterogeneous components place the NVLink segments, not Ray.
+  segment_size: null

@@ -1,0 +1,36 @@
+# 4 encoder + 16 language GPUs: TP1 PP1 CP4 DP4 EP16, GBS16 MBS1 GA4.
+# Only the smoke duration, sequence length and topology differ from the 18-node recipe.
+defaults: vlm_sft-mimo-nm4-18n4g-512k.yaml
+
+sft:
+  max_num_steps: 20
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: /data/nemorl-runs/vlm_sft-mimo-nm4-5n4g-2k-smoke
+
+policy:
+  train_global_batch_size: 16
+  max_total_sequence_length: 2048
+  megatron_cfg:
+    context_parallel_size: 4
+    expert_model_parallel_size: 16
+    hybridep_num_ranks_per_nvlink_domain: 16
+    mimo:
+      parallelism:
+        module_parallelisms:
+          images:
+            data_parallel_size: 4
+          language:
+            context_parallel_size: 4
+            expert_model_parallel_size: 16
+            data_parallel_size: 4
+            rank_offset: 4
+
+logger:
+  log_dir: logs/vlm_sft-mimo-nm4-5n4g-2k-smoke
+  wandb:
+    name: vlm_sft-mimo-nm4-5n4g-2k-smoke
+
+cluster:
+  num_nodes: 5
