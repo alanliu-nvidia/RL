@@ -14,6 +14,7 @@
 import importlib
 import math
 import os
+import pickle
 import sys
 import time
 from copy import deepcopy
@@ -35,6 +36,23 @@ from nemo_rl.utils.venvs import (
     add_hf_modules_cache_to_pythonpath,
     create_local_venv_on_each_node,
 )
+
+# Single-data kwargs whose pickle has at most this many bytes go to the workers
+# by value. A ray.put object must be pulled from the driver node by every worker
+# node before the call runs, but Ray serializes a by-value argument again for each
+# call, so larger kwargs are cheaper through one ray.put.
+_MAX_INLINE_KWARG_BYTES = 4 * 1024
+
+
+def _inline_or_put(value: Any) -> Any:
+    """Return a small value as is, and a ray.put object ref for a large one."""
+    try:
+        # Not ray.cloudpickle: it pins the object of every ObjectRef it pickles.
+        size = len(pickle.dumps(value))
+    except (pickle.PicklingError, TypeError, AttributeError):
+        # Only cloudpickle can serialize the value (for example, a lambda).
+        return ray.put(value)
+    return value if size <= _MAX_INLINE_KWARG_BYTES else ray.put(value)
 
 
 @ray.remote(num_cpus=0, num_gpus=0)
@@ -999,7 +1017,7 @@ class RayWorkerGroup:
             "See https://github.com/NVIDIA-NeMo/RL/issues/582 for more details."
         )
 
-        kwargs = {key: ray.put(value) for key, value in kwargs.items()}
+        kwargs = {key: _inline_or_put(value) for key, value in kwargs.items()}
 
         futures = []
 

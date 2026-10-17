@@ -26,9 +26,11 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import (
+    _MAX_INLINE_KWARG_BYTES,
     RayWorkerBuilder,
     RayWorkerGroup,
     _get_initializer_env_vars,
+    _inline_or_put,
 )
 
 
@@ -680,6 +682,54 @@ def test_run_all_workers_single_data_2d_sharding_filter_dp_tp(worker_group_2d_sh
         else:
             assert count == 0
             assert data is None
+
+
+def test_inline_or_put_keeps_ray_put_for_large_or_cloudpickle_only_values(
+    monkeypatch,
+):
+    monkeypatch.setattr(ray, "put", lambda value: ("ref", value))
+    small = {"gbs": 32, "mbs": 1}
+    large = b"x" * (_MAX_INLINE_KWARG_BYTES + 1)
+    # About 5.5 KiB: Ray would serialize it again for each worker call.
+    metadata = {f"layer.{i}.weight": (i, 4096, "bf16") for i in range(200)}
+
+    def local_fn():
+        return None
+
+    assert _inline_or_put(small) is small
+    assert _inline_or_put(large) == ("ref", large)
+    assert _inline_or_put(metadata) == ("ref", metadata)
+    # The standard pickle cannot serialize a local function, so it is not sized.
+    assert _inline_or_put(local_fn) == ("ref", local_fn)
+
+
+def test_run_all_workers_single_data_puts_only_large_kwargs(
+    worker_group_1d_sharding, monkeypatch
+):
+    worker_group = worker_group_1d_sharding
+    ray.get([w.reset_call_records.remote() for w in worker_group.workers])
+    put_values = []
+    ray_put = ray.put
+
+    def recording_put(value):
+        put_values.append(value)
+        return ray_put(value)
+
+    monkeypatch.setattr(ray, "put", recording_put)
+    test_data = SlicedDataDict({"key": "value_by_value"})
+    large = b"x" * (_MAX_INLINE_KWARG_BYTES + 1)
+
+    futures = worker_group.run_all_workers_single_data(
+        "record_call", data=test_data, large=large
+    )
+    assert len(ray.get(futures)) == 2
+
+    assert put_values == [large]
+    for worker in worker_group.workers:
+        data, _, kwargs, count = ray.get(worker.get_recorded_data.remote())
+        assert count == 1
+        assert data == test_data
+        assert kwargs == {"large": large}
 
 
 def test_run_all_workers_multiple_data_1d_sharding(worker_group_1d_sharding):
