@@ -167,12 +167,13 @@ def _broadcast_batched_data_dict(
                 dtype = getattr(torch, dtype_str.split(".")[-1])
                 tensor = torch.empty(shape, dtype=dtype, device=bcast_device)
                 out[key] = tensor
-            # NCCL has no int16 ("Short") type; ship as int32 and narrow back
-            # (routed_experts rides TQ as int16).
+            # NCCL has no int16 ("Short") type. Broadcast the same bytes
+            # without allocating widened and narrowed copies of route payloads.
             if tensor.dtype == torch.int16:
-                wire = tensor.to(torch.int32)
-                torch.distributed.broadcast(wire, src=src, group=group)
-                tensor = wire.to(torch.int16)
+                tensor = tensor.contiguous()
+                torch.distributed.broadcast(
+                    tensor.reshape(-1).view(torch.uint8), src=src, group=group
+                )
                 out[key] = tensor
             else:
                 torch.distributed.broadcast(tensor, src=src, group=group)
@@ -209,10 +210,9 @@ def _broadcast_batched_data_dict(
                 tensor = torch.empty(numel, dtype=dtype, device=bcast_device)
             if tensor.numel():
                 if tensor.dtype == torch.int16:
-                    wire = tensor.to(torch.int32)
-                    torch.distributed.broadcast(wire, src=src, group=group)
-                    tensor = wire.to(torch.int16)
-                    del wire
+                    torch.distributed.broadcast(
+                        tensor.view(torch.uint8), src=src, group=group
+                    )
                 else:
                     torch.distributed.broadcast(tensor, src=src, group=group)
             if not is_leader:
@@ -276,6 +276,28 @@ def _materialize_fetched(
         pad_to_seqlen=pad_to_seqlen,
         tags=tags,
     )
+
+
+def _mimo_call_kwargs(
+    num_microbatches: Optional[int],
+    sequence_length: Optional[int],
+    split_encoder_media: Optional[bool] = None,
+) -> dict[str, Any]:
+    """Name what the controller decided for MIMO, only when it decided it.
+
+    Only MIMO needs any of these, and only the Megatron worker accepts them:
+    the DTensor worker's entrypoints have no such parameters, so passing them
+    unconditionally would break every run on that backend.
+    """
+    return {
+        name: value
+        for name, value in (
+            ("num_microbatches", num_microbatches),
+            ("sequence_length", sequence_length),
+            ("split_encoder_media", split_encoder_media),
+        )
+        if value is not None
+    }
 
 
 class TQWorkerMixin:
@@ -849,6 +871,16 @@ class TQWorkerMixin:
 
         write_columns(self._require_dp_client(), meta, fields)
 
+    def _holds_logprob_vocabulary(self) -> bool:
+        """Whether this rank's logprob call produced rows for its lane.
+
+        Every rank but the MIMO encoder ones does. An encoder rank is handed
+        its lane's metadata so it can supply that lane's media embeddings, but
+        it holds no vocabulary, and the lane's rows are written by the language
+        rank that shares the lane.
+        """
+        return True
+
     def _write_back_result_field(
         self,
         meta: "KVBatchMeta",
@@ -918,6 +950,9 @@ class TQWorkerMixin:
         self,
         meta: "KVBatchMeta",
         micro_batch_size: Optional[int] = None,
+        num_microbatches: Optional[int] = None,
+        sequence_length: Optional[int] = None,
+        split_encoder_media: Optional[bool] = None,
     ) -> None:
         """Per-rank logprob entrypoint. Fetch → packing prep → run → write back.
 
@@ -927,19 +962,29 @@ class TQWorkerMixin:
         skipping the Ray plasma roundtrip on the (B, S) tensor.
         ``del result`` drops the local reference before returning so the
         worker doesn't carry the tensor into the next dispatch.
+
+        ``num_microbatches``, ``sequence_length`` and ``split_encoder_media``
+        come from the controller under MIMO: the encoder ranks run a forward
+        schedule they cannot derive from their own slice of the batch, and
+        whether this batch still has to be reduced to each encoder rank's
+        media range depends on which producer sent it.
         """
         data = self._fetch(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
         result: BatchedDataDict[Any] = self.get_logprobs(  # type: ignore[attr-defined]
             data=data,
             micro_batch_size=micro_batch_size,
+            **_mimo_call_kwargs(
+                num_microbatches, sequence_length, split_encoder_media
+            ),
         )
-        self._write_back_result_field(
-            meta,
-            result,
-            result_key="logprobs",
-            tq_field="prev_logprobs",
-        )
+        if self._holds_logprob_vocabulary():
+            self._write_back_result_field(
+                meta,
+                result,
+                result_key="logprobs",
+                tq_field="prev_logprobs",
+            )
         del result
 
     @accepts_trace_context
@@ -948,24 +993,32 @@ class TQWorkerMixin:
         self,
         meta: "KVBatchMeta",
         micro_batch_size: Optional[int] = None,
+        num_microbatches: Optional[int] = None,
+        sequence_length: Optional[int] = None,
+        split_encoder_media: Optional[bool] = None,
     ) -> None:
         """Per-rank reference-policy logprob entrypoint.
 
-        See :meth:`get_logprobs_presharded` for the contract. Tensor
-        lives in TQ under ``reference_policy_logprobs``.
+        See :meth:`get_logprobs_presharded` for the contract, including the
+        controller-supplied MIMO schedule. Tensor lives in TQ under
+        ``reference_policy_logprobs``.
         """
         data = self._fetch(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
         result: BatchedDataDict[Any] = self.get_reference_policy_logprobs(  # type: ignore[attr-defined]
             data=data,
             micro_batch_size=micro_batch_size,
+            **_mimo_call_kwargs(
+                num_microbatches, sequence_length, split_encoder_media
+            ),
         )
-        self._write_back_result_field(
-            meta,
-            result,
-            result_key="reference_logprobs",
-            tq_field="reference_policy_logprobs",
-        )
+        if self._holds_logprob_vocabulary():
+            self._write_back_result_field(
+                meta,
+                result,
+                result_key="reference_logprobs",
+                tq_field="reference_policy_logprobs",
+            )
         del result
 
     @accepts_trace_context
@@ -1152,6 +1205,7 @@ class TQWorkerMixin:
         meta: Optional["KVBatchMeta"],
         num_microbatches: Optional[int] = None,
         sequence_length: Optional[int] = None,
+        split_encoder_media: Optional[bool] = None,
     ) -> None:
         """Per-rank microbatch entrypoint. Fetch → packing prep → forward+backward.
 
@@ -1159,6 +1213,9 @@ class TQWorkerMixin:
         ``optimizer.step`` here. Returns nothing — per-microbatch metrics
         accumulate in the backend's open-step state and surface once via
         ``finish_train_step_presharded``.
+
+        See :meth:`get_logprobs_presharded` for the controller-supplied MIMO
+        arguments, which mean the same thing here.
         """
         started = time.monotonic()
         data = None if meta is None else self._fetch(meta)
@@ -1171,8 +1228,9 @@ class TQWorkerMixin:
         started = time.monotonic()
         self.train_microbatch(  # type: ignore[attr-defined]
             data=data,
-            num_microbatches=num_microbatches,
-            sequence_length=sequence_length,
+            **_mimo_call_kwargs(
+                num_microbatches, sequence_length, split_encoder_media
+            ),
         )
         self._add_step_phase("train_microbatch", time.monotonic() - started)
 

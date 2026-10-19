@@ -298,7 +298,6 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         chunk_size = ctx.chunk_size
         tp_group = ctx.tp_group
 
-        partition_vocab_size = int(vocab_parallel_logits.shape[-1])
         seq_size = int(vocab_parallel_logits.shape[1])
         num_chunks = (seq_size + chunk_size - 1) // chunk_size
 
@@ -311,28 +310,38 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
             logits = vocab_parallel_logits[:, chunk_start:chunk_end, :]
             logits = logits.to(dtype=torch.float32)
 
-            softmax_output = _compute_distributed_log_softmax(
+            # The gradient is (is_chosen - softmax), and the softmax buffer can
+            # carry it: negate in place, then add the indicator at the chosen
+            # vocabulary index. Building that indicator with
+            # torch.nn.functional.one_hot instead costs chunk * partition_vocab
+            # elements of int64, again for the bool multiply that masks it, and
+            # a third time in fp32 for the subtraction. At a 262272-entry
+            # vocabulary that transient, not the logits, is the largest
+            # allocation in this backward: it is what put jobs 7762681 and
+            # 7765260 out of memory, the latter asking for exactly the 1.00 GiB
+            # a 512-token chunk of it occupies.
+            chunk_grad_fp32 = _compute_distributed_log_softmax(
                 logits,
                 group=tp_group,
+            ).exp()
+            chunk_grad_fp32.neg_()
+            # src is 1 where the position contributes and 0 where it is masked,
+            # which reproduces the masked one-hot: a masked row adds 0.0, and
+            # masked_target already holds 0 for targets outside this partition.
+            chunk_grad_fp32.scatter_add_(
+                -1,
+                masked_target[:, chunk_start:chunk_end].unsqueeze(-1),
+                (~(target_mask[:, chunk_start:chunk_end]))
+                .unsqueeze(-1)
+                .to(chunk_grad_fp32.dtype),
             )
-            softmax_output = softmax_output.exp()
-
-            # 1 if it's the chosen log prob, 0 otherwise
-            is_chosen = (~(target_mask[:, chunk_start:chunk_end])).unsqueeze(
-                -1
-            ) * torch.nn.functional.one_hot(
-                masked_target[:, chunk_start:chunk_end],
-                num_classes=partition_vocab_size,
-            )
-
-            chunk_grad_fp32 = is_chosen.float().sub_(softmax_output)
             chunk_grad_fp32.mul_(
                 grad_output[:, chunk_start:chunk_end].unsqueeze(dim=-1)
             )
             grad_input[:, chunk_start:chunk_end, :].copy_(chunk_grad_fp32)
 
             # Explicitly free before next iteration allocates
-            del softmax_output, is_chosen, logits, chunk_grad_fp32
+            del logits, chunk_grad_fp32
 
         # if you add an argument to the forward method, then you must add a corresponding None here
         return grad_input, None, None, None, None, None, None
@@ -963,6 +972,7 @@ def from_parallel_logits_to_logprobs(
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     chunk_size: Optional[int] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
+    cp_layout: str = "zigzag",
 ) -> torch.Tensor:
     """Get log probabilities from TP+CP sharded vocab logits.
 
@@ -978,6 +988,10 @@ def from_parallel_logits_to_logprobs(
         cp_group (torch.distributed.ProcessGroup, optional): Context parallelism process group. Defaults to None.
         chunk_size (int, optional): Sequence dimension chunk size for computing the log probabilities.
         sampling_params (TrainingSamplingParams, optional): Sampling parameters for Top-k/Top-p filtering and temperature scaling.
+        cp_layout (str): The context-parallel order ``vocab_parallel_logits``
+            arrived in, used both to choose the targets and to put the gathered
+            log-probabilities back in sequence order. Defaults to the zigzag
+            split NeMo-RL shards its own batches with.
 
     Returns:
         torch.Tensor: Log probabilities tensor with shape [batch_size, seq_len-1].
@@ -996,7 +1010,9 @@ def from_parallel_logits_to_logprobs(
 
     # Shard the targets by context parallelism
     cp_rank = torch.distributed.get_rank(cp_group)
-    target = _get_tokens_on_this_cp_rank(target, cp_rank, cp_size, seq_dim=1)
+    target = _get_tokens_on_this_cp_rank_for_layout(
+        target, cp_rank, cp_size, cp_layout, seq_dim=1
+    )
 
     if need_top_k_or_top_p_filtering(sampling_params):
         if chunk_size is not None:
@@ -1042,7 +1058,7 @@ def from_parallel_logits_to_logprobs(
     if cp_size > 1:
         # we need to gather the logits by context parallelism
         logprobs = allgather_cp_sharded_tensor(
-            logprobs, cp_group, seq_dim=1
+            logprobs, cp_group, seq_dim=1, cp_layout=cp_layout
         )  # , unpadded_seqlen=target.shape[1])
 
     if pad_len > 0:
@@ -1065,6 +1081,7 @@ def from_parallel_logits_to_logprobs_packed_sequences(
     sampling_params: Optional[TrainingSamplingParams] = None,
     target_is_pre_rolled: bool = False,
     return_packed_layout: bool = False,
+    cp_layout: str = "zigzag",
 ) -> torch.Tensor:
     """Get log probabilities from TP sharded vocab logits for packed sequences.
 
@@ -1091,6 +1108,10 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         return_packed_layout (bool): Keep the physical ``[1, T-1]`` layout.
             This is used when the input data was packed before it reached the
             model worker.
+        cp_layout (str): The context-parallel order ``vocab_parallel_logits``
+            arrived in, so the targets can be chosen to match. Defaults to the
+            zigzag split NeMo-RL shards its own batches with; a model that
+            partitions the batch itself may hand back ``'contiguous'``.
 
     Returns:
         torch.Tensor: Log probabilities in unpacked ``[batch_size,
@@ -1107,8 +1128,15 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         target = target.squeeze(0)
         cp_rank = 0 if cp_group is None else torch.distributed.get_rank(cp_group)
 
+        # A contiguous shard is cut from the finished pack rather than from
+        # each sequence in it, so the roll is done across the whole row and
+        # this rank's block taken afterwards. Only the zigzag split is built
+        # sequence by sequence.
+        shard_each_sequence = cp_size > 1 and cp_layout == "zigzag"
         rolled_targets = torch.zeros(
-            target.shape[0] // cp_size, dtype=target.dtype, device=target.device
+            target.shape[0] // cp_size if shard_each_sequence else target.shape[0],
+            dtype=target.dtype,
+            device=target.device,
         )
         for i in range(batch_size):
             start_idx = cu_seqlens_padded[i]
@@ -1116,11 +1144,19 @@ def from_parallel_logits_to_logprobs_packed_sequences(
 
             seq_targets = target[start_idx:end_idx]
             rolled_seq_targets = seq_targets.roll(shifts=-1, dims=0)
-            rolled_targets[start_idx // cp_size : end_idx // cp_size] = (
-                _get_tokens_on_this_cp_rank(
-                    rolled_seq_targets, cp_rank, cp_size, seq_dim=0
+            if shard_each_sequence:
+                rolled_targets[start_idx // cp_size : end_idx // cp_size] = (
+                    _get_tokens_on_this_cp_rank_for_layout(
+                        rolled_seq_targets, cp_rank, cp_size, cp_layout, seq_dim=0
+                    )
                 )
-            )
+            else:
+                rolled_targets[start_idx:end_idx] = rolled_seq_targets
+        if cp_size > 1 and not shard_each_sequence:
+            shard_len = rolled_targets.shape[0] // cp_size
+            rolled_targets = rolled_targets.narrow(
+                0, cp_rank * shard_len, shard_len
+            ).contiguous()
 
         target = rolled_targets.unsqueeze(0)
         vocab_parallel_logits = vocab_parallel_logits.unsqueeze(0)
@@ -1178,15 +1214,26 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         )
 
     if cp_size > 1:
-        # per-sequence cp_allgather
-        final_probs = torch.zeros(probs.shape[0] * cp_size, device=probs.device)
-        for i in range(batch_size):
-            start_idx = cu_seqlens_padded[i]
-            end_idx = cu_seqlens_padded[i + 1]
-            final_probs[start_idx:end_idx] = allgather_cp_sharded_tensor(
-                probs[start_idx // cp_size : end_idx // cp_size], cp_group, seq_dim=0
+        if cp_layout == "contiguous":
+            # One gather over the whole row, because that is how the shard was
+            # cut: rank order is pack order, and a sequence boundary need not
+            # fall on a rank boundary at all.
+            probs = allgather_cp_sharded_tensor(
+                probs, cp_group, seq_dim=0, cp_layout=cp_layout
             )
-        probs = final_probs
+        else:
+            # per-sequence cp_allgather
+            final_probs = torch.zeros(probs.shape[0] * cp_size, device=probs.device)
+            for i in range(batch_size):
+                start_idx = cu_seqlens_padded[i]
+                end_idx = cu_seqlens_padded[i + 1]
+                final_probs[start_idx:end_idx] = allgather_cp_sharded_tensor(
+                    probs[start_idx // cp_size : end_idx // cp_size],
+                    cp_group,
+                    seq_dim=0,
+                    cp_layout=cp_layout,
+                )
+            probs = final_probs
 
     if return_packed_layout:
         return probs[:-1].unsqueeze(0)
@@ -1212,6 +1259,33 @@ def from_parallel_logits_to_logprobs_packed_sequences(
                 out_logprobs[i, :seq_len] = seq_probs[:seq_len]
 
     return out_logprobs
+
+
+def _get_tokens_on_this_cp_rank_for_layout(
+    input_ids: torch.Tensor,
+    cp_rank: int,
+    cp_size: int,
+    cp_layout: str,
+    seq_dim: int = 1,
+) -> torch.Tensor:
+    """Take this rank's tokens under the context-parallel layout in use.
+
+    NeMo-RL shards its own batches zigzag, to balance causal attention, and
+    every collector reads them back the same way. A model that partitions the
+    batch itself can hand back a different order, so the targets have to be
+    chosen in whichever one the logits arrived in.
+    """
+    if cp_size == 1:
+        return input_ids
+    if cp_layout == "zigzag":
+        return _get_tokens_on_this_cp_rank(input_ids, cp_rank, cp_size, seq_dim=seq_dim)
+    if cp_layout == "contiguous":
+        shard_size = input_ids.shape[seq_dim] // cp_size
+        return input_ids.narrow(seq_dim, cp_rank * shard_size, shard_size).contiguous()
+    raise ValueError(
+        f"Unknown context-parallel layout {cp_layout!r}; expected 'zigzag' or "
+        "'contiguous'."
+    )
 
 
 def _get_tokens_on_this_cp_rank(
@@ -1252,9 +1326,11 @@ def _get_tokens_on_this_cp_rank(
 
 
 def allgather_cp_sharded_tensor(
-    tensor, cp_group, seq_dim=1
+    tensor, cp_group, seq_dim=1, cp_layout="zigzag"
 ):  # , unpadded_seqlen=None):
-    return AllGatherCPTensor.apply(tensor, cp_group, seq_dim)  # , unpadded_seqlen)
+    return AllGatherCPTensor.apply(
+        tensor, cp_group, seq_dim, cp_layout
+    )  # , unpadded_seqlen)
 
 
 class _AllReduceSum(torch.autograd.Function):
@@ -1332,7 +1408,11 @@ def group_all_reduce_sum(
 
 class AllGatherCPTensor(torch.autograd.Function):
     def forward(
-        ctx, tensor, cp_group: torch.distributed.ProcessGroup, seq_dim=1
+        ctx,
+        tensor,
+        cp_group: torch.distributed.ProcessGroup,
+        seq_dim=1,
+        cp_layout: str = "zigzag",
     ):  # , unpadded_seqlen: Optional[int] = None):
         cp_size = torch.distributed.get_world_size(cp_group)
         cp_rank_chunks = []
@@ -1343,23 +1423,35 @@ class AllGatherCPTensor(torch.autograd.Function):
             tensor_list=cp_rank_chunks, tensor=tensor, group=cp_group
         )
 
-        # undo the CP load balancing chunking
-        tensor_chunks = []
-        for logit_chunk in cp_rank_chunks:
-            tensor_chunks.extend(torch.chunk(logit_chunk, chunks=2, dim=seq_dim))
+        if cp_layout == "contiguous":
+            # Rank order is already sequence order; there is no interleave to
+            # undo, which is the layout a model that partitions its own batch
+            # leaves behind when its linear layers run chunkwise.
+            ret_tensor = torch.cat(cp_rank_chunks, dim=seq_dim)
+        elif cp_layout == "zigzag":
+            # undo the CP load balancing chunking
+            tensor_chunks = []
+            for logit_chunk in cp_rank_chunks:
+                tensor_chunks.extend(torch.chunk(logit_chunk, chunks=2, dim=seq_dim))
 
-        chunk_indices = []
-        for cp_rank in range(cp_size):
-            chunk_indices.append(cp_rank)
-            chunk_indices.append(2 * cp_size - cp_rank - 1)
+            chunk_indices = []
+            for cp_rank in range(cp_size):
+                chunk_indices.append(cp_rank)
+                chunk_indices.append(2 * cp_size - cp_rank - 1)
 
-        chunks_and_indices = list(zip(tensor_chunks, chunk_indices))
-        chunks_and_indices = sorted(chunks_and_indices, key=lambda tup: tup[1])
-        ret_tensor = [chunk for chunk, _ in chunks_and_indices]
-        ret_tensor = torch.cat(ret_tensor, dim=seq_dim)
+            chunks_and_indices = list(zip(tensor_chunks, chunk_indices))
+            chunks_and_indices = sorted(chunks_and_indices, key=lambda tup: tup[1])
+            ret_tensor = [chunk for chunk, _ in chunks_and_indices]
+            ret_tensor = torch.cat(ret_tensor, dim=seq_dim)
+        else:
+            raise ValueError(
+                f"Unknown context-parallel layout {cp_layout!r}; expected "
+                "'zigzag' or 'contiguous'."
+            )
 
         ctx.seq_dim = seq_dim
         ctx.cp_group = cp_group
+        ctx.cp_layout = cp_layout
         # ctx.unpadded_seqlen = unpadded_seqlen
 
         return ret_tensor
@@ -1368,6 +1460,17 @@ class AllGatherCPTensor(torch.autograd.Function):
         cp_size = torch.distributed.get_world_size(ctx.cp_group)
         cp_rank = torch.distributed.get_rank(ctx.cp_group)
         torch.distributed.all_reduce(grad_output, group=ctx.cp_group)
+        if ctx.cp_layout == "contiguous":
+            seq_dim = ctx.seq_dim
+            shard_size = grad_output.shape[seq_dim] // cp_size
+            return (
+                grad_output.narrow(
+                    seq_dim, cp_rank * shard_size, shard_size
+                ).contiguous(),
+                None,
+                None,
+                None,
+            )
 
         # chunk the seqdim in 2*cp chunks, and select with a CP load balanced indexing
         seq_dim = ctx.seq_dim
@@ -1393,7 +1496,7 @@ class AllGatherCPTensor(torch.autograd.Function):
             *grad_input.shape[0:seq_dim], -1, *grad_input.shape[(seq_dim + 2) :]
         )
 
-        return grad_input, None, None  # , None
+        return grad_input, None, None, None  # , None
 
 
 def cp_shift_next(
@@ -1613,6 +1716,7 @@ def get_next_token_logprobs_from_logits(
     sampling_params: Optional[TrainingSamplingParams] = None,
     chunk_size: Optional[int] = None,
     cp_sharder: Optional["ContextParallelSharder"] = None,
+    cp_layout: str = "zigzag",
 ) -> torch.Tensor:
     """Compute token log-probabilities from logits, handling parallel and non-parallel cases.
 
@@ -1662,11 +1766,17 @@ def get_next_token_logprobs_from_logits(
             cp_group=context_parallel_group,
             sampling_params=sampling_params,
             chunk_size=chunk_size if use_chunking else None,
+            cp_layout=cp_layout,
         )
         # slice off to the correct length to remove potential CP padding
         logprobs = logprobs[:, : input_ids.shape[1] - 1]
 
     elif cp_sharder is not None:
+        if cp_layout != "zigzag":
+            raise NotImplementedError(
+                f"The sharder path cannot read logits in the {cp_layout!r} "
+                "context-parallel layout."
+            )
         logprobs = get_cp_sharded_next_token_logprobs(
             next_token_logits,
             input_ids,

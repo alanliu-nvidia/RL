@@ -192,6 +192,16 @@ def is_nccl_reshard_param(param_name: str) -> bool:
     ``load_weights`` path.
 
     Shared-expert FFN weights (``*.shared_expert.*``) are routed to misc path.
+    A VLM's vision tower and projector go to misc as well. Their FFN weights
+    match the suffixes below, but the bulk path requires every param on it to
+    share one ``layers.N`` prefix -- the caller asserts it, and the PP-stage
+    mapping it feeds assumes language-model layer numbering. A vision tower
+    contributes a second prefix (``model.vision_tower.transformer`` against
+    ``model.language_model``) and trips that assert, which is what job 1169269
+    died on. Sending them to misc costs almost nothing: the tower is a
+    rounding error beside 512 experts, and for NT4 Nano vLLM discards the
+    vision weights on arrival anyway (its nemotron4 weight mapper maps
+    ``model.vision_tower.`` to None).
     Bare ``mtp.``-prefixed HF names are routed to misc too, because vLLM keeps
     the MTP drafter separate and updates it through ``load_weights``. That only
     covers families whose HF names keep the ``mtp.`` prefix. DeepSeek exports
@@ -202,6 +212,8 @@ def is_nccl_reshard_param(param_name: str) -> bool:
     if "shared_expert" in param_name:
         return False
     if param_name.startswith("mtp."):
+        return False
+    if "vision_tower" in param_name or "multi_modal_projector" in param_name:
         return False
     return param_name.endswith(FFN_PROJ_WEIGHT_SUFFIXES) or param_name.endswith(
         FFN_GROUPED_EXPERT_SUFFIXES

@@ -34,6 +34,7 @@ from typing_extensions import Self
 from nemo_rl.data.multimodal_utils import (
     MIMO_MEDIA_OUTPUT_COUNTS_KEY,
     MULTIMODAL_CONTENT_TYPES,
+    HOST_MULTIMODAL_FIELDS,
     PACKED_MULTIMODAL_FIELDS,
     PER_TOKEN_MULTIMODAL_FIELDS,
     VLLM_PROMPT_KEYS,
@@ -202,7 +203,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 preprocess_mode = pixel_preprocess_mode if k == "pixel_values" else None
                 result[k] = (
                     v.as_tensor(
-                        device="cpu" if k == "imgs_sizes" else device,
+                        device="cpu" if k in HOST_MULTIMODAL_FIELDS else device,
                         mode=preprocess_mode,
                     )
                     if as_tensors
@@ -1134,11 +1135,15 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         return self.data[key].shape[0]  # type: ignore # it's a tensor here
 
     def to(self, device: str | torch.device) -> Self:
-        """Move tensors in batched dict to device."""
+        """Move tensors in batched dict to device.
+
+        ``HOST_MULTIMODAL_FIELDS`` are exempt: the model reads them in Python
+        and Megatron's dynamic-resolution ViT rejects them outright when they
+        are not on the host.
+        """
         for k, v in self.data.items():
-            # ViT reads image geometry on the host; keep it off CUDA. MIMO media
-            # output counts are host metadata for shape checks only.
-            if k in ("imgs_sizes", MIMO_MEDIA_OUTPUT_COUNTS_KEY):
+            # ViT reads image geometry on the host; keep it off CUDA.
+            if k in HOST_MULTIMODAL_FIELDS:
                 continue
             if torch.is_tensor(v):
                 self.data[k] = v.to(device)

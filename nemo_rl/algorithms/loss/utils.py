@@ -386,6 +386,7 @@ def _pack_input_ids(
     cp_rank: int = 0,
     cp_size: int = 1,
     roll_shift: int = 0,
+    cp_layout: str = "zigzag",
 ) -> torch.Tensor:
     """Pack input_ids from [B, S] to [1, T_packed // CP] using sequence boundaries.
 
@@ -393,6 +394,13 @@ def _pack_input_ids(
     cu_seqlens_q_padded), optionally rolled, and CP-sharded at that padded
     length before being placed into the packed output.  This matches how
     Megatron packs and CP-shards sequences in _pack_sequences_for_megatron.
+
+    The contiguous layout is the exception, and is split after packing rather
+    than during it. Megatron's contiguous sharder narrows the finished row and
+    never reads cu_seqlens (``_get_batch_on_this_cp_rank_contiguous``), so a
+    rank can hold whole sequences and none of their neighbours. Sharding each
+    sequence separately would agree with that only while a pack holds exactly
+    one sequence.
 
     Args:
         input_ids: Unpacked input IDs [B, S].
@@ -403,9 +411,21 @@ def _pack_input_ids(
         roll_shift: If non-zero, roll each padded sequence by this amount
             before CP-sharding.  Use -1 to build shifted targets for
             next-token prediction.
+        cp_layout: The context-parallel order the model splits its batch in,
+            'zigzag' or 'contiguous'.
     """
+    if cp_layout not in ("zigzag", "contiguous"):
+        raise ValueError(
+            f"Unknown context-parallel layout {cp_layout!r}; expected 'zigzag' "
+            "or 'contiguous'."
+        )
     batch_size = input_ids.shape[0]
-    total_packed_len = cu_seqlens_q_padded[-1] // cp_size
+    shard_each_sequence = cp_size > 1 and cp_layout == "zigzag"
+    total_packed_len = (
+        cu_seqlens_q_padded[-1] // cp_size
+        if shard_each_sequence
+        else cu_seqlens_q_padded[-1]
+    )
     packed = torch.zeros(
         total_packed_len, dtype=input_ids.dtype, device=input_ids.device
     )
@@ -422,8 +442,13 @@ def _pack_input_ids(
         seq[:copy_len] = input_ids[i, :copy_len]
         if roll_shift != 0:
             seq = seq.roll(shifts=roll_shift, dims=0)
-        sharded = _get_tokens_on_this_cp_rank(seq, cp_rank, cp_size, seq_dim=0)
-        packed[packed_start // cp_size : (packed_start + padded_len) // cp_size] = (
-            sharded
-        )
+        if shard_each_sequence:
+            packed[packed_start // cp_size : (packed_start + padded_len) // cp_size] = (
+                _get_tokens_on_this_cp_rank(seq, cp_rank, cp_size, seq_dim=0)
+            )
+        else:
+            packed[packed_start : packed_start + padded_len] = seq
+    if cp_size > 1 and not shard_each_sequence:
+        shard_len = packed.shape[0] // cp_size
+        packed = packed.narrow(0, cp_rank * shard_len, shard_len).contiguous()
     return packed.unsqueeze(0)

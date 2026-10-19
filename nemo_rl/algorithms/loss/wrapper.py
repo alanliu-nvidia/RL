@@ -56,6 +56,7 @@ class SequencePackingLossWrapper:
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        cp_layout: str = "zigzag",
     ):
         """Wrap a loss function to handle sequence packing.
 
@@ -82,6 +83,25 @@ class SequencePackingLossWrapper:
         self.vocab_parallel_rank = vocab_parallel_rank
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
+        # This wrapper reaches each sequence's logits by narrowing to
+        # seq_start // cp_size, which only locates them while every sequence
+        # is sharded separately. A contiguous shard is cut from the finished
+        # pack instead, so a rank can hold whole sequences and none of their
+        # neighbours, and the narrow would silently read the wrong tokens.
+        # One sequence per pack is the case where the two coincide.
+        if (
+            cp_layout != "zigzag"
+            and context_parallel_group is not None
+            and torch.distributed.get_world_size(context_parallel_group) > 1
+            and len(self.cu_seqlens_q_padded) - 1 > 1
+        ):
+            raise NotImplementedError(
+                f"Sequence-packed loss in the {cp_layout!r} context-parallel "
+                f"layout cannot be taken one sequence at a time when a pack "
+                f"holds {len(self.cu_seqlens_q_padded) - 1} of them. Enable "
+                "policy.sequence_packing.fuse_loss, which scores the whole "
+                "pack in one call."
+            )
 
     def __call__(
         self,
@@ -210,6 +230,7 @@ class SequencePackingFusionLossWrapper:
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        cp_layout: str = "zigzag",
     ):
         self.loss_fn = loss_fn
         self.prepare_fn = prepare_fn
@@ -220,6 +241,10 @@ class SequencePackingFusionLossWrapper:
         self.vocab_parallel_rank = vocab_parallel_rank
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
+        # Accepted so both wrappers take the same arguments; the layout itself
+        # reaches the computation through prepare_fn, which scores the whole
+        # pack and so needs no per-sequence addressing of its own.
+        self.cp_layout = cp_layout
 
     def __call__(
         self,

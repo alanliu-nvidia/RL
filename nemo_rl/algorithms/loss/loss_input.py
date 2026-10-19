@@ -210,6 +210,7 @@ def prepare_loss_input(
     chunk_size: Optional[int] = None,
     cp_sharder: Optional["ContextParallelSharder"] = None,
     teacher_output_layer_weight_by_index: Optional[dict[int, torch.Tensor]] = None,
+    cp_layout: str = "zigzag",
 ) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
     """Prepare loss input for a loss function.
 
@@ -265,6 +266,7 @@ def prepare_loss_input(
                 sampling_params=sampling_params,
                 chunk_size=chunk_size,
                 cp_sharder=cp_sharder,
+                cp_layout=cp_layout,
             )
 
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
@@ -289,6 +291,7 @@ def prepare_loss_input(
                     # Only reachable with top-k/top-p sampling active that has its own kernel path so don't chunk here
                     chunk_size=None,
                     cp_sharder=cp_sharder,
+                    cp_layout=cp_layout,
                 )
 
         loss_input = {"next_token_logprobs": logprobs}
@@ -471,6 +474,7 @@ def prepare_packed_loss_input(
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     chunk_size: Optional[int] = None,
+    cp_layout: str = "zigzag",
 ) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
     """Prepare loss input from packed logits in a single fused pass.
 
@@ -495,6 +499,9 @@ def prepare_packed_loss_input(
         chunk_size: Sequence-dim chunk size for the logprob computation
             (policy.logprob_chunk_size); avoids materializing full-size
             float32 logits during training.
+        cp_layout: The context-parallel order the logits arrived in. A model
+            that partitions its own batch may hand back 'contiguous' instead
+            of the zigzag split NeMo-RL shards its own batches with.
 
     Returns:
         tuple(loss_input, maybe_updated_data)
@@ -539,6 +546,7 @@ def prepare_packed_loss_input(
             cp_rank=cp_rank,
             cp_size=cp_size,
             roll_shift=-1,
+            cp_layout=cp_layout,
         )
 
     # With chunking, keep logits in their original dtype: the chunked logprob
@@ -562,6 +570,7 @@ def prepare_packed_loss_input(
         chunk_size=chunk_size if use_chunking else None,
         target_is_pre_rolled=not input_is_prepacked,
         return_packed_layout=input_is_prepacked,
+        cp_layout=cp_layout,
     )
 
     if "answer_token_mask" in data:
@@ -617,6 +626,7 @@ def prepare_packed_loss_input(
                     chunk_size=chunk_size if use_chunking else None,
                     target_is_pre_rolled=not input_is_prepacked,
                     return_packed_layout=input_is_prepacked,
+                    cp_layout=cp_layout,
                 )
             )
 

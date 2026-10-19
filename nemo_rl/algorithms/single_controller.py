@@ -772,6 +772,27 @@ class SingleControllerActor:
         """Start the rollout / train / watchdog pumps and run until one finishes."""
         # Synchronize weights before starting the pumps, unless setup already delivered them.
         if self._weight_synchronizer.is_stale:
+            # Park the optimizer first, for the same reason the post-step refit
+            # does (see the comment above its own offload_before_refit call):
+            # the refit stages weights into a packed broadcast buffer on the
+            # trainer, and that buffer has to fit alongside whatever the policy
+            # is already holding. This call used to be missing here, so the
+            # *initial* refit -- the only one that runs before any training
+            # step -- staged its buffer on top of a fully resident optimizer.
+            #
+            # That is what full scale kept dying on. Setup rests at 117 GiB
+            # (70 GiB weights + grad buffers, 47 GiB optimizer; identical at 8
+            # and 24 nodes), and job 1169981 then OOMed during the first refit
+            # with 264 GiB resident. Its payload split shows why the refit
+            # needs room: 186.54 GiB total, of which only 84.56 GiB takes the
+            # nccl_reshard path and 101.97 GiB still rides the packed
+            # broadcast.
+            #
+            # prepare_for_training onloads it again at the top of the first
+            # training step, exactly as on the post-step path. Gated
+            # worker-side by offload_optimizer_for_refit, which defaults True.
+            with self._timer.time("offload_before_refit"):
+                await asyncio.to_thread(self._trainer.offload_before_refit)
             await self._sync_weights()
         self._rollout_manager.set_weight_version(self._trainer_version)
 
@@ -1747,13 +1768,11 @@ class SingleControllerActor:
     ) -> Optional["FinalizedGroup"]:
         """Finalize and index one group atomically with respect to TQ saves.
 
-        Returns the committed FinalizedGroup once the group is committed to
-        the replay buffer (callers may read valid_row_count/total_row_count
-        off it to decide whether the group is worth keeping), or None when
-        the finalizer itself dropped it as a structural outcome (ownership
-        already cleaned up; the caller credits the step short). A low
-        valid-row fraction is no longer a finalizer-side drop -- the caller
-        decides that, since only the caller can source a replacement.
+        Returns a FinalizedGroup after either committing it to the replay
+        buffer or cleaning it up for failing the valid-row threshold. The
+        caller reads its valid-row counts to source a replacement for the
+        latter; rejected groups are never visible to the train pump. Returns
+        None for a structural finalizer drop, with ownership already cleaned.
         """
         self._finalizer_waiters += 1
         queue_depth = max(
@@ -1833,6 +1852,22 @@ class SingleControllerActor:
                         "finalizer returned no metadata for non-dropped group "
                         f"{request.group_id}"
                     )
+                elif (
+                    (
+                        min_valid_fraction
+                        := self._master_config.token_capture.min_valid_fraction_per_group
+                    )
+                    is not None
+                    and finalized.total_row_count > 0
+                    and finalized.valid_row_count / finalized.total_row_count
+                    < min_valid_fraction
+                ):
+                    # The train pump can consume a group immediately after commit.
+                    # Reject and clean it before exposing any replay metadata.
+                    await self._cleanup_known_finalization_request_unlocked(
+                        cut, request
+                    )
+                    return finalized
                 else:
                     try:
                         await self._buffer.commit_finalized(
@@ -2074,18 +2109,8 @@ class SingleControllerActor:
                                 self._credit_shortfall(target_step)
                                 return
                             finalized = await self._finalize_with_actor(request)
-                            if finalized is None:
-                                # Finalizer dropped the group as a structural
-                                # outcome (e.g. router replay with no routed
-                                # data yet); ownership was already cleaned up,
-                                # so like the dropped-prompt path above the
-                                # train pump will never release this permit
-                                # and the step must be allowed to close short.
-                                self._buffer_capacity.release()
-                                self._credit_shortfall(target_step)
-                                return
                             min_valid_fraction = self._master_config.token_capture.min_valid_fraction_per_group
-                            below_threshold = (
+                            below_threshold = finalized is None or (
                                 min_valid_fraction is not None
                                 and finalized.total_row_count > 0
                                 and finalized.valid_row_count
@@ -2096,28 +2121,24 @@ class SingleControllerActor:
                                 self._rollout_manager.stats.committed += 1
                                 ownership_transferred = True
                                 break
-                            # Enough rows verified to publish, but too few to
-                            # be worth training on. Unlike the finalizer's own
-                            # structural drops above, this is a policy call
-                            # only the controller can act on: it is the one
-                            # component that can source a replacement.
-                            try:
-                                await self._cleanup_known_finalization_request(request)
-                            except BaseException as cleanup_error:
-                                raise RuntimeError(
-                                    "finalizer group fell below "
-                                    "min_valid_fraction_per_group and "
-                                    "known-key cleanup failed for group "
-                                    f"{request.group_id}"
-                                ) from cleanup_error
-                            print(
-                                f"  finalize: group {request.group_id} below "
-                                "min_valid_fraction_per_group "
-                                f"({finalized.valid_row_count}/"
-                                f"{finalized.total_row_count} < "
-                                f"{min_valid_fraction}); seeking a replacement",
-                                flush=True,
-                            )
+                            # Structural and quality rejections were cleaned before
+                            # publication. Both can use the configured spare pool
+                            # to preserve the step's full prompt-group count.
+                            if finalized is None:
+                                print(
+                                    f"  finalize: group {request.group_id} dropped; "
+                                    "seeking a replacement",
+                                    flush=True,
+                                )
+                            else:
+                                print(
+                                    f"  finalize: group {request.group_id} below "
+                                    "min_valid_fraction_per_group "
+                                    f"({finalized.valid_row_count}/"
+                                    f"{finalized.total_row_count} < "
+                                    f"{min_valid_fraction}); seeking a replacement",
+                                    flush=True,
+                                )
                             replacement = self._take_replacement(
                                 target_step, replacements
                             )
@@ -3333,6 +3354,14 @@ class SingleControllerActor:
                         with self._timer.time("offload_before_refit"):
                             await asyncio.to_thread(self._trainer.offload_before_refit)
                     else:
+                        # The refit has to stage weights into a packed broadcast
+                        # buffer on a rank that just finished a training step, so
+                        # park the optimizer first -- exactly as the deferred branch
+                        # above does before its save. prepare_for_training brings it
+                        # back at the top of the next step. Gated worker-side by
+                        # offload_optimizer_for_refit.
+                        with self._timer.time("offload_before_refit"):
+                            await asyncio.to_thread(self._trainer.offload_before_refit)
                         # Named to match async GRPO's refit phase: training cannot
                         # proceed and generation is serving stale weights, so the
                         # same seconds are idle on both fleets.
