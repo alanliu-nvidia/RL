@@ -522,6 +522,258 @@ def _patch_vllm_shm_broadcast_bind_retry(logger) -> None:
         )
 
 
+_RADIO_FINAL_LAYERNORM_MARKER = "# NeMo-RL backport of vLLM commit 5dc66ef26f."
+
+
+def _replace_radio_ln_once(source: str, old: str, new: str, description: str) -> str:
+    count = source.count(old)
+    if count != 1:
+        raise RuntimeError(
+            f"Expected exactly one {description} insertion point, found {count}. "
+            "The installed vLLM source does not match the qualified 0.29.0 layout."
+        )
+    return source.replace(old, new, 1)
+
+
+def _radio_final_layernorm_source(source: str) -> tuple[str, bool]:
+    """Return patched source and whether a modification was required."""
+    required_fragments = (
+        "self.vision_final_layernorm",
+        "def _apply_vision_final_layernorm",
+        '"vision_projector.vision_final_layernorm."',
+        '"vision_final_layernorm"',
+        "_loaded_vision_final_layernorm_params",
+        "self._vision_final_layernorm_enabled = True",
+        "return self.vision_final_layernorm(vit_embeds.float()).to(output_dtype)",
+        "final_layernorm_weights.append(",
+    )
+    if (
+        _RADIO_FINAL_LAYERNORM_MARKER in source
+        or "def _apply_vision_final_layernorm" in source
+    ):
+        missing = [
+            fragment for fragment in required_fragments if fragment not in source
+        ]
+        if (
+            source.count("vit_embeds = self._apply_vision_final_layernorm(vit_embeds)")
+            != 2
+        ):
+            missing.append("both image/video forward hooks")
+        if missing:
+            raise RuntimeError(
+                f"Existing RADIO final-LayerNorm patch is incomplete: {missing}"
+            )
+        return source, False
+
+    source = _replace_radio_ln_once(
+        source,
+        """            self.mlp1 = mlp1.to(llm_dtype)
+            self.sound_encoder: ProjectedParakeet | None = None
+""",
+        f"""            self.mlp1 = mlp1.to(llm_dtype)
+            {_RADIO_FINAL_LAYERNORM_MARKER}
+            self.vision_final_layernorm: nn.LayerNorm | None = None
+            if (getattr(config.text_config, "num_nextn_predict_layers", 0) or 0) > 0:
+                # Megatron adds this post-RADIO norm when the inherited vision
+                # config has MTP enabled. Keep it available for dummy-load +
+                # refit, but do not apply it until its checkpoint tensors load.
+                self.vision_final_layernorm = nn.LayerNorm(
+                    vit_hidden_size,
+                    eps=getattr(vision_config, "layer_norm_eps", 1.0e-6),
+                ).float()
+            self._loaded_vision_final_layernorm_params: set[str] = set()
+            self._vision_final_layernorm_enabled = False
+            self.sound_encoder: ProjectedParakeet | None = None
+""",
+        "model initialization",
+    )
+
+    source = _replace_radio_ln_once(
+        source,
+        """    def extract_feature_dynamic(
+""",
+        """    def _apply_vision_final_layernorm(
+        self, vit_embeds: torch.Tensor
+    ) -> torch.Tensor:
+        if not self._vision_final_layernorm_enabled:
+            return vit_embeds
+        assert self.vision_final_layernorm is not None
+        output_dtype = vit_embeds.dtype
+        return self.vision_final_layernorm(vit_embeds.float()).to(output_dtype)
+
+    def extract_feature_dynamic(
+""",
+        "LayerNorm helper",
+    )
+
+    source = _replace_radio_ln_once(
+        source,
+        """        _, vit_embeds = self.vision_model(pixel_values, imgs_sizes=imgs_sizes)
+        vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+""",
+        """        _, vit_embeds = self.vision_model(pixel_values, imgs_sizes=imgs_sizes)
+        vit_embeds = self._apply_vision_final_layernorm(vit_embeds)
+        vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+""",
+        "dynamic-image forward",
+    )
+
+    source = _replace_radio_ln_once(
+        source,
+        """            else:
+                _, vit_embeds = self.vision_model(chunk)
+            vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+""",
+        """            else:
+                _, vit_embeds = self.vision_model(chunk)
+            vit_embeds = self._apply_vision_final_layernorm(vit_embeds)
+            vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+""",
+        "fixed/chunked image-video forward",
+    )
+
+    source = _replace_radio_ln_once(
+        source,
+        """            connector=["mlp1", "sound_encoder.projection"],
+""",
+        """            connector=[
+                "mlp1",
+                "vision_final_layernorm",
+                "sound_encoder.projection",
+            ],
+""",
+        "multimodal connector mapping",
+    )
+
+    source = _replace_radio_ln_once(
+        source,
+        """        adapter_dict = dict(self.mlp1.named_parameters())
+
+        def is_llm(name: str) -> bool:
+""",
+        """        adapter_dict = dict(self.mlp1.named_parameters())
+        final_layernorm = getattr(self, "vision_final_layernorm", None)
+        final_layernorm_dict = (
+            dict(final_layernorm.named_parameters())
+            if load_multimodal_weights and final_layernorm is not None
+            else {}
+        )
+
+        def is_llm(name: str) -> bool:
+""",
+        "LayerNorm parameter map",
+    )
+
+    source = _replace_radio_ln_once(
+        source,
+        """        def is_adapter_weights(weight: tuple[str, torch.Tensor]):
+            return weight[0].startswith("mlp1")
+
+        def is_vision_weights(name: str) -> bool:
+""",
+        """        def is_adapter_weights(weight: tuple[str, torch.Tensor]):
+            return weight[0].startswith("mlp1")
+
+        def get_final_layernorm_name(name: str) -> str | None:
+            for source_prefix in (
+                "vision_final_layernorm.",
+                "vision_projector.vision_final_layernorm.",
+            ):
+                if name.startswith(source_prefix):
+                    return name.removeprefix(source_prefix)
+            return None
+
+        def is_vision_weights(name: str) -> bool:
+""",
+        "LayerNorm checkpoint-name mapper",
+    )
+
+    source = _replace_radio_ln_once(
+        source,
+        """        adapter_weights: list[tuple[str, torch.Tensor]] = []
+        vision_weights: list[tuple[str, torch.Tensor]] = []
+""",
+        """        adapter_weights: list[tuple[str, torch.Tensor]] = []
+        final_layernorm_weights: list[tuple[str, torch.Tensor]] = []
+        vision_weights: list[tuple[str, torch.Tensor]] = []
+""",
+        "LayerNorm weight buffer",
+    )
+
+    source = _replace_radio_ln_once(
+        source,
+        """                    adapter_weights.append((trimmed_name, w.detach().clone()))
+                elif is_vision_weights(name):
+""",
+        """                    adapter_weights.append((trimmed_name, w.detach().clone()))
+                elif (
+                    final_layernorm_name := get_final_layernorm_name(name)
+                ) is not None:
+                    if not final_layernorm_dict:
+                        continue
+                    final_layernorm_weights.append(
+                        (final_layernorm_name, w.detach().clone())
+                    )
+                elif is_vision_weights(name):
+""",
+        "LayerNorm weight routing",
+    )
+
+    source = _replace_radio_ln_once(
+        source,
+        """                    default_weight_loader(param, w)
+            self.vision_model.load_weights(vision_weights)
+""",
+        """                    default_weight_loader(param, w)
+            for trimmed_name, w in final_layernorm_weights:
+                param = final_layernorm_dict[trimmed_name]
+                with torch.no_grad():
+                    default_weight_loader(param, w)
+                self._loaded_vision_final_layernorm_params.add(trimmed_name)
+            if final_layernorm_weights and (
+                self._loaded_vision_final_layernorm_params
+                >= final_layernorm_dict.keys()
+            ):
+                if not self._vision_final_layernorm_enabled:
+                    logger.info_once(
+                        "Loaded and enabled checkpoint-backed RADIO final LayerNorm",
+                        scope="global",
+                    )
+                self._vision_final_layernorm_enabled = True
+            self.vision_model.load_weights(vision_weights)
+""",
+        "LayerNorm parameter loading",
+    )
+
+    compile(source, "nano_nemotron_vl.py", "exec")
+    return source, True
+
+
+def _patch_vllm_radio_final_layernorm(logger) -> None:
+    """Backport post-RADIO FP32 LayerNorm loading and forward for Super VL.
+
+    Source: https://github.com/TomerBN-Nvidia/vllm/pull/46
+    The checkpoint MTP metadata allocates the norm; both affine tensors must
+    load before it is used. Cloned streaming weights support subsequent refits.
+    Patch source before model import so EngineCore subprocesses see the fix.
+    """
+    try:
+        file_to_patch = _get_vllm_file("model_executor/models/nano_nemotron_vl.py")
+    except RuntimeError:
+        logger.warning(
+            "Could not locate nano_nemotron_vl.py for RADIO final LayerNorm."
+        )
+        return
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        patched, changed = _radio_final_layernorm_source(content)
+        if changed:
+            write_back(patched)
+            logger.info("Patched Super VL checkpoint-backed RADIO final LayerNorm.")
+        else:
+            logger.info("Super VL RADIO final LayerNorm source already present.")
+
+
 def _patch_vllm_radio_layerscale_loader(logger) -> None:
     """Load explicit RADIO LayerScale weights and initialize folded weights.
 
@@ -651,6 +903,129 @@ def _patch_vllm_glm_decoder_sequence_parallel_moe(logger) -> None:
         write_back(content.replace(old_snippet, new_snippet, 1))
 
     logger.info("Successfully disabled decoder-level SP-MoE for GLM DSA models.")
+
+
+def _patch_vllm_cutedsl_available_requires_quack(logger) -> None:
+    """Widen the cuteDSL availability probes to cover ``quack``.
+
+    ``is_available`` imports only ``cutlass`` and ``cutlass.cute``, but the
+    compile path it guards goes on to import ``quack.compile_utils``. When a
+    container pairs quack-kernels 0.6.5 with an nvidia-cutlass-dsl that no
+    longer exposes ``cutlass.base_dsl.enums``, ``quack`` raises on import while
+    the probe still reports the kernels as available. The ll_bf16 router GEMM
+    warmup is gated only on ``has_device_capability(90)`` -- no kernel-config
+    flag reaches it -- so on any MoE model with a bf16 ``GateLinear`` that
+    mismatch aborts engine startup instead of falling back.
+
+    Importing ``quack`` in the probe is a no-op where the pair is consistent
+    and restores the supported "kernel unavailable" path where it is not.
+    Remove once the container ships a matching quack / cutlass-dsl pair.
+    """
+    marker = "import quack.compile_utils  # noqa: F401"
+    # (file, indent) -- ll_bf16's probe is a module-level function, skinny
+    # gemm's is a staticmethod, so the try bodies sit at different depths.
+    probes = (
+        ("model_executor/kernels/linear/cute_dsl/ll_bf16.py", " " * 8),
+        ("model_executor/kernels/linear/cute_dsl/skinny_gemm.py", " " * 12),
+    )
+
+    for relative_path, indent in probes:
+        try:
+            file_to_patch = _get_vllm_file(relative_path)
+        except RuntimeError:
+            logger.warning(
+                "Could not locate %s for the cuteDSL availability patch.",
+                relative_path,
+            )
+            continue
+
+        old_snippet = (
+            f"{indent}import cutlass.cute  # noqa: F401\n"
+            f"\n"
+            f"{indent}_cutedsl_available = True\n"
+        )
+        new_snippet = (
+            f"{indent}import cutlass.cute  # noqa: F401\n"
+            f"{indent}{marker}\n"
+            f"\n"
+            f"{indent}_cutedsl_available = True\n"
+        )
+
+        with _locked_file_patch(file_to_patch) as (content, write_back):
+            if new_snippet in content:
+                logger.info(
+                    "cuteDSL availability patch already applied to %s.",
+                    relative_path,
+                )
+                continue
+            if old_snippet not in content:
+                logger.warning(
+                    "Could not apply the cuteDSL availability patch: expected "
+                    "source shape was not found in %s.",
+                    file_to_patch,
+                )
+                continue
+            write_back(content.replace(old_snippet, new_snippet, 1))
+
+        logger.info("Patched the cuteDSL availability probe in %s.", relative_path)
+
+
+def _patch_vllm_fa4_available_requires_quack(logger) -> None:
+    """Make the FA4 availability probe import the kernels it advertises.
+
+    Same defect as the cuteDSL linear-kernel probes above, in a different file
+    and reached by a different caller, so that patch does not cover it.
+    ``FA4_AVAILABLE`` is decided by a bare ``os.path.exists`` on
+    ``cute/interface.py`` -- the module is never imported -- but dispatching to
+    ``fa_version=4`` imports it, and it pulls in ``quack``. Where the container's
+    quack-kernels and nvidia-cutlass-dsl disagree, FA4 reports itself available
+    and then dies on ``No module named 'cutlass.base_dsl.enums'``.
+
+    This only bites multimodal runs: ``DEFAULT_FA_VERSION`` is 2, and it is the
+    ViT attention wrapper that asks for 4. Text-only NT4 never builds a vision
+    tower, which is why the 86-node runs have not seen it (job 7772194).
+
+    Importing quack here is a no-op where the pair is consistent, and restores
+    the supported "FA4 unavailable, fall back" path where it is not. Remove once
+    the container ships a matching quack / cutlass-dsl pair.
+    """
+    relative_path = "vllm_flash_attn/flash_attn_interface.py"
+    try:
+        file_to_patch = _get_vllm_file(relative_path)
+    except RuntimeError:
+        logger.warning(
+            "Could not locate %s for the FA4 availability patch.", relative_path
+        )
+        return
+
+    marker = "    import quack.compile_utils  # noqa: F401"
+    old_snippet = (
+        '        raise ImportError("vllm.vllm_flash_attn.cute.interface not found")\n'
+        "\n"
+        "    FA4_UNAVAILABLE_REASON = None\n"
+    )
+    new_snippet = (
+        '        raise ImportError("vllm.vllm_flash_attn.cute.interface not found")\n'
+        "\n"
+        f"{marker}\n"
+        "\n"
+        "    FA4_UNAVAILABLE_REASON = None\n"
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if marker in content:
+            logger.info("FA4 availability patch already applied to %s.", relative_path)
+            return
+        if old_snippet not in content:
+            logger.warning(
+                "Could not apply the FA4 availability patch: expected source "
+                "shape was not found in %s.",
+                file_to_patch,
+            )
+            return
+        write_back(content.replace(old_snippet, new_snippet, 1))
+
+    logger.info("Patched the FA4 availability probe in %s.", relative_path)
 
 
 def _patch_vllm_moe_routed_experts_capture(logger, *, required: bool = False) -> bool:
@@ -1022,10 +1397,16 @@ def ensure_vllm_source_compat() -> None:
     """
     from vllm.logger import init_logger
 
+    from nemo_rl.models.generation.vllm.nemotron4_vlm import register_nemotron4_vlm
+
     patch_logger = init_logger("vllm_patch")
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
+    _patch_vllm_radio_final_layernorm(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
+    _patch_vllm_cutedsl_available_requires_quack(patch_logger)
+    _patch_vllm_fa4_available_requires_quack(patch_logger)
+    register_nemotron4_vlm(patch_logger)
 
 
 def _apply_vllm_patches(
@@ -1038,6 +1419,8 @@ def _apply_vllm_patches(
     # Import lazily so importing the worker module does not import vLLM.
     import vllm.envs as envs
     from vllm.logger import init_logger
+
+    from nemo_rl.models.generation.vllm.nemotron4_vlm import register_nemotron4_vlm
 
     patch_logger = init_logger("vllm_patch")
     nemotron_h_fp32_lm_head_enabled = bool(nemotron_h_fp32_lm_head)
@@ -1091,7 +1474,11 @@ def _apply_vllm_patches(
     _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
+    _patch_vllm_radio_final_layernorm(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
+    _patch_vllm_cutedsl_available_requires_quack(patch_logger)
+    _patch_vllm_fa4_available_requires_quack(patch_logger)
+    register_nemotron4_vlm(patch_logger)
     if nemotron_h_fp32_lm_head_enabled and not _patch_vllm_nemotron_h_fp32_lm_head(
         patch_logger
     ):

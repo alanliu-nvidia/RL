@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+nemo_rl_nt4_vlm = nemo_rl_nt4_vlm_plugin:register

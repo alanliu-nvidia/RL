@@ -305,6 +305,19 @@ def _filter_gemma4_unified_multimodal_weights(
     )
 
 
+def _is_mtp_weight(key: str) -> bool:
+    """Whether an HF weight name belongs to a multi-token-prediction layer.
+
+    Same predicate the Megatron worker uses to recognise them on the export
+    side (``_collect_mtp_hf_layer_names``): families that keep the bare
+    ``mtp.`` prefix (NemotronH, Nemotron4, Qwen3.5) plus nested spellings.
+    DeepSeek's trailing ``model.layers.N`` spelling is deliberately not
+    matched here -- it is indistinguishable from a real decoder layer by name
+    alone, and that family runs with a drafter, so it never reaches this path.
+    """
+    return key.startswith("mtp.") or ".mtp." in key
+
+
 def _tied_embedding_aliases(model: torch.nn.Module | None) -> dict[str, str]:
     """Return vLLM's ``{alias qualname: canonical qualname}`` for tied embeddings.
 
@@ -508,6 +521,38 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 "Refit dropped %d tied-embedding alias weight(s); vLLM ties %s",
                 dropped,
                 ", ".join(f"{a} -> {c}" for a, c in sorted(aliases.items())),
+            )
+        return kept
+
+    def _without_unconsumable_mtp_weights(
+        self, policy_weights: list[tuple[str, torch.Tensor]]
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Drop MTP weights when vLLM has no drafter to receive them.
+
+        A policy trained with ``mtp_num_layers > 0`` exports its MTP layers on
+        the policy stream, because the trainer assumes vLLM runs MTP
+        speculative decoding and keeps the drafter as a separate module
+        (see ``_collect_mtp_hf_layer_names`` in the Megatron worker). Without
+        ``speculative_config`` there is no drafter, the main model has no
+        ``model.mtp`` submodule, and vLLM's autoloader raises on the first such
+        key instead of ignoring it.
+
+        Dropping them is safe: MTP heads are an auxiliary training-time
+        objective and contribute nothing to ordinary autoregressive decoding.
+        The trainer keeps and keeps training them; only this replica's copy is
+        skipped. Mirrors ``_load_draft_weights``, which likewise skips when the
+        drafter is absent.
+        """
+        if self._get_drafter_model() is not None:
+            return policy_weights
+        kept = [(k, v) for k, v in policy_weights if not _is_mtp_weight(k)]
+        dropped = len(policy_weights) - len(kept)
+        if dropped and not getattr(self, "_logged_mtp_drop", False):
+            self._logged_mtp_drop = True  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__
+            logger.info(
+                "Refit dropped %d MTP weight(s); vLLM has no speculative "
+                "drafter to consume them and the main model has no MTP module.",
+                dropped,
             )
         return kept
 
@@ -1051,7 +1096,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 )
 
         policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
-        self._load_hf_weights(self._without_tied_embedding_aliases(policy_weights))
+        self._load_hf_weights(
+            self._without_unconsumable_mtp_weights(
+                self._without_tied_embedding_aliases(policy_weights)
+            )
+        )
         # Eagle3 draft weights are exported with the `draft.` prefix.
         self._load_draft_weights(draft_weights)
         # MTP drafters co-trained with the policy receive their weights from the
