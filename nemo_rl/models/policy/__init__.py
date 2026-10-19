@@ -43,21 +43,49 @@ def _patch_transformers_tokenizer_class_set():
     DTensor v2 all import from nemo_rl.models.policy) without polluting nemo_rl
     consumers that don't touch tokenizers.
     """
+    import warnings
+
     import transformers
     from packaging.version import Version as PkgVersion
 
     # Transformers 5.12.1 still ships both registry entries, so the patch remains
     # load-bearing across the currently supported backend environments.
-    # TODO: remove this patch (and the assert below) once the deepseek_v3
-    # entries actually disappear upstream.
+    # TODO: remove this patch entirely once the deepseek_v3 entries actually
+    # disappear upstream.
     # https://github.com/NVIDIA-NeMo/RL/issues/2764
-    # NOTE(liding, local-only): the <5.13 transformers assert was removed so this
-    # branch runs in the rl-gym image (transformers 5.17 still ships the entries).
+    #
+    # This used to assert transformers < 5.13. That turned every container bump
+    # into a hard import failure for reasons unrelated to the model being run:
+    # rl-gym.72488118 ships transformers 5.17.0, which took the whole driver
+    # down at `import nemo_rl.models.policy` before any recipe code ran. The
+    # patch's actual precondition is that the two registries still exist and
+    # still carry the deepseek_v3 entry, so test that directly and skip the
+    # patch when upstream has moved on.
     from transformers import AutoTokenizer
-    from transformers.models.auto.tokenization_auto import (
-        MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS,
-        TOKENIZER_MAPPING_NAMES,
-    )
+
+    try:
+        from transformers.models.auto.tokenization_auto import (
+            MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS,
+            TOKENIZER_MAPPING_NAMES,
+        )
+    except ImportError:
+        warnings.warn(
+            f"transformers {transformers.__version__} no longer exposes the "
+            "tokenizer blocklist registries; skipping the deepseek_v3 patch. "
+            "If deepseek_v3 or Moonlight tokenizers now load correctly, remove "
+            "this patch (NVIDIA-NeMo/RL#2764).",
+            stacklevel=2,
+        )
+        return
+
+    if PkgVersion(transformers.__version__) >= PkgVersion("5.13.0"):
+        warnings.warn(
+            f"transformers {transformers.__version__} is newer than the <5.13 "
+            "this deepseek_v3 tokenizer-blocklist patch was verified against. "
+            "The registries it needs are still present, so it stays active; "
+            "re-check whether it is still required (NVIDIA-NeMo/RL#2764).",
+            stacklevel=2,
+        )
 
     _original_from_pretrained = AutoTokenizer.from_pretrained
 
@@ -513,6 +541,9 @@ class MegatronConfig(TypedDict):
     manual_gc: NotRequired[bool]
     # Updates between collections; must be > 0 when manual_gc is true.
     manual_gc_interval: NotRequired[int]
+    # Collective watchdog deadline for the training process group and every
+    # subgroup derived from it. Omitted: torch's NCCL default of 10 minutes.
+    distributed_timeout_minutes: NotRequired[int]
     # Enable grouped GEMM for MoE experts via CUTLASS. Significant throughput
     # gain when multiple experts are assigned per rank (num_local_experts > 1).
     # Requires TE >= 1.11.0 for FP8 and Ampere (sm_80) or newer.

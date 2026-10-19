@@ -94,12 +94,65 @@ from nemo_rl.models.megatron.draft.optimizer import (
     build_draft_optimizer_override_provider,
 )
 
+# Registers the NM4 HF config and weight bridge. NM4 exports carry no modeling
+# code and no auto_map, so without this AutoConfig cannot read them and
+# AutoBridge has no mapping to export their weights with.
+import nemo_rl.models.megatron.nemotron4  # noqa: E402,F401
+
 if TYPE_CHECKING:
     from megatron.bridge.models.megatron_mimo import MegatronMIMOParallelismConfig
 
 _HF_CONFIG_PATCHED = False
 
 _NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT = "expanded_sequence_v1"
+
+
+def _log_rank0_memory(stage: str) -> None:
+    """Print rank 0's device memory at a named point in setup.
+
+    Resident memory, not peak, is what matters here: NT4 Nano reaches step 0
+    with roughly 266 of 276 GiB already allocated, so the transient that
+    finally fails is incidental and the useful question is which of weights,
+    gradient buffers and optimizer state accounts for the standing total.
+    Only rank 0 prints, since all ranks are symmetric at these points.
+    """
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() != 0:
+        return
+    gib = 1024**3
+    print(
+        f"[mem] {stage}: "
+        f"allocated={torch.cuda.memory_allocated() / gib:.2f} GiB "
+        f"reserved={torch.cuda.memory_reserved() / gib:.2f} GiB",
+        flush=True,
+    )
+
+
+def _maybe_enable_rerun_validation() -> None:
+    """Opt into Megatron's reproducibility check for unexpected results.
+
+    We set check_for_nan_in_grad, so a NaN gradient norm reaches
+    validate_result(). Nothing initializes the rerun state machine, though, so
+    it sits at its default DISABLED mode and that call only raises
+    "Unexpected result nan" -- it never says whether the NaN is reproducible.
+    That distinction is the whole question when a single rank out of ninety-six
+    fails: VALIDATE_RESULTS reruns the iteration on the same GPU and then on a
+    different one, reporting "Possible transient error!" for what is almost
+    certainly bad hardware versus "Possible persistent error!" for a real bug
+    in the data or the model.
+
+    Off by default and behind an env var because the mode saves and restores
+    RNG state around validated steps, and a run we need to finish should not
+    pay for a diagnostic it may never trigger. Flip it on only when chasing a
+    NaN that has already happened once.
+    """
+    if os.environ.get("NRL_RERUN_VALIDATE", "0") != "1":
+        return
+
+    from megatron.core.rerun_state_machine import RerunMode, get_rerun_state_machine
+
+    get_rerun_state_machine().set_mode(RerunMode.VALIDATE_RESULTS)
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+        print("[rerun] mode=VALIDATE_RESULTS (NRL_RERUN_VALIDATE=1)", flush=True)
 
 
 def _patch_hf_config_double_instantiation():
@@ -637,20 +690,29 @@ def setup_distributed(config) -> None:
     configure_dynamo_cache()
     # Ensure clean slate before import
     destroy_parallel_state()
-    # Long-sequence MoE jobs may need more than torch's default timeout.
-    timeout_minutes = os.environ.get("NRL_DIST_TIMEOUT_MINUTES")
-    if timeout_minutes:
+    # Initialize process group. Subgroups created later (DATA_PARALLEL_GROUP_WITH_CP,
+    # EXPERT_MODEL_PARALLEL_GROUP, ...) inherit this timeout, so it is the only place
+    # the collective watchdog deadline is set. Torch's NCCL default is 10 minutes,
+    # which is short for a 64-node distributed-checkpoint load.
+    timeout_minutes = config["megatron_cfg"].get("distributed_timeout_minutes")
+    # NRL_DIST_TIMEOUT_MINUTES wins over the config so a recipe can raise the
+    # deadline from its env_vars block without carrying a megatron_cfg override.
+    env_timeout_minutes = os.environ.get("NRL_DIST_TIMEOUT_MINUTES")
+    if env_timeout_minutes:
         try:
-            timeout = float(timeout_minutes)
+            timeout_minutes = float(env_timeout_minutes)
         except ValueError as error:
             raise ValueError(
                 "NRL_DIST_TIMEOUT_MINUTES must be a positive number."
             ) from error
-        if timeout <= 0:
+        if timeout_minutes <= 0:
             raise ValueError("NRL_DIST_TIMEOUT_MINUTES must be a positive number.")
-        torch.distributed.init_process_group("nccl", timeout=timedelta(minutes=timeout))
-    else:
-        torch.distributed.init_process_group("nccl")
+    init_kwargs = (
+        {"timeout": timedelta(minutes=timeout_minutes)}
+        if timeout_minutes is not None
+        else {}
+    )
+    torch.distributed.init_process_group("nccl", **init_kwargs)
 
 
 def validate_and_set_config(
@@ -1185,6 +1247,8 @@ def setup_model_config(
             )
             raise
 
+        model_cfg = _unwrap_mimo_provider(model_cfg, config)
+
     # Construct the final provider with model-only overrides before applying
     # NeMo-RL's first-class Megatron settings. Conflicts are rejected so the
     # provider and the user-facing config cannot disagree about the same field.
@@ -1322,6 +1386,36 @@ def _validate_model_override_conflicts(
         f"first-class NeMo-RL setting; {conflict_paths}. Set the first-class "
         "field directly instead."
     )
+
+
+def _unwrap_mimo_provider(model_cfg: Any, config: PolicyConfig) -> Any:
+    """Return the standard provider behind a MIMO checkpoint's serialized one.
+
+    A MIMO checkpoint's run_config.yaml deserializes to a MegatronMIMOProvider,
+    but every setting below -- model_overrides, parallelism, precision, the VLM
+    tower controls -- describes the standard provider it wraps, and
+    MegatronMIMOProvider exposes none of those fields. Unwrap here and let
+    ``configure_megatron_mimo`` rebuild the wrapper once those settings have
+    landed, which is the same ``from_standard_provider`` call the checkpoint's
+    own provider was built with.
+    """
+    from megatron.bridge.models.megatron_mimo import MegatronMIMOProvider
+
+    if not isinstance(model_cfg, MegatronMIMOProvider):
+        return model_cfg
+    if resolve_mimo_sft_config(config) is None:
+        raise ValueError(
+            "The pretrained checkpoint holds a MIMO model but "
+            "policy.megatron_cfg.mimo is unset, so the policy would be built "
+            "as an ordinary model and its weights would not match."
+        )
+    standard_provider = model_cfg.standard_provider
+    if standard_provider is None:
+        raise ValueError(
+            "The pretrained MIMO checkpoint carries no standard_provider, so "
+            "there is nothing for the recipe's model settings to apply to."
+        )
+    return standard_provider
 
 
 def _merge_model_overrides(
@@ -2353,29 +2447,6 @@ def _create_megatron_config(
     )
 
 
-def _get_layer_wise_model_kwargs(
-    policy_cfg: PolicyConfig, optimizer_cfg: OptimizerConfig
-) -> dict[str, bool]:
-    """Forward opt-in layer-wise settings only to a compatible Bridge API."""
-    if not optimizer_cfg.use_layer_wise_distributed_optimizer:
-        return {}
-    kwargs = {"use_layer_wise_distributed_optimizer": True}
-    compact = policy_cfg["megatron_cfg"].get("use_layer_wise_param_layout") is False
-    if compact:
-        kwargs["use_layer_wise_param_layout"] = False
-    parameters = inspect.signature(get_model).parameters
-    accepts_kwargs = any(
-        p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()
-    )
-    missing = set(kwargs) - parameters.keys()
-    if missing and not accepts_kwargs:
-        raise ValueError(
-            "Layer-wise optimizer configuration requires a Megatron-Bridge get_model "
-            f"API supporting {', '.join(sorted(missing))}; upgrade Megatron-Bridge."
-        )
-    return kwargs
-
-
 def _create_draft_pre_wrap_hook(
     policy_cfg: PolicyConfig,
     megatron_cfg: ConfigContainer,
@@ -2840,19 +2911,35 @@ def setup_model_and_optimizer(
             chunk_size=policy_cfg["megatron_cfg"]["fused_linear_logprobs_chunk_size"]
         )
     configure_gtp_remat(megatron_cfg.model)
+    if policy_cfg["megatron_cfg"].get("use_layer_wise_param_layout", True) is False:
+        if (
+            not megatron_cfg.optimizer.use_layer_wise_distributed_optimizer
+            or megatron_cfg.optimizer.use_distributed_optimizer
+        ):
+            raise ValueError(
+                "use_layer_wise_param_layout=False requires "
+                "use_layer_wise_distributed_optimizer=True and "
+                "use_distributed_optimizer=False."
+            )
+    _log_rank0_memory("before get_model")
     model = get_model(
         megatron_cfg.model,
         megatron_cfg.ddp,
         use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
+        use_layer_wise_distributed_optimizer=megatron_cfg.optimizer.use_layer_wise_distributed_optimizer,
+        use_layer_wise_param_layout=policy_cfg["megatron_cfg"].get(
+            "use_layer_wise_param_layout", True
+        ),
         overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
         data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
         pre_wrap_hook=pre_wrap_hook,
         mixed_precision_wrapper=mixed_precision_wrapper,
         pg_collection=pg_collection,
         wrap_with_ddp=load_optimizer,
-        **_get_layer_wise_model_kwargs(policy_cfg, megatron_cfg.optimizer),
     )
     classify_gtp_remat_chains(model, megatron_cfg.model)
+
+    _log_rank0_memory("after get_model (weights + DDP grad buffers)")
 
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
@@ -2868,6 +2955,8 @@ def setup_model_and_optimizer(
         optimizer = None
         scheduler = None
 
+    _log_rank0_memory("after setup_optimizer")
+    _maybe_enable_rerun_validation()
     print("Model, optimizer, and learning rate scheduler built")
     torch.distributed.barrier()
 
@@ -2920,6 +3009,7 @@ def setup_model_and_optimizer(
                 and megatron_cfg.dist.use_torch_fsdp2,
             )
         print("Checkpoint loaded")
+        _log_rank0_memory("after load_checkpoint")
 
         # See _force_sync_optimizer_fp32_from_model: required when
         # optimizer_cpu_offload=True so the first optimizer step does Adam on the

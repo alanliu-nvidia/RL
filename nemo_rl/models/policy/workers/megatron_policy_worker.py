@@ -95,6 +95,11 @@ from nemo_rl.models.megatron.draft.step_state import (
     DraftStepPayload,
     DraftStepState,
 )
+from nemo_rl.data.energon.mimo_image_split import (
+    EncoderMediaSplit,
+    apply_encoder_media_split,
+    encoder_shard_for_rank,
+)
 from nemo_rl.models.megatron.mimo import resolve_mimo_sft_config
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
@@ -245,6 +250,123 @@ def _unwrapped_chunks(model: Any) -> list[Any]:
 
     unwrapped = unwrap_model(model)
     return list(unwrapped) if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+
+
+def _count_nonfinite(obj: Any) -> int:
+    """Nonfinite entries across whatever a module handed back."""
+    if torch.is_tensor(obj):
+        if not obj.is_floating_point():
+            return 0
+        return int((~torch.isfinite(obj)).sum())
+    if isinstance(obj, (tuple, list)):
+        return sum(_count_nonfinite(item) for item in obj)
+    if isinstance(obj, dict):
+        return sum(_count_nonfinite(item) for item in obj.values())
+    return 0
+
+
+def _check_cp_replica_consistency(model: Any) -> None:
+    """Do the context-parallel ranks agree on the weights they just loaded?
+
+    Context parallelism shards the sequence, not the parameters, so every rank
+    in a CP group must hold bit-identical weights. If checkpoint load reshards
+    wrongly and leaves one rank with stale or uninitialized values, that rank
+    computes garbage while rank 0 still looks correct to the refit -- which
+    matches a forward that is NaN only once CP is wide.
+    """
+    if os.environ.get("NRL_CP_CHECK", "0") != "1":
+        return
+
+    from megatron.core import parallel_state
+
+    group = parallel_state.get_context_parallel_group(check_initialized=False)
+    if group is None or torch.distributed.get_world_size(group=group) <= 1:
+        return
+    cp_size = torch.distributed.get_world_size(group=group)
+    rank = torch.distributed.get_rank()
+
+    # Expert weights are the one exception: EP carves its groups out of the
+    # same ranks CP spans, so each rank legitimately owns a different slice of
+    # the experts and comparing them reports every one of them as a mismatch.
+    named = [
+        (name, param)
+        for chunk in _unwrapped_chunks(model)
+        for name, param in chunk.named_parameters()
+        if ".experts." not in name
+    ]
+    # float64 so that summing a large bf16 tensor cannot alias two different
+    # payloads onto the same value.
+    local = torch.tensor(
+        [float(p.detach().double().abs().sum()) for _, p in named],
+        dtype=torch.float64,
+        device="cuda",
+    )
+    gathered = [torch.empty_like(local) for _ in range(cp_size)]
+    torch.distributed.all_gather(gathered, local, group=group)
+
+    stacked = torch.stack(gathered)
+    mismatched = (stacked != stacked[0]).any(dim=0).nonzero().flatten().tolist()
+    nonfinite = [i for i, v in enumerate(local.tolist()) if v != v or v in (float("inf"), float("-inf"))]
+    print(
+        f"[NRL_CP_CHECK] rank={rank} cp_size={cp_size} params={len(named)} "
+        f"mismatched_across_cp={len(mismatched)} nonfinite_local={len(nonfinite)} :: "
+        + " | ".join(named[i][0] for i in (mismatched or nonfinite)[:8]),
+        flush=True,
+    )
+
+
+def _install_forward_nan_probe(model: Any) -> None:
+    """Name the first module whose forward output turns nonfinite.
+
+    The gradient probe in param_and_grad_buffer only sees the wreckage once
+    every tensor downstream of the fault is already NaN. Forward hooks fire as
+    each module completes, innermost first, so the first module to return a
+    nonfinite output while every module before it returned finite values is the
+    origin. Each check syncs on the device, so this only covers the layer
+    boundaries and switches itself off after the opening forward passes.
+    """
+    if os.environ.get("NRL_FWD_NAN", "0") != "1":
+        return
+
+    interesting = re.compile(
+        r"(^|\.)(embedding|output_layer|vision_model|vision_projection)$"
+        r"|(^|\.)decoder\.layers\.\d+$"
+    )
+    names: dict[int, str] = {}
+    roots = []
+    for chunk in _unwrapped_chunks(model):
+        roots.append(id(chunk))
+        for name, module in chunk.named_modules():
+            if name == "" or interesting.search(name):
+                names[id(module)] = name or "<root>"
+
+    state = {"done": False, "forwards": 0}
+
+    def _hook(module: Any, args: Any, output: Any) -> None:
+        if state["done"]:
+            return
+        name = names.get(id(module))
+        if name is None:
+            return
+        bad = _count_nonfinite(output)
+        if bad:
+            state["done"] = True
+            print(
+                f"[NRL_FWD_NAN] rank={torch.distributed.get_rank()} "
+                f"module={name} type={type(module).__name__} "
+                f"out_nonfinite={bad} in_nonfinite={_count_nonfinite(args)}",
+                flush=True,
+            )
+            return
+        if id(module) in roots:
+            state["forwards"] += 1
+            if state["forwards"] >= 2:
+                state["done"] = True
+
+    for chunk in _unwrapped_chunks(model):
+        for _, module in chunk.named_modules():
+            if id(module) in names:
+                module.register_forward_hook(_hook)
 
 
 def _model_media_placeholder_token_id(model: Any) -> Optional[int]:
@@ -639,6 +761,8 @@ class MegatronPolicyWorkerImpl(
         self.cfg = config
         self.mimo_parallelism_config = None
         self.mimo_runtime = None
+        # Set on MIMO encoder ranks only; language ranks keep the whole batch.
+        self.mimo_encoder_media_split: Optional[EncoderMediaSplit] = None
         self._router_replay_enabled = router_replay_enabled(config)
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
@@ -786,6 +910,8 @@ class MegatronPolicyWorkerImpl(
 
         self.mcore_state = model_and_optimizer_state.state
         self.model = model_and_optimizer_state.model
+        _install_forward_nan_probe(self.model)
+        _check_cp_replica_consistency(self.model)
         self.optimizer = model_and_optimizer_state.optimizer
         self.scheduler = model_and_optimizer_state.scheduler
         self.checkpointing_context = model_and_optimizer_state.checkpointing_context
@@ -832,6 +958,13 @@ class MegatronPolicyWorkerImpl(
                 raise RuntimeError(
                     f"MIMO module {self.mimo_runtime.active_module_name!r} has no finalized DP size."
                 )
+            self.mimo_encoder_media_split = self._build_mimo_encoder_media_split(
+                config,
+                active_data_parallel_size=active_data_parallel_size,
+                language_data_parallel_size=self.mimo_parallelism_config.get_parallelism(
+                    MIMO_LANGUAGE_MODULE_KEY
+                ).data_parallel_size,
+            )
         else:
             language_tensor_parallel_size = None
             active_data_parallel_size = None
@@ -851,6 +984,18 @@ class MegatronPolicyWorkerImpl(
             active_data_parallel_size=active_data_parallel_size,
             install_model_config_hooks=self.mimo_parallelism_config is None,
         )
+        if self.mimo_parallelism_config is not None:
+            # Bridge's MIMO bridge knows each component's HF prefix and walks
+            # only the routes live on this rank, so language and encoder ranks
+            # export their own weights and the engine receives the whole model.
+            from megatron.bridge.models.megatron_mimo.conversion import (
+                MegatronMIMOBridge,
+            )
+
+            self.megatron_bridge = MegatronMIMOBridge.from_bridge(
+                self.megatron_bridge,
+                parallelism_config=self.mimo_parallelism_config,
+            )
         self._first_train_step_forward_pre_hook_disabled = False
         self._first_train_step_param_sync_func = None
         if self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled():
@@ -918,6 +1063,11 @@ class MegatronPolicyWorkerImpl(
         self.refit_conversion_tasks = None
         self.refit_conversion_tasks_current_index = None
         self.refit_param_info_mcore = None
+        # MIMO refit: the union of every role's exported parameters, in the order
+        # all trainer ranks agree to walk it, plus the rank that owns each role.
+        self._mimo_refit_param_info = None
+        self._mimo_refit_module_params = None
+        self._mimo_refit_module_owner = None
 
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
@@ -1463,6 +1613,12 @@ class MegatronPolicyWorkerImpl(
             "model_dtype": self.dtype,
             "all_mb_metrics": mb_metrics,
             "grad_norm": torch.tensor([grad_norm]),
+            # The high-water mark since the process started, which is what
+            # says how close a packing regime runs to the card. Read without
+            # resetting, so the _log_gpu_memory debug sampler keeps owning the
+            # per-phase counters and this stays a whole-run ceiling.
+            "peak_memory_gib": torch.cuda.max_memory_allocated()
+            / float(1024**3),
             "train_elapsed_seconds": metrics_train_elapsed,  # pragma: no cover
         }
         # Read "config" via getattr-by-string so the token stays out of
@@ -1543,12 +1699,18 @@ class MegatronPolicyWorkerImpl(
         *,
         data: BatchedDataDict[Any],
         micro_batch_size: Optional[int] = None,
+        num_microbatches: Optional[int] = None,
+        sequence_length: Optional[int] = None,
+        split_encoder_media: bool = False,
     ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
         with self.use_reference_model():
             reference_logprobs = self.get_logprobs(
                 data=data,
                 micro_batch_size=micro_batch_size,
                 require_router_replay=False,
+                num_microbatches=num_microbatches,
+                sequence_length=sequence_length,
+                split_encoder_media=split_encoder_media,
             )
 
         return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
@@ -1828,6 +1990,7 @@ class MegatronPolicyWorkerImpl(
         data: Optional[BatchedDataDict[Any]],
         num_microbatches: Optional[int] = None,
         sequence_length: Optional[int] = None,
+        split_encoder_media: bool = False,
     ) -> None:
         """One DP slice of data → one ``forward_backward_func`` invocation.
 
@@ -1848,8 +2011,14 @@ class MegatronPolicyWorkerImpl(
                 data,
                 num_microbatches=num_microbatches,
                 sequence_length=sequence_length,
+                split_encoder_media=split_encoder_media,
             )
             return
+        if split_encoder_media:
+            raise ValueError(
+                "split_encoder_media is a MIMO-only argument; this worker holds "
+                "no MIMO runtime."
+            )
         if data is None:
             raise ValueError("A non-MIMO train microbatch requires data.")
         try:
@@ -1882,8 +2051,16 @@ class MegatronPolicyWorkerImpl(
         *,
         num_microbatches: Optional[int],
         sequence_length: Optional[int],
+        split_encoder_media: bool = False,
     ) -> None:
-        """Run one synchronized heterogeneous schedule invocation."""
+        """Run one synchronized heterogeneous schedule invocation.
+
+        ``split_encoder_media`` says this batch has not been reduced to each
+        encoder rank's media range yet. Rollout batches have not; an SFT
+        loader's have, because the Energon task encoder splits them as it
+        encodes. Guessing from the batch is not safe either way, so the
+        producer states it.
+        """
         if num_microbatches is None or num_microbatches <= 0:
             raise ValueError("MIMO training requires a positive num_microbatches.")
         if sequence_length is None or sequence_length <= 0:
@@ -1895,13 +2072,16 @@ class MegatronPolicyWorkerImpl(
         if data is None:
             data_iterator: Iterator[Any] = iter([None] * num_microbatches)
             micro_batch_size = state["mbs"]
+            forward_length = self._mimo_dataless_forward_length(sequence_length)
         else:
+            if split_encoder_media and self.mimo_encoder_media_split is not None:
+                apply_encoder_media_split(data, self.mimo_encoder_media_split)
             (
                 data_iterator,
                 actual_num_microbatches,
                 micro_batch_size,
-                _,
-                actual_sequence_length,
+                row_width,
+                forward_length,
             ) = get_microbatch_iterator(
                 data,
                 self.cfg,
@@ -1917,23 +2097,94 @@ class MegatronPolicyWorkerImpl(
                     "MIMO role batch produced a different microbatch count: "
                     f"expected {num_microbatches}, got {actual_num_microbatches}."
                 )
-            if actual_sequence_length != sequence_length:
+            if row_width != sequence_length:
                 raise ValueError(
                     "MIMO role batch produced a different sequence length: "
-                    f"expected {sequence_length}, got {actual_sequence_length}."
+                    f"expected {sequence_length}, got {row_width}."
                 )
 
         state["num_chunks"] = 1
         state["total_num_microbatches"] = num_microbatches
+
+        # One schedule invocation carries the whole step, so the loss
+        # denominators are known before the forward and the loss can apply
+        # them itself. The streaming path cannot do that -- it trains on raw
+        # sums and rescales the gradients at finish -- but it also nulls
+        # mcore's end-of-schedule gradient finalization, which MIMO leaves in
+        # place. Here the data-parallel reduce has already happened by the time
+        # the step is closed, too late for anything to rescale into it.
+        global_valid_seqs, global_valid_toks = self._reduce_mimo_valid_counts(data)
+        state["global_valid_seqs"] = global_valid_seqs
+        state["global_valid_toks"] = global_valid_toks
+
         losses_reduced = megatron_mimo_forward_backward(
             model=self.model,
             data_iterator=data_iterator,
             num_microbatches=num_microbatches,
-            seq_length=sequence_length,
+            seq_length=forward_length,
             mbs=micro_batch_size,
             mimo_runtime=self.mimo_runtime,
+            post_processing_fn=LossPostProcessor(
+                loss_fn=state["loss_fn"],
+                cfg=self.cfg,
+                num_microbatches=num_microbatches,
+                sampling_params=self.sampling_params,
+            ),
+            sampling_params=self.sampling_params,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
         )
         state["mimo_losses_reduced"] = list(losses_reduced or [])
+
+    def _mimo_dataless_forward_length(self, sequence_length: int) -> int:
+        """The forward length for a rank the controller handed no batch.
+
+        Every other rank reads it off its own microbatch iterator, which is
+        where the context-parallel padding gets applied. A rank with no batch
+        has nothing to read it from and can only take the controller's row
+        width -- the same number right up until context parallelism widens
+        one and not the other. Refuse rather than desync the schedule.
+        """
+        if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
+            raise NotImplementedError(
+                "A MIMO rank driven without a batch of its own cannot derive "
+                "the context-parallel forward padding. Give every rank its "
+                "lane's batch, as the rollout dispatch does."
+            )
+        return sequence_length
+
+    def _reduce_mimo_valid_counts(
+        self, data: Optional[BatchedDataDict[Any]]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Agree this step's loss denominators across the whole MIMO world.
+
+        Exactly one rank per language data lane contributes. Encoder ranks are
+        handed the same lane batch and the language lane's tensor- and
+        context-parallel replicas each hold all of it, so letting any of them
+        contribute would multiply every count by the size of its own group.
+        Reducing over the trainer world rather than the language data-parallel
+        group still gives the language totals, and it leaves every encoder rank
+        holding them too -- their gradients come from the same loss, back
+        through the bridge.
+        """
+        assert self.mimo_runtime is not None
+        counts = torch.zeros(2, dtype=torch.float64, device="cuda")
+        contributes = (
+            self.mimo_runtime.active_module_name == MIMO_LANGUAGE_MODULE_KEY
+            and self.mimo_runtime.local_pg_collection.tp_cp.rank() == 0
+            and data is not None
+        )
+        if contributes:
+            sample_mask = data["sample_mask"]
+            counts[0] = torch.sum(sample_mask)
+            if "token_mask" in data:
+                counts[1] = torch.sum(
+                    data["token_mask"][:, 1:] * sample_mask.unsqueeze(-1)
+                )
+            else:
+                counts[1] = counts[0] * data["input_ids"].shape[1]
+        torch.distributed.all_reduce(counts)
+        return counts[0], counts[1]
 
     def _train_microbatch_body(
         self,
@@ -2206,41 +2457,34 @@ class MegatronPolicyWorkerImpl(
                 for scheduler in self.mimo_runtime.schedulers.values():
                     scheduler.step(increment=state["gbs"])
 
-            loss_dict: dict[str, torch.Tensor] = {}
+            # Only the language role runs the loss, and only its ranks are in
+            # the group the aggregation reduces over. The encoder ranks return
+            # the empty shape; the controller reads the language role's result.
+            global_loss = torch.zeros(())
+            all_mb_metrics: dict[str, list[Any]] = {}
             if is_language_role:
-                losses_reduced = state["mimo_losses_reduced"]
-                if not losses_reduced:
+                mb_metrics = state["mimo_losses_reduced"]
+                if not mb_metrics:
                     raise RuntimeError(
                         "The MIMO language role produced no loss metrics."
                     )
-                for name in losses_reduced[0]:
-                    values = [loss[name].view(-1) for loss in losses_reduced]
-                    if values[0].numel() == 2:
-                        totals = torch.vstack(values).sum(dim=0)
-                        torch.distributed.all_reduce(
-                            totals,
-                            group=self.mimo_runtime.local_pg_collection.dp_cp,
-                        )
-                        loss_dict[name] = torch.where(
-                            totals[1] > 0,
-                            totals[0] / totals[1],
-                            torch.zeros_like(totals[0]),
-                        )
-                    elif values[0].numel() == 1:
-                        loss_dict[name] = torch.cat(values).mean()
-                    else:
-                        raise ValueError(f"Invalid MIMO metric shape for {name}.")
-
-            language_loss = loss_dict.get("lm loss")
-            global_loss = (
-                language_loss if language_loss is not None else torch.zeros(())
-            )
-            all_mb_metrics: dict[str, list[Any]] = {
-                name: [value.detach().cpu()] for name, value in loss_dict.items()
-            }
-            if loss_dict:
-                all_mb_metrics["lr"] = [curr_lr]
-                all_mb_metrics["wd"] = [curr_wd]
+                # No rescale pass here, unlike the streaming path: the loss was
+                # given the step's true denominators, so these are final.
+                global_valid_seqs = float(state["global_valid_seqs"].item())
+                global_valid_toks = float(state["global_valid_toks"].item())
+                step_metrics = []
+                for m in mb_metrics:
+                    out = dict(m)
+                    out["lr"] = curr_lr
+                    out["wd"] = curr_wd
+                    out["global_valid_seqs"] = global_valid_seqs
+                    out["global_valid_toks"] = global_valid_toks
+                    step_metrics.append(out)
+                all_mb_metrics, global_loss = aggregate_training_statistics(
+                    all_mb_metrics=step_metrics,
+                    losses=[float(sum(m["loss"] for m in mb_metrics))],
+                    data_parallel_group=self.mimo_runtime.local_pg_collection.dp_cp,
+                )
 
             metrics = self._assemble_step_metrics(
                 global_loss=global_loss,
@@ -2592,9 +2836,12 @@ class MegatronPolicyWorkerImpl(
     def get_logprobs(
         self,
         *,
-        data: BatchedDataDict[Any],
+        data: Optional[BatchedDataDict[Any]],
         micro_batch_size: Optional[int] = None,
         require_router_replay: bool = True,
+        num_microbatches: Optional[int] = None,
+        sequence_length: Optional[int] = None,
+        split_encoder_media: bool = False,
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get the logprobs of the model for a batch of data.
 
@@ -2609,6 +2856,21 @@ class MegatronPolicyWorkerImpl(
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        if self.mimo_runtime is not None:
+            return self._get_logprobs_mimo(
+                data=data,
+                micro_batch_size=micro_batch_size,
+                num_microbatches=num_microbatches,
+                sequence_length=sequence_length,
+                split_encoder_media=split_encoder_media,
+            )
+        if split_encoder_media:
+            raise ValueError(
+                "split_encoder_media is a MIMO-only argument; this worker holds "
+                "no MIMO runtime."
+            )
+        if data is None:
+            raise ValueError("A non-MIMO logprob batch requires data.")
         self.timer.start("get_logprobs")
         no_grad = torch.no_grad()
         no_grad.__enter__()
@@ -2701,6 +2963,177 @@ class MegatronPolicyWorkerImpl(
             device="cpu",
             pin_memory=True,
         )
+        cpu_logprobs.copy_(logprobs, non_blocking=False)
+        return BatchedDataDict[LogprobOutputSpec](logprobs=cpu_logprobs)
+
+    def _holds_logprob_vocabulary(self) -> bool:
+        """Only the MIMO language ranks have logprobs to write back."""
+        if self.mimo_runtime is None:
+            return True
+        return self.mimo_runtime.active_module_name == MIMO_LANGUAGE_MODULE_KEY
+
+    @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs_mimo")
+    def _build_mimo_encoder_media_split(
+        self,
+        config: PolicyConfig,
+        *,
+        active_data_parallel_size: int,
+        language_data_parallel_size: int,
+    ) -> Optional[EncoderMediaSplit]:
+        """Describe this rank's media range, or None if it holds the language module.
+
+        SFT reaches the same place through the Energon task encoder, which knows
+        the geometry because it configured it. GRPO has no task encoder, so
+        ``patch_dim`` comes from the model provider rather than a second knob
+        that could disagree with the weights.
+        """
+        assert self.mimo_runtime is not None
+        if self.mimo_runtime.active_module_name == MIMO_LANGUAGE_MODULE_KEY:
+            return None
+
+        mimo_config = resolve_mimo_sft_config(config)
+        assert mimo_config is not None
+        shard, _lane = encoder_shard_for_rank(
+            dp_rank=self.mimo_runtime.local_pg_collection.dp.rank(),
+            dp_size=active_data_parallel_size,
+            language_dp_size=language_data_parallel_size,
+        )
+        # configure_megatron_mimo has already replaced megatron_cfg.model with
+        # the MIMO wrapper, which keeps the tower geometry on the standard
+        # provider it was built from.
+        provider = (
+            getattr(self.megatron_cfg.model, "standard_provider", None)
+            or self.megatron_cfg.model
+        )
+        patch_dim = getattr(provider, "patch_dim", None)
+        if not patch_dim:
+            raise RuntimeError(
+                "MIMO GRPO sizes the encoder media split from the vision "
+                f"tower's patch_dim, which {type(provider).__name__} does not "
+                "carry."
+            )
+        return EncoderMediaSplit(
+            shard=shard,
+            patch_dim=int(patch_dim),
+            temporal_patch_size=mimo_config.encoder_media_split_temporal_patch_size,
+            frame_weight=mimo_config.encoder_media_split_frame_weight,
+            image_token_id=self.tokenizer.convert_tokens_to_ids("<image>"),
+        )
+
+    def _get_logprobs_mimo(
+        self,
+        *,
+        data: Optional[BatchedDataDict[Any]],
+        micro_batch_size: Optional[int],
+        num_microbatches: Optional[int],
+        sequence_length: Optional[int],
+        split_encoder_media: bool = False,
+    ) -> BatchedDataDict[LogprobOutputSpec]:
+        """Run one synchronized heterogeneous schedule to collect logprobs.
+
+        Every rank in the MIMO grid has to enter the schedule with the same
+        microbatch count and sequence length, so both are caller-supplied the
+        way ``_train_mimo_microbatch_body`` takes them: an encoder rank cannot
+        derive a language rank's token geometry from its own media batch. Only
+        ranks holding the language module produce logprobs; the rest return an
+        empty tensor for the caller to drop.
+        """
+        assert self.mimo_runtime is not None
+        if num_microbatches is None or num_microbatches <= 0:
+            raise ValueError("MIMO logprobs require a positive num_microbatches.")
+        if sequence_length is None or sequence_length <= 0:
+            raise ValueError("MIMO logprobs require a positive sequence_length.")
+
+        self.timer.start("get_logprobs")
+        no_grad = torch.no_grad()
+        no_grad.__enter__()
+        self.model.eval()
+
+        is_language_rank = (
+            self.mimo_runtime.active_module_name == MIMO_LANGUAGE_MODULE_KEY
+        )
+        logprob_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
+
+        if data is None:
+            mb_iterator: Iterator[Any] = iter([None] * num_microbatches)
+            mbs = logprob_batch_size
+            forward_length = self._mimo_dataless_forward_length(sequence_length)
+        else:
+            if split_encoder_media and self.mimo_encoder_media_split is not None:
+                apply_encoder_media_split(data, self.mimo_encoder_media_split)
+            # Logprobs run the same forward as training, so a batch that needs
+            # the mask needs it here too.
+            attach_media_token_validity_mask(data, self.media_placeholder_token_id)
+            (
+                mb_iterator,
+                actual_num_microbatches,
+                mbs,
+                row_width,
+                forward_length,
+            ) = get_microbatch_iterator(
+                data,
+                self.cfg,
+                logprob_batch_size,
+                straggler_timer=self.mcore_state.straggler_timer,
+                delegate_pack_to_model=self.delegate_pack_to_model,
+                delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+                model_slices_context_parallel_inputs=True,
+                mtp_enabled=self.mtp_enabled,
+            )
+            if actual_num_microbatches != num_microbatches:
+                raise ValueError(
+                    "MIMO role batch produced a different microbatch count: "
+                    f"expected {num_microbatches}, got {actual_num_microbatches}."
+                )
+            if row_width != sequence_length:
+                raise ValueError(
+                    "MIMO role batch produced a different sequence length: "
+                    f"expected {sequence_length}, got {row_width}."
+                )
+
+        logprobs_post_processor = LogprobsPostProcessor(
+            cfg=self.cfg,
+            sampling_params=self.sampling_params,
+            use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
+                "use_fused_linear_logprobs", False
+            ),
+        )
+        list_of_logprobs = megatron_mimo_forward_backward(
+            model=self.model,
+            data_iterator=mb_iterator,
+            num_microbatches=num_microbatches,
+            seq_length=forward_length,
+            mbs=mbs,
+            mimo_runtime=self.mimo_runtime,
+            post_processing_fn=logprobs_post_processor,
+            forward_only=True,
+            sampling_params=self.sampling_params,
+        )
+
+        if is_language_rank:
+            padded = []
+            for entry in list_of_logprobs or []:
+                lp = entry["logprobs"]
+                padding_needed = sequence_length - lp.shape[1]
+                if padding_needed > 0:
+                    lp = torch.nn.functional.pad(
+                        lp, (0, padding_needed), mode="constant", value=0.0
+                    )
+                padded.append(lp)
+            logprobs = torch.cat(padded, dim=0)
+        else:
+            logprobs = torch.zeros(
+                (0, sequence_length), device=torch.cuda.current_device()
+            )
+
+        no_grad.__exit__(None, None, None)
+        self.timer.stop("get_logprobs")
+
+        cpu_logprobs = torch.empty_like(logprobs, device="cpu", pin_memory=True)
         cpu_logprobs.copy_(logprobs, non_blocking=False)
         return BatchedDataDict[LogprobOutputSpec](logprobs=cpu_logprobs)
 
@@ -3253,7 +3686,48 @@ class MegatronPolicyWorkerImpl(
         for name, tensor in self._iter_params_with_optional_kv_scales():
             refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
 
+        if self.mimo_runtime is not None:
+            return self._unify_mimo_refit_param_info(refit_param_info_hf)
+
         return refit_param_info_hf
+
+    def _unify_mimo_refit_param_info(
+        self, local_param_info: dict[str, tuple[torch.Size, torch.dtype]]
+    ) -> dict[str, tuple[torch.Size, torch.dtype]]:
+        """Combine both MIMO roles' refit metadata into one agreed sequence.
+
+        Each rank exports only the component it hosts, but the generation side
+        needs the whole model and ``Policy.prepare_refit_info`` publishes just
+        rank 0's answer. Merge the roles here, ordered by the rank that reported
+        them, so every trainer rank returns the same dictionary and rank 0's is
+        complete.
+        """
+        gathered: list[Any] = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(
+            gathered, (self.mimo_runtime.active_module_name, local_param_info)
+        )
+
+        param_info: dict[str, tuple[torch.Size, torch.dtype]] = {}
+        module_params: dict[str, list[str]] = {}
+        module_owner: dict[str, int] = {}
+        for rank, (module_name, module_param_info) in enumerate(gathered):
+            if module_name in module_owner:
+                continue
+            module_owner[module_name] = rank
+            module_params[module_name] = list(module_param_info)
+            collisions = param_info.keys() & module_param_info.keys()
+            if collisions:
+                raise RuntimeError(
+                    f"MIMO module {module_name!r} exports parameters another "
+                    f"module already claimed, so refit cannot tell which rank "
+                    f"owns them: {sorted(collisions)[:5]}"
+                )
+            param_info.update(module_param_info)
+
+        self._mimo_refit_param_info = param_info
+        self._mimo_refit_module_params = module_params
+        self._mimo_refit_module_owner = module_owner
+        return param_info
 
     def prepare_refit_info(
         self,
@@ -3469,10 +3943,149 @@ class MegatronPolicyWorkerImpl(
             if self._is_fp8_export() and self.refit_payload_mode != "logical_weights":
                 return self.megatron_bridge.get_export_fp8_tasks(self.model)
             return [
-                task
-                for task in self.megatron_bridge.get_conversion_tasks([self.model])
-                if task is not None
+                task for task in self._bridge_conversion_tasks() if task is not None
             ]
+
+    def _iter_mimo_hf_weights(
+        self, conversion_tasks: Optional[Iterable[Any]]
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Stream this rank's HF weights for every MIMO route it owns.
+
+        Bridge's own MIMO export gathers to rank 0, which suits saving a
+        checkpoint but not refit: each trainer rank has to hand its weights to
+        the inference workers beside it. Driving the route-local bridges here
+        gives the standard per-rank stream, with each route's HF prefix applied.
+
+        The two underscore-prefixed helpers are deliberate. ``_iter_active_routes``
+        decides route ownership and ``_bridged_parallel_state`` maps a dozen
+        Megatron-Core parallel_state globals onto a component's groups;
+        reimplementing either here would silently drift from the pinned Bridge.
+        """
+        from megatron.bridge.models.megatron_mimo.conversion import (
+            component_pg_context,
+            make_route_local_bridge,
+        )
+        from megatron.bridge.models.megatron_mimo.conversion.orchestrator import (
+            _bridged_parallel_state,
+            _iter_active_routes,
+        )
+
+        assert self.mimo_runtime is not None
+        infra = self.mimo_runtime.megatron_mimo_infra
+        active = [
+            (route, pg_collection, self._mimo_route_submodule(route))
+            for route, pg_collection in _iter_active_routes(
+                self.megatron_bridge.routes, infra.pg_collections
+            )
+        ]
+        for (route, pg_collection, submodule), tasks in zip(
+            active, self._mimo_tasks_by_route(conversion_tasks, active)
+        ):
+            route_bridge = make_route_local_bridge(
+                self.megatron_bridge._model_bridge, route
+            )
+            with (
+                _bridged_parallel_state(pg_collection),
+                component_pg_context(submodule, pg_collection),
+            ):
+                yield from route_bridge.stream_weights_megatron_to_hf(
+                    [submodule],
+                    self.megatron_bridge.hf_pretrained,
+                    cpu=False,
+                    show_progress=False,
+                    conversion_tasks=tasks,
+                )
+
+    @staticmethod
+    def _mimo_tasks_by_route(
+        conversion_tasks: Optional[Iterable[Any]],
+        active: list[tuple[Any, Any, torch.nn.Module]],
+    ) -> list[Optional[list]]:
+        """Split refit tasks per route, by which route's module owns each one.
+
+        A route-local bridge can only convert its own component, so the flat
+        list refit carries has to be divided before any of them runs. Tasks name
+        the module that holds the parameter, which survives the dequantizing
+        rewrite the logical-weights payload mode applies; grouping on that keeps
+        a filtered subset working too. ``None`` lets each bridge build its own.
+        """
+        if conversion_tasks is None:
+            return [None] * len(active)
+
+        owners = [
+            {id(module) for module in submodule.modules()}
+            for _route, _pg_collection, submodule in active
+        ]
+        subsets: list[Optional[list]] = [[] for _ in active]
+        for task in conversion_tasks:
+            if task is None or task.megatron_module is None:
+                continue
+            for index, owned in enumerate(owners):
+                if id(task.megatron_module) in owned:
+                    subsets[index].append(task)
+                    break
+            else:
+                raise ValueError(
+                    f"Refit task {task.global_param_name!r} belongs to no MIMO "
+                    "route active on this rank."
+                )
+        return subsets
+
+    def _mimo_route_submodule(self, route: Any) -> torch.nn.Module:
+        """Resolve a MIMO route's target module on the wrapped training model.
+
+        Bridge addresses routes by dotted path on a bare ``MimoModel``, but
+        training wraps each component in DDP and mixed precision in place, so
+        ``modality_submodules.images`` is a wrapper and the rest of the path
+        lives beneath it. Unwrap at every step rather than only at the root.
+        """
+        from megatron.core.utils import unwrap_model
+
+        module = unwrap_model(self.model)
+        for name in route.target_module_path.split("."):
+            module = unwrap_model(getattr(module, name))
+        return module
+
+    def _bridge_conversion_tasks(self) -> list:
+        """Build this rank's conversion tasks, one route at a time under MIMO.
+
+        Bridge's ``get_conversion_tasks`` resolves each route against a bare
+        ``MimoModel``; refit has the DDP-wrapped one. The loop below is that
+        method with ``_mimo_route_submodule`` in place of ``get_submodule``,
+        and without the route annotation that only its own export path reads.
+        """
+        if self.mimo_runtime is None:
+            return self.megatron_bridge.get_conversion_tasks([self.model])
+
+        from megatron.bridge.models.megatron_mimo.conversion import (
+            component_pg_context,
+            make_route_local_bridge,
+        )
+        from megatron.bridge.models.megatron_mimo.conversion.orchestrator import (
+            _bridged_parallel_state,
+            _iter_active_routes,
+            bind_hf_source_to_bridge,
+        )
+
+        hf_pretrained = self.megatron_bridge.hf_pretrained
+        bind_hf_source_to_bridge(self.megatron_bridge._model_bridge, hf_pretrained)
+        infra = self.mimo_runtime.megatron_mimo_infra
+        tasks: list = []
+        for route, pg_collection in _iter_active_routes(
+            self.megatron_bridge.routes, infra.pg_collections
+        ):
+            submodule = self._mimo_route_submodule(route)
+            route_bridge = make_route_local_bridge(
+                self.megatron_bridge._model_bridge, route
+            )
+            with (
+                _bridged_parallel_state(pg_collection),
+                component_pg_context(submodule, pg_collection),
+            ):
+                tasks.extend(
+                    route_bridge.build_conversion_tasks(hf_pretrained, [submodule])
+                )
+        return tasks
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
         """Calculate parameter information for refit.
@@ -3591,11 +4204,14 @@ class MegatronPolicyWorkerImpl(
                 conversion_tasks
             )
 
-        base_iter = self.megatron_bridge.export_hf_weights(
-            [self.model],
-            show_progress=False,
-            conversion_tasks=conversion_tasks,
-        )
+        if self.mimo_runtime is not None:
+            base_iter = self._iter_mimo_hf_weights(conversion_tasks)
+        else:
+            base_iter = self.megatron_bridge.export_hf_weights(
+                [self.model],
+                show_progress=False,
+                conversion_tasks=conversion_tasks,
+            )
 
         # Yield the original parameters first.
         for name, tensor in base_iter:
@@ -3759,9 +4375,7 @@ class MegatronPolicyWorkerImpl(
             raise ValueError(f"Unsupported SGLang target precision: {target_precision}")
 
         if self.refit_conversion_tasks is None:
-            self.refit_conversion_tasks = self.megatron_bridge.get_conversion_tasks(
-                [self.model]
-            )
+            self.refit_conversion_tasks = self._bridge_conversion_tasks()
 
         return iter_named_tensor_buckets(
             self._iter_params_with_optional_kv_scales(include_draft=False),
@@ -3953,6 +4567,14 @@ class MegatronPolicyWorkerImpl(
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
     ) -> None:
+        if self.mimo_runtime is not None:
+            self._broadcast_mimo_weights_for_collective(
+                kv_scales=kv_scales,
+                buffer_size_bytes=buffer_size_bytes,
+                num_buffers=num_buffers,
+            )
+            return
+
         # param_iterator will return (name, tensor), we only need tensor.
         packed_broadcast_producer(
             iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),
@@ -3962,6 +4584,150 @@ class MegatronPolicyWorkerImpl(
             buffer_size_bytes=buffer_size_bytes,
             num_buffers=num_buffers,
         )
+
+    def _broadcast_mimo_weights_for_collective(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        *,
+        buffer_size_bytes: Optional[int] = None,
+        num_buffers: Optional[int] = None,
+    ) -> None:
+        """Broadcast both MIMO roles' weights to generation, all from rank 0.
+
+        ``packed_broadcast_producer`` transmits only ``src``'s bytes but sizes
+        every round from the caller's own parameters, so each member of the refit
+        group has to walk a parameter sequence of the same shape. No MIMO rank
+        holds that whole sequence: rank 0 hosts the language model and the vision
+        tower lives on the encoder ranks, which is why leaving every trainer rank
+        to produce its own component wedged the collective instead of raising.
+
+        Stage the components rank 0 does not host onto it, then have every rank
+        walk the agreed sequence: a rank exports the parameters its own component
+        owns -- which it must, because Bridge gathers each tensor across that
+        component's ranks -- and fills the rest with buffers of the right size
+        that nobody reads.
+        """
+        if self._mimo_refit_param_info is None:
+            raise RuntimeError(
+                "MIMO collective refit needs the unified parameter metadata that "
+                "prepare_refit_info publishes, and it has not run yet."
+            )
+
+        rank = torch.distributed.get_rank()
+        local_module = self.mimo_runtime.active_module_name
+        producer_module = next(iter(self._mimo_refit_module_params))
+        if self._mimo_refit_module_owner[producer_module] != 0:
+            raise RuntimeError(
+                "MIMO collective refit expects the parameters rank 0 exports to "
+                f"come first in the agreed order, but {producer_module!r} is "
+                f"owned by rank {self._mimo_refit_module_owner[producer_module]}."
+            )
+
+        local_weights = self._iter_params_with_optional_kv_scales(kv_scales=kv_scales)
+        staged = self._stage_mimo_foreign_weights(
+            rank, local_module, producer_module, local_weights
+        )
+
+        packed_broadcast_producer(
+            iterator=self._iter_mimo_union_weights(
+                rank, local_module, producer_module, local_weights, staged
+            ),
+            group=self.model_update_group,
+            src=0,
+            post_iter_func=lambda x: x[1],
+            buffer_size_bytes=buffer_size_bytes,
+            num_buffers=num_buffers,
+        )
+
+    def _stage_mimo_foreign_weights(
+        self,
+        rank: int,
+        local_module: str,
+        producer_module: str,
+        local_weights: Iterator[tuple[str, torch.Tensor]],
+    ) -> dict[str, torch.Tensor]:
+        """Move the components rank 0 does not host onto it, one tensor at a time.
+
+        Every rank of a component exports it, not just the one that sends: Bridge
+        gathers each tensor across that component's tensor- and expert-parallel
+        ranks, so an exporter driven on one rank alone waits on peers that never
+        arrive. Rank 0 parks what it collects in host memory, which the producer
+        copies back as it packs, so the language ranks never carry a second
+        component resident.
+        """
+        staged: dict[str, torch.Tensor] = {}
+        for module_name, names in self._mimo_refit_module_params.items():
+            if module_name == producer_module:
+                continue
+            owner = self._mimo_refit_module_owner[module_name]
+            hosts_module = module_name == local_module
+            for name in names:
+                shape, dtype = self._mimo_refit_param_info[name]
+                if hosts_module:
+                    tensor = self._next_exported_mimo_weight(
+                        local_weights, name, module_name
+                    )
+                else:
+                    tensor = torch.empty(shape, dtype=dtype, device="cuda")
+                torch.distributed.broadcast(tensor, src=owner)
+                if rank == 0:
+                    staged[name] = tensor.to("cpu", non_blocking=False)
+        return staged
+
+    def _iter_mimo_union_weights(
+        self,
+        rank: int,
+        local_module: str,
+        producer_module: str,
+        local_weights: Iterator[tuple[str, torch.Tensor]],
+        staged: dict[str, torch.Tensor],
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Yield the agreed sequence, real where this rank can supply it.
+
+        Only rank 0's bytes leave the group, so the filler buffers the other
+        ranks hand back are never read -- they exist to make each rank size its
+        rounds the same way. The components rank 0 does not host come from what
+        was staged onto it; everything else comes from the exporter, which every
+        rank of the hosting component has to drive together.
+        """
+        for module_name, names in self._mimo_refit_module_params.items():
+            exports_module = (
+                module_name == producer_module and module_name == local_module
+            )
+            for name in names:
+                if exports_module:
+                    yield (
+                        name,
+                        self._next_exported_mimo_weight(
+                            local_weights, name, module_name
+                        ),
+                    )
+                elif rank == 0:
+                    yield name, staged[name]
+                else:
+                    shape, dtype = self._mimo_refit_param_info[name]
+                    yield name, torch.empty(shape, dtype=dtype, device="cuda")
+
+    @staticmethod
+    def _next_exported_mimo_weight(
+        local_weights: Iterator[tuple[str, torch.Tensor]],
+        name: str,
+        module_name: str,
+    ) -> torch.Tensor:
+        """Take the next exported tensor and hold the exporter to the agreed order."""
+        exported_name, tensor = next(local_weights)
+        if exported_name != name:
+            raise RuntimeError(
+                f"MIMO module {module_name!r} exported {exported_name!r} where "
+                f"refit expected {name!r}; the agreed order and the exporter "
+                "disagree."
+            )
+        # Receivers allocate on the device the collectives run on, and an
+        # exporter is free to hand back a host tensor.
+        tensor = tensor.contiguous()
+        if tensor.device.type != "cuda":
+            tensor = tensor.to(torch.cuda.current_device())
+        return tensor
 
     def _build_layer_to_pp_stage(
         self, pp_size: int, layer_prefix: str
@@ -4367,9 +5133,24 @@ class MegatronPolicyWorkerImpl(
 
         def _on_this_workers_device():
             torch.cuda.set_device(device)
-            return self._nccl_reshard_refit_guarded(
+            result = self._nccl_reshard_refit_guarded(
                 kv_scales=kv_scales, refit_timeout_s=refit_timeout_s
             )
+            # What refit leaves behind, which is the number that decides whether
+            # step 0 fits. Setup rests at 117 GiB and the forward then dies near
+            # 270 of 276, yet a 64-node rank processes one sequence where an
+            # 8-node rank processes four -- so the gap is not activations, and
+            # the staging buffers this path allocates are the obvious suspect.
+            # Printed by one rank only; all ranks are symmetric here.
+            if torch.distributed.get_rank() == 0:
+                gib = 1024**3
+                print(
+                    f"[mem] after refit: "
+                    f"allocated={torch.cuda.memory_allocated() / gib:.2f} GiB "
+                    f"reserved={torch.cuda.memory_reserved() / gib:.2f} GiB",
+                    flush=True,
+                )
+            return result
 
         return await await_off_loop(_on_this_workers_device)
 

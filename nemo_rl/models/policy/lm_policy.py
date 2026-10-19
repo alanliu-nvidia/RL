@@ -42,6 +42,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.megatron.mimo import (
     MIMOSFTConfig,
+    mimo_rank_to_lane,
     mimo_worker_sharding,
     resolve_mimo_sft_config,
 )
@@ -172,8 +173,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         mimo_config = resolve_mimo_sft_config(config) if megatron_enable else None
         if mimo_config is not None and not allow_mimo_sft:
             raise ValueError(
-                "policy.megatron_cfg.mimo is supported only by the SFT v2 "
-                "entry point. Use examples/run_sft_v2.py."
+                "policy.megatron_cfg.mimo is supported only by the SFT v2 and "
+                "GRPO entry points. Use examples/run_sft_v2.py or "
+                "examples/run_grpo_single_controller.py."
             )
         self.mimo_config: MIMOSFTConfig | None = mimo_config
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
@@ -604,6 +606,85 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     # DRY for Policy's logprob/train methods only. The data-plane sibling
     # TQPolicy shards KVBatchMeta via ``shard_meta_for_dp``; the
     # driver-on-data vs driver-on-meta split is by design.
+    def _mimo_per_rank_shards(self, sharded_data: list[Any]) -> list[Any]:
+        """Give every MIMO rank the shard of the lane it belongs to.
+
+        Encoder ranks of a lane each receive that lane's whole batch and reduce
+        it to their own media range in the worker, the way the Energon task
+        encoder does for SFT.
+        """
+        assert self.mimo_config is not None
+        if len(sharded_data) != self.data_parallel_size:
+            raise ValueError(
+                "MIMO expects one shard per language lane: lanes="
+                f"{self.data_parallel_size}, shards={len(sharded_data)}."
+            )
+        lanes = mimo_rank_to_lane(
+            self.mimo_config.parallelism,
+            world_size=len(self.worker_group.workers),
+        )
+        return [sharded_data[lane] for lane in lanes]
+
+    def _mimo_schedule_shape(self, sharded_data: list[Any]) -> tuple[int, int]:
+        """Return the microbatch count and padded length every MIMO rank will use.
+
+        The encoder ranks are driven with no data of their own, so they cannot
+        derive this; the controller has to state it, and the worker rejects a
+        batch that disagrees. Dynamic batching and sequence packing decide the
+        split inside the worker from content the controller does not model, so
+        they are refused here rather than guessed at.
+
+        The data-plane sibling does support packing, because its driver packs
+        the whole batch once and ships each lane the resulting plan
+        (``TQPolicy._mimo_lane_microbatches``). This path shards already-
+        materialised tensors and has no such plan to pass on.
+        """
+        if self.use_dynamic_batches or self.use_sequence_packing:
+            raise NotImplementedError(
+                "MIMO GRPO on this path requires static batching: dynamic "
+                "batching and sequence packing choose microbatch boundaries "
+                "in the worker. Run with data_plane.impl=transfer_queue, "
+                "whose driver packs once and hands every lane the same plan."
+            )
+
+        lane_sizes = {shard["input_ids"].shape[0] for shard in sharded_data}
+        lengths = {shard["input_ids"].shape[1] for shard in sharded_data}
+        if len(lane_sizes) != 1 or len(lengths) != 1:
+            raise ValueError(
+                "MIMO lanes must agree on batch shape so every rank steps "
+                f"through the same schedule: sizes={sorted(lane_sizes)}, "
+                f"lengths={sorted(lengths)}."
+            )
+        lane_size = lane_sizes.pop()
+        sequence_length = lengths.pop()
+
+        micro_batch_size = self.cfg["logprob_batch_size"]
+        if lane_size % micro_batch_size:
+            raise ValueError(
+                f"MIMO lane batch {lane_size} is not a whole number of "
+                f"microbatches of {micro_batch_size}."
+            )
+        return lane_size // micro_batch_size, sequence_length
+
+    def _submit_mimo_logprobs(self, sharded_data: list[Any]) -> list[Any]:
+        """Hand every MIMO rank its lane's batch and the shared schedule shape.
+
+        MIMO has no homogeneous grid to shard over -- ``mimo_worker_sharding``
+        is a flat worker axis -- so the named-axis fan-out does not apply. Each
+        rank instead receives its lane's shard directly, and every rank gets the
+        same microbatch count and sequence length because the heterogeneous
+        schedule only runs if all of them step through it together.
+        """
+        num_microbatches, sequence_length = self._mimo_schedule_shape(sharded_data)
+        return self.worker_group.run_all_workers_multiple_data(
+            "get_logprobs",
+            data=self._mimo_per_rank_shards(sharded_data),
+            common_kwargs={
+                "num_microbatches": num_microbatches,
+                "sequence_length": sequence_length,
+            },
+        )
+
     def _shard_for_logprob(
         self,
         data: BatchedDataDict[Any],
@@ -719,21 +800,24 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             if timer
             else nullcontext()
         ):
-            futures = self.worker_group.run_all_workers_sharded_data(
-                "get_logprobs",
-                data=sharded_data,
-                in_sharded_axes=["data_parallel"],
-                replicate_on_axes=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
-                output_is_replicated=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
-            )
+            if self.mimo_config is not None:
+                futures = self._submit_mimo_logprobs(sharded_data)
+            else:
+                futures = self.worker_group.run_all_workers_sharded_data(
+                    "get_logprobs",
+                    data=sharded_data,
+                    in_sharded_axes=["data_parallel"],
+                    replicate_on_axes=[
+                        "context_parallel",
+                        "tensor_parallel",
+                        "pipeline_parallel",
+                    ],
+                    output_is_replicated=[
+                        "context_parallel",
+                        "tensor_parallel",
+                        "pipeline_parallel",
+                    ],
+                )
         logprobs: BatchedDataDict[LogprobOutputSpec] = BatchedDataDict.from_batches(
             self.worker_group.get_all_worker_results(futures)
         )
@@ -942,28 +1026,39 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             if timer
             else nullcontext()
         ):
-            futures = self.worker_group.run_all_workers_sharded_data(
-                "train",
-                data=sharded_data,
-                in_sharded_axes=["data_parallel"],
-                replicate_on_axes=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
-                output_is_replicated=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
-                common_kwargs={
-                    "loss_fn": loss_fn,
-                    "eval_mode": eval_mode,
-                    "gbs": batch_size,
-                    "mbs": micro_batch_size,
-                    "check_dim_skip_keys": check_dim_skip_keys,
-                },
-            )
+            train_kwargs = {
+                "loss_fn": loss_fn,
+                "eval_mode": eval_mode,
+                "gbs": batch_size,
+                "mbs": micro_batch_size,
+                "check_dim_skip_keys": check_dim_skip_keys,
+            }
+            if self.mimo_config is not None:
+                # No homogeneous grid to shard over; every rank is handed its
+                # lane's batch and the same gbs/mbs, which is what keeps the
+                # heterogeneous schedule in step.
+                futures = self.worker_group.run_all_workers_multiple_data(
+                    "train",
+                    data=self._mimo_per_rank_shards(sharded_data),
+                    common_kwargs=train_kwargs,
+                )
+            else:
+                futures = self.worker_group.run_all_workers_sharded_data(
+                    "train",
+                    data=sharded_data,
+                    in_sharded_axes=["data_parallel"],
+                    replicate_on_axes=[
+                        "context_parallel",
+                        "tensor_parallel",
+                        "pipeline_parallel",
+                    ],
+                    output_is_replicated=[
+                        "context_parallel",
+                        "tensor_parallel",
+                        "pipeline_parallel",
+                    ],
+                    common_kwargs=train_kwargs,
+                )
         results = self.worker_group.get_all_worker_results(futures)
 
         # Aggregate the results

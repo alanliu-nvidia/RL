@@ -514,6 +514,34 @@ def _prepare_prepacked(
             if model_slices_context_parallel_inputs
             else _slice_prepacked_for_cp(full_position_ids, padded)
         )
+    # Hand attention the padded spans as the sequences, the same convention
+    # _prepare_vlm_batch_for_megatron and _pack_sequences_for_megatron already
+    # use. Reporting the raw boundaries instead sets pad_between_seqs, and TE
+    # answers that by passing seqused to FlashAttention for THD
+    # (context_parallel.py), which FA4 refuses at head_dim 256 on Blackwell --
+    # the wall both the CP16 and CP64 runs hit. cuDNN cannot take over because
+    # it has no backward kernel for this attention, so there is no backend
+    # left unless the flag goes away.
+    #
+    # Equivalent for every token the loss sees: padding is always a right tail
+    # (get_packed_seq_padding_mask), attention is causal, so no real token can
+    # reach its own padding. The padded rows do become queries, but each span
+    # is validated to hold at least one real token above, so none of them is a
+    # softmax over an empty set -- the usual source of NaN in this pattern.
+    # Their outputs are discarded at the loss layer, and the recurrent layers
+    # reset state at these same boundaries.
+    #
+    # Flipping only the flag and keeping the raw boundaries here would be much
+    # worse than the bug it fixes: with pad_between_seqs false TE derives the
+    # physical offsets it hands FlashAttention from cu_seqlens_q rather than
+    # from cu_seqlens_q_padded, so the raw boundaries would point attention at
+    # the wrong rows of the packed buffer.
+    #
+    # SequencePackingLossWrapper reads cu_seqlens_q as the unpadded lengths and
+    # so now truncates each sequence's tensors to the padded length. That adds
+    # only positions whose token mask is zero, and the losses normalize by the
+    # separately computed global_valid_toks, so the value is unchanged -- the
+    # same bargain the two sibling packers above already make.
     params = PackedSeqParams(
         # Keep the attention output in the physical THD layout. Transformer
         # Engine otherwise compacts it to the logical token count, which no
@@ -763,8 +791,8 @@ def process_microbatch(
                 )
                 if model_slices_context_parallel_inputs:
                     packed_seq_params = PackedSeqParams(
-                        cu_seqlens_q=cu_seqlens,
-                        cu_seqlens_kv=cu_seqlens,
+                        cu_seqlens_q=cu_seqlens_padded,
+                        cu_seqlens_kv=cu_seqlens_padded,
                         cu_seqlens_q_padded=cu_seqlens_padded,
                         cu_seqlens_kv_padded=cu_seqlens_padded,
                         max_seqlen_q=int(
@@ -777,10 +805,16 @@ def process_microbatch(
                             .max()
                             .item()
                         ),
-                        # TE's default inference excludes the final boundary, so
-                        # it misses trailing-only padding for a single sequence.
-                        # CP zigzag can move that padding to a rank-local seam.
-                        pad_between_seqs=not torch.equal(cu_seqlens, cu_seqlens_padded),
+                        # Only the total_tokens differs from what
+                        # _pack_sequences_for_megatron already built, so keep its
+                        # padded-span boundaries rather than reintroducing the raw
+                        # ones. Declaring the padding is what makes TE hand
+                        # seqused to FlashAttention, which FA4 refuses at head_dim
+                        # 256 on Blackwell, and cuDNN cannot take the call over
+                        # because it has no backward kernel for this attention.
+                        # Right-padding plus causal masking means no real token
+                        # can reach the padding either way.
+                        pad_between_seqs=False,
                         qkv_format="thd",
                         total_tokens=input_ids.shape[1],
                     )

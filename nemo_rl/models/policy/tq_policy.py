@@ -190,6 +190,10 @@ class TQPolicy(TQDriverMixin, Policy):
         # Finish calls of the open step that train_placed_microbatches already
         # submitted, one per worker (``mimo.async_finish``).
         self._queued_finish_refs: Optional[list[ray.ObjectRef]] = None
+        # Microbatch size of the open step, which only the MIMO fan-out needs:
+        # the encoder ranks are told their schedule rather than deriving it, and
+        # begin_train_step is where a caller's override is resolved.
+        self._open_step_mbs: Optional[int] = None
 
         # Forward to workers (replaces ``Policy.setup_data_plane`` call
         # site in the trainer — TQPolicy bundles bootstrap + worker
@@ -430,30 +434,138 @@ class TQPolicy(TQDriverMixin, Policy):
         with timer.time(f"{timer_prefix}/shard_meta") if timer else nullcontext():
             metas, _ = shard_meta_for_dp(
                 lp_meta,
-                dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
+                dp_world=self.data_parallel_size,
                 batch_size=None,
                 sequence_packing_args=spa,
                 dynamic_batching_args=dba,
             )
         with timer.time(f"{timer_prefix}/submit_futures") if timer else nullcontext():
-            futures = self.worker_group.run_all_workers_sharded_data(
-                worker_method,
-                meta=metas,
-                in_sharded_axes=["data_parallel"],
-                replicate_on_axes=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
-                output_is_replicated=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
-                common_kwargs={**common_kwargs, **trace_context_kwargs()},
+            if self.mimo_config is not None:
+                futures = self._submit_mimo_logprob_metas(
+                    worker_method,
+                    lp_meta,
+                    metas,
+                    common_kwargs={**common_kwargs, **trace_context_kwargs()},
+                )
+            else:
+                futures = self.worker_group.run_all_workers_sharded_data(
+                    worker_method,
+                    meta=metas,
+                    in_sharded_axes=["data_parallel"],
+                    replicate_on_axes=[
+                        "context_parallel",
+                        "tensor_parallel",
+                        "pipeline_parallel",
+                    ],
+                    output_is_replicated=[
+                        "context_parallel",
+                        "tensor_parallel",
+                        "pipeline_parallel",
+                    ],
+                    common_kwargs={**common_kwargs, **trace_context_kwargs()},
+                )
+        # Wait for completion; per-rank returns are None. The MIMO fan-out
+        # hands back plain refs rather than a dedupable bundle, the same as the
+        # MIMO train dispatch, because a flat worker axis has nothing to dedupe.
+        if self.mimo_config is not None:
+            ray.get(futures)
+        else:
+            self.worker_group.get_all_worker_results(futures)
+
+    def _mimo_lane_microbatches(
+        self,
+        dp_metas: list[KVBatchMeta],
+        micro_batch_size: int,
+    ) -> int:
+        """How many microbatches every MIMO rank will step through.
+
+        The heterogeneous schedule only runs when all of its roles enter it
+        the same number of times, so this has to be one number for every
+        lane. Unpacked, a lane's row count decides it. Packed, the driver's
+        plan does: ``shard_meta_for_dp`` packs the whole batch with the bin
+        count forced to a multiple of the lane count, so the bins divide
+        evenly and every lane is handed the same number of them. That same
+        plan rides each lane's ``extra_info`` to the encoder ranks, which is
+        what lets them land on the boundaries the language rank will use
+        without seeing its tokens.
+
+        Dynamic batching has no equivalent guarantee -- it agrees microbatch
+        *boundaries* across shards but not how many there are -- so it stays
+        refused rather than hanging the schedule when two lanes disagree.
+        """
+        if self.use_dynamic_batches:
+            raise NotImplementedError(
+                "MIMO GRPO cannot use dynamic batching: it lets each lane "
+                "choose its own microbatch count, and the heterogeneous "
+                "schedule needs one count for every role."
             )
-        # Wait for completion; per-rank returns are None.
-        self.worker_group.get_all_worker_results(futures)
+        counts: set[int] = set()
+        for meta in dp_metas:
+            plan = (meta.extra_info or {}).get(MICRO_BATCH_INDICES)
+            if plan is not None:
+                counts.add(len(plan[0]))
+                continue
+            if self.use_sequence_packing:
+                raise RuntimeError(
+                    "MIMO needs the driver's microbatch plan when sequence "
+                    "packing is on, but shard_meta_for_dp did not stamp one."
+                )
+            lane_size = len(meta.sample_ids)
+            if lane_size % micro_batch_size:
+                raise ValueError(
+                    f"MIMO lane batch {lane_size} is not a whole number of "
+                    f"microbatches of {micro_batch_size}."
+                )
+            counts.add(lane_size // micro_batch_size)
+        if len(counts) != 1:
+            raise ValueError(
+                "MIMO lanes must agree on their microbatch count so every "
+                f"rank steps through the same schedule; got {sorted(counts)}."
+            )
+        return counts.pop()
+
+    def _submit_mimo_logprob_metas(
+        self,
+        worker_method: str,
+        lp_meta: KVBatchMeta,
+        dp_metas: list[KVBatchMeta],
+        *,
+        common_kwargs: dict[str, Any],
+    ) -> list[ray.ObjectRef]:
+        """Hand every MIMO rank its lane's metadata and the schedule they share.
+
+        ``mimo_worker_sharding`` is a flat worker axis, so the named-axis fan-out
+        has no grid to shard over. Each rank takes the metadata of the language
+        lane it belongs to -- encoder ranks included, since they narrow it to
+        their own media range in the worker, the way the Energon task encoder
+        does for SFT -- and every rank is told the same microbatch count and
+        forward length, because the heterogeneous schedule only runs when all of
+        them step through it together.
+        """
+        micro_batch_size = (
+            common_kwargs.get("micro_batch_size") or self.cfg["logprob_batch_size"]
+        )
+        return self.worker_group.run_all_workers_multiple_data(
+            worker_method,
+            meta=self._mimo_per_rank_shards(dp_metas),
+            common_kwargs={
+                **common_kwargs,
+                "num_microbatches": self._mimo_lane_microbatches(
+                    dp_metas, micro_batch_size
+                ),
+                # The width the rows were padded to, not the width the forward
+                # runs at. Context parallelism widens the second one and the
+                # controller does not model that; each rank derives it from the
+                # batch it was handed, which lands on the same number because
+                # MIMO pins pipelining to 1.
+                "sequence_length": int(
+                    lp_meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN]
+                ),
+                # Rollout batches reach the worker whole. An SFT loader's do
+                # not: the Energon task encoder splits media as it encodes.
+                "split_encoder_media": True,
+            },
+        )
 
     def get_logprobs_from_meta(
         self,
@@ -544,7 +656,7 @@ class TQPolicy(TQDriverMixin, Policy):
         with timer.time("policy_training/shard_meta") if timer else nullcontext():
             dp_metas, _ = shard_meta_for_dp(
                 train_meta,
-                dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
+                dp_world=self.data_parallel_size,
                 batch_size=batch_size,
                 sequence_packing_args=spa,
                 dynamic_batching_args=dba,
@@ -625,6 +737,7 @@ class TQPolicy(TQDriverMixin, Policy):
         """Open a logical train step on every worker."""
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
+        self._open_step_mbs = micro_batch_size
         if self.flops_tracker is not None:
             self.flops_tracker.reset()
         # run_all_workers_single_data returns plain ObjectRefs (one per
@@ -684,7 +797,7 @@ class TQPolicy(TQDriverMixin, Policy):
         with timer.time("policy_training/shard_meta") if timer else nullcontext():
             dp_metas, _ = shard_meta_for_dp(
                 train_meta,
-                dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
+                dp_world=self.data_parallel_size,
                 batch_size=None,
                 sequence_packing_args=spa,
                 dynamic_batching_args=dba,
@@ -937,6 +1050,9 @@ class TQPolicy(TQDriverMixin, Policy):
         in_sharded_axes: Optional[list[str]] = None,
     ) -> None:
         """Send prepared per-data-lane metadata into an open train step."""
+        if self.mimo_config is not None:
+            self._dispatch_mimo_dp_microbatches(dp_metas, timer=timer)
+            return
         if GTP_WEIGHT_REMAT_AXIS in self.sharding_annotations.names and (
             in_sharded_axes is None or GTP_WEIGHT_REMAT_AXIS not in in_sharded_axes
         ):
@@ -973,6 +1089,78 @@ class TQPolicy(TQDriverMixin, Policy):
         # accumulate in their open-step state until finish_train_step).
         self.worker_group.get_all_worker_results(futures)
 
+    def _dispatch_mimo_dp_microbatches(
+        self,
+        dp_metas: list[KVBatchMeta],
+        *,
+        timer: Optional[Timer],
+    ) -> None:
+        """Send each language lane's metadata to every rank of that lane.
+
+        The rollout-loader counterpart of
+        :meth:`_dispatch_mimo_train_microbatches`, which routes role-local SFT
+        loaders by explicit delivery plan. Here the controller holds one batch
+        per language lane, so the lane each rank belongs to is what decides its
+        batch, and the encoder ranks narrow their lane's batch to their own media
+        range in the worker.
+        """
+        if self._open_step_mbs is None:
+            raise RuntimeError(
+                "MIMO microbatch dispatch needs the microbatch size of an open "
+                "train step, and begin_train_step has not run."
+            )
+        num_microbatches = self._mimo_lane_microbatches(dp_metas, self._open_step_mbs)
+
+        if self.flops_tracker is not None:
+            for m in dp_metas:
+                self.flops_tracker.track_batch(list(m.sequence_lengths or []))
+
+        with (
+            timer.time("policy_training/submit_microbatch_futures")
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_multiple_data(
+                "train_microbatch_presharded",
+                meta=self._mimo_per_rank_shards(dp_metas),
+                common_kwargs={
+                    "num_microbatches": num_microbatches,
+                    # See _submit_mimo_logprob_metas: the padded row width, not
+                    # the context-parallel forward width.
+                    "sequence_length": int(
+                        dp_metas[0].extra_info[GLOBAL_FORWARD_PAD_SEQLEN]
+                    ),
+                    # See _submit_mimo_logprob_metas: rollout batches still
+                    # carry every encoder rank's media.
+                    "split_encoder_media": True,
+                    **trace_context_kwargs(),
+                },
+            )
+        ray.get(futures)
+
+    def _mimo_language_lane_ranks(self) -> list[int]:
+        """Rank of one language replica per data lane.
+
+        The MIMO stand-in for the ``is_replica_leader`` filter, which a flat
+        worker axis cannot answer: it reports every rank a leader, encoder
+        ranks included. Each module's ranks are contiguous
+        tensor x context x pipeline replicas from its offset, so striding by
+        that width picks exactly one rank per lane -- the same disjoint cover
+        of the batch the named-axis filter gives every other backend.
+        """
+        assert self.mimo_config is not None
+        language = self.mimo_config.parallelism["module_parallelisms"]["language"]
+        replica_width = (
+            language["tensor_model_parallel_size"]
+            * language["context_parallel_size"]
+            * language["pipeline_model_parallel_size"]
+        )
+        offset = language["rank_offset"]
+        return [
+            offset + lane * replica_width
+            for lane in range(language["data_parallel_size"])
+        ]
+
     def finish_train_step(self) -> dict[str, Any]:
         """Close an open train step: all_reduce, rescale, optimizer.step.
 
@@ -988,6 +1176,7 @@ class TQPolicy(TQDriverMixin, Policy):
             )
         results = ray.get(futures)
         self._queued_finish_refs = None
+        self._open_step_mbs = None
         # Filter to DP-replica leaders only. ``run_all_workers_single_data``
         # returns one result per GPU (TP×CP×PP×DP), but TP/CP/non-last-PP
         # twins hold identical copies of their DP shard's metric list.
@@ -996,10 +1185,7 @@ class TQPolicy(TQDriverMixin, Policy):
         # gets this for free via ``output_is_replicated`` on its sharded
         # dispatch; finish has no data to shard, so we dedupe here.
         if self.mimo_config is not None:
-            language_rank = self.mimo_config.parallelism["module_parallelisms"][
-                "language"
-            ]["rank_offset"]
-            leader_results = [results[language_rank]]
+            leader_results = [results[r] for r in self._mimo_language_lane_ranks()]
         else:
             leader_results = [r for r in results if r.get("is_replica_leader", True)]
         aggregated_results = _aggregate_train_results(leader_results)
@@ -1018,6 +1204,7 @@ class TQPolicy(TQDriverMixin, Policy):
                 self._queued_finish_refs, num_returns=len(self._queued_finish_refs)
             )
             self._queued_finish_refs = None
+        self._open_step_mbs = None
         futures = self.worker_group.run_all_workers_single_data(
             "abort_train_step_presharded",
             **trace_context_kwargs(),

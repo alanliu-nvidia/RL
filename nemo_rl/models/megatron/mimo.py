@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
@@ -37,6 +37,9 @@ class MIMOSFTConfig(BaseModel):
     # images and video tubelets into contiguous ranges of equal cost. Cost of one
     # unit = its patches per frame + this weight per frame.
     encoder_media_split_frame_weight: int = Field(default=165, ge=0)
+    # Frames per video tubelet, the smallest piece that split keeps whole. Match
+    # the task encoder's temporal_patch_size; it only affects video.
+    encoder_media_split_temporal_patch_size: int = Field(default=2, gt=0)
 
 
 def resolve_mimo_sft_config(policy_config: Mapping[str, Any]) -> MIMOSFTConfig | None:
@@ -114,6 +117,78 @@ def validate_mimo_parallelism(
             + details
         )
     return parallelism
+
+
+def mimo_rank_to_lane(
+    parallelism: Mapping[str, Any], *, world_size: int
+) -> list[int]:
+    """Map every rank to the language lane whose batch it has to receive.
+
+    ``build_mimo_data_loader_placement`` answers a neighbouring question --
+    which rank *owns a loader* for a lane -- and under single-owner loading not
+    every rank appears there. GRPO fans data out from the controller, so it
+    needs the lane every rank must *see*. Ranks are contiguous ``tp*cp*pp``
+    replicas from each module's ``rank_offset``, the same layout that function
+    uses; expert parallelism folds into DP and does not widen a replica.
+    """
+    modules = parallelism["module_parallelisms"]
+    language = modules["language"]
+    encoders = [config for name, config in modules.items() if name != "language"]
+    if len(encoders) != 1:
+        raise ValueError("MIMO GRPO requires exactly one encoder component.")
+    encoder = encoders[0]
+
+    language_dp = language["data_parallel_size"]
+    encoder_dp = encoder["data_parallel_size"]
+    if language_dp <= 0 or encoder_dp <= 0 or encoder_dp % language_dp:
+        raise ValueError(
+            f"MIMO encoder DP {encoder_dp} must be a positive multiple of "
+            f"language DP {language_dp}."
+        )
+    stride = encoder_dp // language_dp
+
+    lanes: list[Optional[int]] = [None] * world_size
+
+    def assign(offset: int, replica_size: int, replicas: int, lane_of) -> None:
+        for replica in range(replicas):
+            start = offset + replica * replica_size
+            for rank in range(start, start + replica_size):
+                if not 0 <= rank < world_size:
+                    raise ValueError(
+                        f"MIMO rank {rank} is outside a world of {world_size}."
+                    )
+                if lanes[rank] is not None:
+                    raise ValueError(f"MIMO rank {rank} is claimed by two modules.")
+                lanes[rank] = lane_of(replica)
+
+    assign(
+        language["rank_offset"],
+        _replica_size(language),
+        language_dp,
+        lambda replica: replica,
+    )
+    assign(
+        encoder["rank_offset"],
+        _replica_size(encoder),
+        encoder_dp,
+        lambda replica: replica // stride,
+    )
+
+    unassigned = [rank for rank, lane in enumerate(lanes) if lane is None]
+    if unassigned:
+        raise ValueError(
+            f"MIMO leaves ranks {unassigned} without a module; the parallelism "
+            "block does not cover the world."
+        )
+    return cast(list[int], lanes)
+
+
+def _replica_size(module: Mapping[str, Any]) -> int:
+    return (
+        module["tensor_model_parallel_size"]
+        * module["context_parallel_size"]
+        * module["pipeline_model_parallel_size"]
+    )
 
 
 def mimo_worker_sharding(world_size: int) -> NamedSharding:

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from collections import defaultdict
+from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from typing import (
@@ -97,6 +98,8 @@ PostProcessingFunction = Union[
 ]
 
 _MIMO_IGNORE_INDEX = -100
+# The lengths sequence packing is driven by, as auto-detected in data.py.
+_MIMO_SEQ_LENGTH_KEY = "input_lengths"
 
 
 def _prepare_padding_mask_for_model(
@@ -520,34 +523,128 @@ def _mimo_packing_kwargs(
     }
 
 
+def _mimo_pack_rows(
+    rows: torch.Tensor,
+    starts: Sequence[int],
+    lengths: Sequence[int],
+    total_tokens: int,
+    fill: float,
+) -> torch.Tensor:
+    """Lay per-token rows into the THD row their tokens were packed into.
+
+    A per-token tensor only lines up with the tokens it describes while it
+    shares their layout, so it is placed on the boundaries packing already
+    chose rather than rebuilt from the rows. Each sequence begins where its
+    padded span begins and carries only its valid tokens; the padding the
+    packer left after it keeps ``fill``.
+    """
+    if len(starts) - 1 != rows.shape[0] or len(lengths) != rows.shape[0]:
+        raise ValueError(
+            f"MIMO packing describes {len(starts) - 1} spans and "
+            f"{len(lengths)} lengths for {rows.shape[0]} rows."
+        )
+    packed = rows.new_full((1, total_tokens), fill)
+    for index, length in enumerate(lengths):
+        if length > rows.shape[1]:
+            raise ValueError(
+                f"MIMO sequence {index} is {length} tokens but its row holds "
+                f"{rows.shape[1]}."
+            )
+        start = starts[index]
+        packed[0, start : start + length] = rows[index, :length]
+    return packed
+
+
+def _mimo_cp_layout(mimo_model: Any) -> str:
+    """The context-parallel order this model hands its outputs back in.
+
+    MIMO partitions its own batch, because media has to be inserted before
+    the context-parallel selection happens, and the order it leaves behind is
+    the one its partition adapter was built with. Everything that reads those
+    outputs has to pick its tokens the same way, which is not the zigzag
+    NeMo-RL shards its own batches with whenever the language model's linear
+    layers ask for contiguous blocks.
+
+    An unsplit sequence has no such order, so the default is reported rather
+    than the adapter's setting, which the model carries whatever the context
+    parallel size. Saying otherwise would send the collectors down paths that
+    exist only to honour a real split, and refuse the ones -- unpacked
+    batches, fused linear logprobs -- that a context parallel size of one is
+    entitled to use.
+    """
+    if get_context_parallel_world_size() == 1:
+        return "zigzag"
+    adapter = getattr(mimo_model, "partition_adapter", None)
+    if adapter is None:
+        raise RuntimeError(
+            "A MIMO language rank must have a partition adapter to report its "
+            "context-parallel layout."
+        )
+    return str(adapter.cfg.linear_cp_layout)
+
+
 def _mimo_language_batch(
     microbatch: ProcessedMicrobatch,
     mimo_model: Any,
+    *,
+    with_labels: bool = True,
 ) -> dict[str, Any]:
-    """Project one existing processed SFT microbatch into the language role."""
+    """Project one existing processed SFT microbatch into the language role.
+
+    ``with_labels`` picks what the language model returns. Bridge's MIMO loss
+    reads per-token losses, which only come back when the model is given
+    labels; every NeMo-RL post-processor wants the ``[b, s, v]`` logits the
+    model returns when it is not.
+    """
     input_ids = microbatch.input_ids
+    packed_seq_params = microbatch.packed_seq_params
     data = microbatch.data_dict
     token_mask = data["token_mask"]
     sample_mask = data["sample_mask"]
-    if token_mask.shape != input_ids.shape or sample_mask.shape != (
-        input_ids.shape[0],
-    ):
-        raise ValueError("MIMO language masks do not match the processed input batch.")
+    # Where the masks already share the model's layout -- unpacked, or packed
+    # upstream by Energon -- the pairing can be built straight on them. Packing
+    # done at microbatch time leaves them behind on the rows they came from,
+    # so there the pairing is built on those rows and packed afterwards. Doing
+    # it the other way round would pair the last token of one sequence with
+    # the first token of the next.
+    repack = packed_seq_params is not None and token_mask.shape != input_ids.shape
+    rows = data["input_ids"] if repack else input_ids
+    if token_mask.shape != rows.shape or sample_mask.shape != (rows.shape[0],):
+        raise ValueError("MIMO language masks do not match the input batch rows.")
 
-    labels = torch.full_like(input_ids, _MIMO_IGNORE_INDEX)
-    loss_mask = torch.zeros_like(token_mask, dtype=torch.float32)
-    if input_ids.shape[1] > 1:
-        labels[:, :-1] = input_ids[:, 1:]
+    labels = torch.full_like(rows, _MIMO_IGNORE_INDEX)
+    loss_mask = torch.zeros_like(rows, dtype=torch.float32)
+    if rows.shape[1] > 1:
+        labels[:, :-1] = rows[:, 1:]
         loss_mask[:, :-1] = token_mask[:, 1:].to(torch.float32) * sample_mask.unsqueeze(
             -1
         )
         for token_id in mimo_model.special_token_ids.values():
-            loss_mask[:, :-1].masked_fill_(input_ids[:, 1:] == token_id, 0)
+            loss_mask[:, :-1].masked_fill_(rows[:, 1:] == token_id, 0)
     labels[loss_mask == 0] = _MIMO_IGNORE_INDEX
+
+    if repack:
+        width = input_ids.shape[1]
+        # Every PackedSeqParams boundary is a padded one, so the valid length
+        # of each sequence has to come from the same lengths the packer was
+        # given rather than from the spans it produced.
+        if _MIMO_SEQ_LENGTH_KEY not in data:
+            raise ValueError(
+                "MIMO needs per-sequence lengths to pack the language masks, "
+                f"but the batch carries no {_MIMO_SEQ_LENGTH_KEY!r}."
+            )
+        starts = packed_seq_params.cu_seqlens_q_padded.tolist()
+        lengths = [int(length) for length in data[_MIMO_SEQ_LENGTH_KEY]]
+        labels = _mimo_pack_rows(
+            labels, starts, lengths, width, _MIMO_IGNORE_INDEX
+        )
+        loss_mask = _mimo_pack_rows(loss_mask, starts, lengths, width, 0)
+    if labels.shape != input_ids.shape:
+        raise ValueError("MIMO language masks do not match the processed input batch.")
 
     return {
         "input_ids": input_ids,
-        "labels": labels,
+        "labels": labels if with_labels else None,
         "loss_mask": loss_mask,
         "position_ids": microbatch.position_ids,
         "attention_mask": None,
@@ -717,11 +814,34 @@ def _check_mimo_encoder_rows(
         )
 
 
+def _mimo_encoder_no_collection(
+    output_tensor: Any,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Stand in for a collector on ranks that hold no language module.
+
+    Encoder ranks emit media embeddings, not vocabulary logits, so there is
+    nothing for a post-processor to gather from them. The schedule only calls
+    the collector on the stage that produces the loss, which is never one of
+    these ranks, but every forward step has to return one.
+    """
+    del output_tensor
+    return torch.zeros((), device=torch.cuda.current_device()), {}
+
+
 def mimo_forward_with_post_processing_fn(
     data_iterator: Iterator[Optional[ProcessedMicrobatch]],
     model: Any,
+    post_processing_fn: Optional[PostProcessingFunction] = None,
+    sampling_params: Optional[TrainingSamplingParams] = None,
+    global_valid_seqs: Optional[torch.Tensor] = None,
+    global_valid_toks: Optional[torch.Tensor] = None,
 ) -> tuple[Any, Callable]:
-    """Run one role-local NeMo-RL microbatch through ``MimoModel``."""
+    """Run one role-local NeMo-RL microbatch through ``MimoModel``.
+
+    With ``post_processing_fn`` unset the model is given labels and the
+    collector is Bridge's own next-token loss. Every NeMo-RL post-processor
+    consumes logits instead, and only language ranks can service one.
+    """
     # Keep Bridge's experimental MIMO utilities out of ordinary Megatron imports.
     from megatron.bridge.training.megatron_mimo_parallel_utils import (
         unwrap_megatron_mimo_model,
@@ -733,7 +853,9 @@ def mimo_forward_with_post_processing_fn(
     if mimo_model.role.has_language_module:
         if microbatch is None:
             raise RuntimeError("Every language rank requires its role batch.")
-        batch = _mimo_language_batch(microbatch, mimo_model)
+        batch = _mimo_language_batch(
+            microbatch, mimo_model, with_labels=post_processing_fn is None
+        )
     else:
         batch = _mimo_encoder_batch(microbatch, mimo_model)
 
@@ -750,7 +872,43 @@ def mimo_forward_with_post_processing_fn(
             require_counts=_mimo_encoder_media_split_active(mimo_model),
         )
 
-    return output_tensor, partial(loss_func, loss_mask)
+    if post_processing_fn is None:
+        return output_tensor, partial(loss_func, loss_mask)
+
+    if not mimo_model.role.has_language_module:
+        return output_tensor, _mimo_encoder_no_collection
+
+    # Element-wise, so it belongs on the logits here rather than inside the
+    # post-processor, which is where the whole-vocabulary sampling parameters
+    # are applied instead.
+    apply_temperature_scaling(output_tensor, sampling_params)
+
+    if isinstance(post_processing_fn, LossPostProcessor):
+        return output_tensor, post_processing_fn(
+            data_dict=microbatch.data_dict,
+            packed_seq_params=microbatch.packed_seq_params,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            cp_layout=_mimo_cp_layout(mimo_model),
+        )
+
+    if not isinstance(post_processing_fn, LogprobsPostProcessor):
+        raise TypeError(
+            "MIMO forward supports LossPostProcessor and LogprobsPostProcessor, "
+            f"got {type(post_processing_fn).__name__}."
+        )
+    if microbatch.original_seq_length is None:
+        raise RuntimeError(
+            "A MIMO language microbatch must carry original_seq_length to "
+            "unpad logprobs."
+        )
+    return output_tensor, post_processing_fn(
+        data_dict=microbatch.data_dict,
+        input_ids=microbatch.input_ids,
+        cu_seqlens_padded=microbatch.cu_seqlens_padded,
+        original_seq_length=microbatch.original_seq_length,
+        cp_layout=_mimo_cp_layout(mimo_model),
+    )
 
 
 def megatron_mimo_forward_backward(
@@ -761,19 +919,30 @@ def megatron_mimo_forward_backward(
     seq_length: int,
     mbs: int,
     mimo_runtime: "MegatronMIMOSetupOutput",
+    post_processing_fn: Optional[PostProcessingFunction] = None,
+    forward_only: bool = False,
+    sampling_params: Optional[TrainingSamplingParams] = None,
+    global_valid_seqs: Optional[torch.Tensor] = None,
+    global_valid_toks: Optional[torch.Tensor] = None,
 ) -> Any:
     """Invoke Megatron-LM's selected multi-module forward/backward schedule."""
     forward_backward_func = get_forward_backward_func(
         schedule_pg_collection=mimo_runtime.multimodule_pg_collection
     )
     return forward_backward_func(
-        forward_step_func=mimo_forward_with_post_processing_fn,
+        forward_step_func=partial(
+            mimo_forward_with_post_processing_fn,
+            post_processing_fn=post_processing_fn,
+            sampling_params=sampling_params,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+        ),
         data_iterator=data_iterator,
         model=[model],
         num_microbatches=num_microbatches,
         seq_length=seq_length,
         micro_batch_size=mbs,
-        forward_only=False,
+        forward_only=forward_only,
         p2p_communicator=mimo_runtime.multimodule_communicator,
         pg_collection=mimo_runtime.multimodule_pg_collection,
     )
@@ -922,6 +1091,7 @@ class LossPostProcessor:
         packed_seq_params: Optional[PackedSeqParams] = None,
         global_valid_seqs: Optional[torch.Tensor] = None,
         global_valid_toks: Optional[torch.Tensor] = None,
+        cp_layout: str = "zigzag",
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
         """Create a loss post-processing function for training.
 
@@ -934,6 +1104,9 @@ class LossPostProcessor:
             packed_seq_params: Parameters for packed sequences (optional)
             global_valid_seqs: Global valid sequence count for loss normalization
             global_valid_toks: Global valid token count for loss normalization
+            cp_layout: The context-parallel order the logits will arrive in.
+                Defaults to the zigzag split NeMo-RL shards its own batches
+                with; a model that partitions the batch itself may differ.
 
         Returns:
             Callable: Function that takes output tensor and returns (loss, metrics) tuple
@@ -941,6 +1114,11 @@ class LossPostProcessor:
         # A custom prepare_fn (e.g. value models) overrides the default logit prep.
         logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
         if self.prepare_fn is not None:
+            if cp_layout != "zigzag":
+                raise NotImplementedError(
+                    f"A custom prepare_fn cannot be told that its logits are "
+                    f"in the {cp_layout!r} context-parallel layout."
+                )
             prepare_loss_input_wrapped = self.prepare_fn
         else:
             prepare_loss_input_wrapped = partial(
@@ -949,6 +1127,7 @@ class LossPostProcessor:
                 d2t=self.d2t,
                 chunk_size=logprob_chunk_size,
                 teacher_output_layer_weight_by_index=self.teacher_output_layer_weight_by_index,
+                cp_layout=cp_layout,
             )
 
         # wrap loss function with loss input preparation
@@ -970,6 +1149,7 @@ class LossPostProcessor:
                     prepare_packed_loss_input,
                     sampling_params=self.sampling_params,
                     chunk_size=logprob_chunk_size,
+                    cp_layout=cp_layout,
                 )
             else:
                 wrapper_cls = SequencePackingLossWrapper
@@ -989,6 +1169,7 @@ class LossPostProcessor:
                 vocab_parallel_rank=get_tensor_model_parallel_rank(),
                 vocab_parallel_group=get_tensor_model_parallel_group(),
                 context_parallel_group=get_context_parallel_group(),
+                cp_layout=cp_layout,
             )
             if "student_logits" in data_dict:
                 # draft + use_fused_linear_logprobs is rejected at setup in
@@ -1095,6 +1276,7 @@ class LogprobsPostProcessor:
         input_ids: torch.Tensor,
         cu_seqlens_padded: Optional[torch.Tensor | CpuIntTuple],
         original_seq_length: int,
+        cp_layout: str = "zigzag",
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create a post-processing function that computes token log probabilities.
 
@@ -1106,6 +1288,9 @@ class LogprobsPostProcessor:
             input_ids: Processed input token IDs
             cu_seqlens_padded: Cumulative sequence lengths for packed sequences
             original_seq_length: Sequence width before dense padding was applied
+            cp_layout: The context-parallel order the logits will arrive in.
+                Defaults to the zigzag split NeMo-RL shards its own batches
+                with; a model that partitions the batch itself may differ.
 
         Returns:
             Callable: Function that takes output tensor and returns (dummy_loss, {"logprobs": token_logprobs})
@@ -1115,6 +1300,20 @@ class LogprobsPostProcessor:
         if self.cfg["sequence_packing"]["enabled"]:
             assert cu_seqlens_padded is not None
             cu_seqlens_padded_cpu = to_cpu_int_tuple(cu_seqlens_padded)
+        # Only the packed, unfused branch below chooses its own targets, so it
+        # is the only one that can honour a layout other than the default.
+        # Refuse the rest rather than quietly read the logits in the wrong
+        # order, which costs nothing today: a model that partitions its own
+        # batch runs context parallelism, and that already requires packing.
+        if cp_layout != "zigzag" and (
+            self.use_fused_linear_logprobs
+            or not self.cfg["sequence_packing"]["enabled"]
+        ):
+            raise NotImplementedError(
+                f"Logprobs in the {cp_layout!r} context-parallel layout need "
+                "the packed, unfused path; fused linear logprobs and unpacked "
+                "batches both assume the zigzag split."
+            )
 
         def processor_fn_inner(output_tensor):
             if self.use_fused_linear_logprobs:
@@ -1137,6 +1336,7 @@ class LogprobsPostProcessor:
                     cp_group=get_context_parallel_group(),
                     chunk_size=logprob_chunk_size,
                     sampling_params=self.sampling_params,
+                    cp_layout=cp_layout,
                 )
             else:
                 tp_grp = get_tensor_model_parallel_group()
