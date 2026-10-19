@@ -220,7 +220,7 @@ def build_video_preprocessing_config(
     generation_config: dict[str, Any],
     *,
     frame_manifest_magic: bytes,
-) -> VideoProcessingConfig | None:
+) -> "VideoProcessingConfig | None":
     """Build video preprocessing when explicitly enabled by generation config."""
     video_num_frames = generation_config.get("video_num_frames")
     if image_config is None or video_num_frames is None:
@@ -230,6 +230,11 @@ def build_video_preprocessing_config(
             "Megatron video generation requires a Megatron-LM revision that "
             "provides VideoProcessingConfig."
         )
+
+    # Deferred: video preprocessing is opt-in, and VideoProcessingConfig is newer
+    # than some pinned Megatron-core branches. Importing it at module scope made
+    # image-only runs fail on those pins.
+    from megatron.core.inference.config import VideoProcessingConfig
 
     # Video configs.
     video_kwargs: dict[str, Any] = {}

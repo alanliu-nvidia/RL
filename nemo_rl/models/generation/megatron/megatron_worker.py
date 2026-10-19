@@ -15,12 +15,13 @@
 import asyncio
 import gc
 import importlib
+import inspect
 import os
 import threading
 import time
 import warnings
 from collections import Counter, OrderedDict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields as dataclass_fields, replace
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
 
 import requests
@@ -165,6 +166,18 @@ def _resolve_mxfp8_refit_backend(model_config: Any) -> str:
     return resolve_mxfp8_backend(model_config.inference_grouped_gemm_backend)
 
 
+def _execution_batch_bytes_kwarg(fn: Any, value: int | None) -> dict[str, int]:
+    """Pass `execution_batch_bytes` only to Megatron refit entrypoints that take it.
+
+    The parameter is newer than some pinned Megatron-core branches. These calls
+    are collective, so the signature is probed rather than retrying a failed
+    call, which would leave the process group desynchronized.
+    """
+    if value is None or "execution_batch_bytes" not in inspect.signature(fn).parameters:
+        return {}
+    return {"execution_batch_bytes": value}
+
+
 @dataclass
 class _MegatronRefitTask:
     """A Bridge import task and its mutable inference destination."""
@@ -256,6 +269,21 @@ def _apply_optional_inference_config_kwargs(
         inference_config_kwargs["prefix_caching_mamba_gb"] = mcore_generation_config[
             "prefix_caching_mamba_gb"
         ]
+
+    # Several of these settings are newer than some pinned Megatron-core
+    # branches. Drop the ones the installed InferenceConfig cannot accept so a
+    # recipe written against a newer pin still runs, and say which were dropped
+    # rather than letting them look applied.
+    supported = {field.name for field in dataclass_fields(InferenceConfig)}
+    unsupported = sorted(set(inference_config_kwargs) - supported)
+    for key in unsupported:
+        del inference_config_kwargs[key]
+    if unsupported:
+        warnings.warn(
+            "Ignoring Megatron inference settings this Megatron-core build does "
+            f"not support: {', '.join(unsupported)}.",
+            stacklevel=2,
+        )
 
 
 def _apply_inference_cuda_graph_scope(
@@ -602,8 +630,14 @@ class MegatronGenerationMixin:
             "logprobs_mode": mcore_generation_config["logprobs_mode"],
             "max_requests": max_requests,
             "image_preprocessing_config": image_preprocessing_config,
-            "video_preprocessing_config": video_preprocessing_config,
         }
+        # Video preprocessing is opt-in and InferenceConfig only grew the field
+        # after some pinned Megatron-core branches were cut, so forward it only
+        # when a video config was actually built.
+        if video_preprocessing_config is not None:
+            inference_config_kwargs["video_preprocessing_config"] = (
+                video_preprocessing_config
+            )
         _apply_optional_inference_config_kwargs(
             inference_config_kwargs, mcore_generation_config
         )
@@ -1496,7 +1530,9 @@ class MegatronGenerationRefitMixin:
             group=self.refit_pg,
             src_rank_offset=0,
             dst_rank_offset=self.refit_dst_rank_offset,
-            execution_batch_bytes=self.refit_execution_batch_bytes,
+            **_execution_batch_bytes_kwarg(
+                prepare_swap_model_weights, self.refit_execution_batch_bytes
+            ),
         )
 
     def preinit_nvshmem_collective(self) -> None:
@@ -1533,7 +1569,9 @@ class MegatronGenerationRefitMixin:
             group=self.refit_pg,
             src_rank_offset=0,
             dst_rank_offset=self.refit_dst_rank_offset,
-            execution_batch_bytes=self.refit_execution_batch_bytes,
+            **_execution_batch_bytes_kwarg(
+                swap_model_weights, self.refit_execution_batch_bytes
+            ),
         )
 
         return True
@@ -2173,7 +2211,9 @@ class MegatronGenerationRefitMixin:
                 group=None,
                 src_rank_offset=0,
                 dst_rank_offset=0,
-                execution_batch_bytes=execution_batch_bytes,
+                **_execution_batch_bytes_kwarg(
+                    prepare_swap_model_weights, execution_batch_bytes
+                ),
             )
             self._swap_weights_plan_prepared = True
 
@@ -2186,7 +2226,7 @@ class MegatronGenerationRefitMixin:
             group=None,
             src_rank_offset=0,
             dst_rank_offset=0,
-            execution_batch_bytes=execution_batch_bytes,
+            **_execution_batch_bytes_kwarg(swap_model_weights, execution_batch_bytes),
         )
         # Offload training model.
         self.model = self.move_model(
