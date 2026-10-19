@@ -27,12 +27,10 @@
 # Optional isolated managed Dynamo runtime (Dynamo + vLLM only):
 #   --build-arg BUILD_DYNAMO=1
 #
-# transformer-engine and nvidia-cudnn-frontend resolve from internal ADLR GitLab
-# forks over HTTPS (see [tool.uv.sources] in pyproject.toml), and custom wheels
-# (e.g. gdp-attn-fused, nvidia-cutlass-dsl) from the gitlab-internal-pypi index
-# (see [[tool.uv.index]] in pyproject.toml). Supply a GitLab CI_JOB_TOKEN as a
-# build secret (never a build-arg) to authenticate both; builds without it fail
-# at the `uv sync`/`uv lock --check` steps that need it:
+# nvidia-cudnn-frontend resolves from an internal ADLR GitLab fork over HTTPS
+# (see [tool.uv.sources] in pyproject.toml). Supply a GitLab CI_JOB_TOKEN as a
+# build secret to authenticate Git fetches. Custom wheels from the
+# gitlab-internal-pypi package index are available without credentials.
 #   docker buildx build --secret id=CI_JOB_TOKEN,env=CI_JOB_TOKEN -f docker/Dockerfile ...
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
@@ -300,25 +298,18 @@ elif [ -n "$SEED_KEY" ]; then
     rsync -a --exclude='.cache-key' /tmp/uv-cache-seed/ "${UV_CACHE_DIR}/" 2>/dev/null || true
 fi
 
-# transformer-engine and nvidia-cudnn-frontend resolve from internal ADLR
-# GitLab forks over HTTPS (see [tool.uv.sources] in pyproject.toml). uv shells
-# out to the system `git` for these, so authenticate it with a short-lived git
+# nvidia-cudnn-frontend resolves from an internal ADLR GitLab fork over HTTPS
+# (see [tool.uv.sources] in pyproject.toml). uv shells out to the system `git`
+# for this, so authenticate it with a short-lived git
 # credential helper fed from the CI_JOB_TOKEN build secret. The token is never
 # a build-arg (would persist in image history) and never embedded in a git URL
 # (would persist in uv.lock and in the uv-cache-seed export below); `set +x`
 # brackets only the line that expands the token so it never hits the build log.
-# The same secret also authenticates the gitlab-internal-pypi index (custom
-# wheels, e.g. gdp-attn-fused/nvidia-cutlass-dsl; see [[tool.uv.index]] in
-# pyproject.toml) via uv's documented UV_INDEX_<NAME>_USERNAME/PASSWORD env
-# vars -- these are plain shell exports, not a file, so unlike the git
-# credentials above they need no cleanup: each RUN instruction is a fresh
-# shell, and env vars never persist into the image layer the way a file would.
+# The gitlab-internal-pypi package index uses anonymous access.
 if [[ -f /run/secrets/CI_JOB_TOKEN ]]; then
     { set +x; \
       git config --global credential.helper store; \
       echo "https://gitlab-ci-token:$(cat /run/secrets/CI_JOB_TOKEN)@gitlab-master.nvidia.com" > ~/.git-credentials; \
-      export UV_INDEX_GITLAB_INTERNAL_PYPI_USERNAME=gitlab-ci-token; \
-      export UV_INDEX_GITLAB_INTERNAL_PYPI_PASSWORD=$(cat /run/secrets/CI_JOB_TOKEN); \
       set -x; }
     chmod 600 ~/.git-credentials
 fi
@@ -502,13 +493,11 @@ RUN --mount=type=ssh \
 # above (tensorrt-llm's workspace moved there too, so the relock no longer
 # needs to wait for this layer -- see the comment on that COPY). The
 # credential helper here is still needed for this layer's own fetches during
-# the actual TRT-LLM build below (internal ADLR forks, gitlab-internal-pypi).
+# the actual TRT-LLM build below (internal ADLR forks).
 if [[ -f /run/secrets/CI_JOB_TOKEN ]]; then
     { set +x; \
       git config --global credential.helper store; \
       echo "https://gitlab-ci-token:$(cat /run/secrets/CI_JOB_TOKEN)@gitlab-master.nvidia.com" > ~/.git-credentials; \
-      export UV_INDEX_GITLAB_INTERNAL_PYPI_USERNAME=gitlab-ci-token; \
-      export UV_INDEX_GITLAB_INTERNAL_PYPI_PASSWORD=$(cat /run/secrets/CI_JOB_TOKEN); \
       set -x; }
     chmod 600 ~/.git-credentials
 fi

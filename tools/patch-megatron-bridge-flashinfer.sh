@@ -43,6 +43,8 @@ if [[ ! -f "$MEGATRON_BRIDGE_PYPROJECT" ]]; then
 fi
 
 sed -i \
+  -e 's|https://gitlab-master.nvidia.com/api/v4/projects/65523/packages/pypi/simple|https://gitlab-master.nvidia.com/api/v4/projects/636413/packages/pypi/simple|g' \
+  -e '/^name = "gitlab-internal-pypi"$/,/^\[/s/^authenticate = "always"$/authenticate = "never"/' \
   -e 's/^flashinfer-python = { index = "flashinfer" }$/flashinfer-python = { index = "gitlab-internal-pypi" }/' \
   -e 's/^flashinfer-cubin = { index = "flashinfer" }$/flashinfer-cubin = { index = "gitlab-internal-pypi" }/' \
   "$MEGATRON_BRIDGE_PYPROJECT"
@@ -52,9 +54,9 @@ if ! grep -q 'name = "gitlab-internal-pypi"' "$MEGATRON_BRIDGE_PYPROJECT"; then
 
 [[tool.uv.index]]
 name = "gitlab-internal-pypi"
-url = "https://gitlab-master.nvidia.com/api/v4/projects/65523/packages/pypi/simple"
+url = "https://gitlab-master.nvidia.com/api/v4/projects/636413/packages/pypi/simple"
 explicit = true
-authenticate = "always"
+authenticate = "never"
 EOF
 fi
 
