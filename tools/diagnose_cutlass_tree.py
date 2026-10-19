@@ -78,9 +78,13 @@ def main(venv: str) -> int:
             if os.path.isfile(full) and _digest(full) != files[path]:
                 mismatched.append((path, _digest(full)))
         total_mismatched += len(mismatched)
-        print(f"  {dist}: {len(files)} files, {len(mismatched)} no longer match its RECORD")
+        print(
+            f"  {dist}: {len(files)} files, {len(mismatched)} no longer match its RECORD"
+        )
         for path, now_hash in sorted(mismatched)[:5]:
-            holder = owners.get((path, now_hash)) or ["(no cutlass wheel has this content)"]
+            holder = owners.get((path, now_hash)) or [
+                "(no cutlass wheel has this content)"
+            ]
             print(f"    {path}\n      now holds content from: {', '.join(holder)}")
 
     shared = sorted(p for p, dists in shipped_by.items() if len(dists) > 1)
@@ -95,9 +99,16 @@ def main(venv: str) -> int:
             with open(full, errors="ignore") as fh:
                 if needle in fh.read():
                     rel = os.path.relpath(full, site_packages)
-                    print(f"  {needle.split()[-1]} defined in {rel} (shipped by: {', '.join(shipped_by.get(rel, ['?']))})")
+                    print(
+                        f"  {needle.split()[-1]} defined in {rel} (shipped by: {', '.join(shipped_by.get(rel, ['?']))})"
+                    )
 
-    print("  ->", "HYBRID tree (files overwritten between wheels)" if total_mismatched else "consistent with every wheel's RECORD")
+    print(
+        "  ->",
+        "HYBRID tree (files overwritten between wheels)"
+        if total_mismatched
+        else "consistent with every wheel's RECORD",
+    )
     return 1 if total_mismatched else 0
 
 

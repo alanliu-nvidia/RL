@@ -20,12 +20,15 @@ def test_mimo_begin_stages_shared_params_before_step_initialization(
 ) -> None:
     # These imports require the optional Megatron/TE worker environment.
     from megatron.bridge.training import megatron_mimo_parallel_utils
+
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker.model = torch.nn.Module()  # MIMO wraps its children, not this module, in DDP.
+    worker.model = (
+        torch.nn.Module()
+    )  # MIMO wraps its children, not this module, in DDP.
     worker.model.eval()
     worker.mimo_runtime = SimpleNamespace(module_to_grid_tuple=[(worker.model, None)])
     worker.megatron_cfg = SimpleNamespace(
@@ -65,7 +68,9 @@ def test_mimo_begin_stages_shared_params_before_step_initialization(
         prepare_model_params_for_param_sync=Mock(side_effect=stage_params),
     )
     worker._split_step_state_init = Mock(side_effect=initialize_step)
-    monkeypatch.setattr(megatron_mimo_parallel_utils, "zero_grad_buffer_for_multimodule", clear_buffers)
+    monkeypatch.setattr(
+        megatron_mimo_parallel_utils, "zero_grad_buffer_for_multimodule", clear_buffers
+    )
 
     worker.begin_train_step(None, gbs=4, mbs=1)
 

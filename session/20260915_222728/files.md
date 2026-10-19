@@ -5,7 +5,7 @@
 - `3775506-logs/ray-driver.log` - matched NT4 resolved config and results.
 - `3775507-logs/ray-driver.log` - matched Qwen resolved config and results.
 - `3775508-logs/ray-driver.log` - matched Omni resolved config and results.
-- `logbook/nt4_sft_clevr_comparison_w_omni_qwen.md` - prior findings and
+- `logbook/nt4-sft-clevr-comparison-w-omni-qwen.md` - prior findings and
   benchmark metrics.
 
 ## Changed
@@ -23,7 +23,7 @@
   same-size black-image diagnostic.
 - `tests/unit/models/megatron/{test_megatron_data.py,test_megatron_setup.py}` -
   cover the config and mask plumbing (not run per user request).
-- `logbook/nt4_sft_clevr_comparison_w_omni_qwen.md` - consolidate benchmark
+- `logbook/nt4-sft-clevr-comparison-w-omni-qwen.md` - consolidate benchmark
   results and the confirmed root cause.
 - `reports/auto_research/nt4_nano_clevr/experiments.tsv` - experiment ledger.
 

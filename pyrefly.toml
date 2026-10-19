@@ -40,6 +40,7 @@ project-includes = [
   # uv run --group dev pyrefly check $(git ls-files 'nemo_rl/**/*.py' 'examples/**/*.py' 'docs/*.py' 'tools/**/*.py') --output-format json | jq -r --slurpfile all_files <(git ls-files 'nemo_rl/**/*.py' 'examples/**/*.py' 'docs/*.py' 'tools/**/*.py' | jq -R -s 'split("\n")[:-1]') --arg pwd "$(pwd)/" '(.errors | group_by(.path) | map({(.[0].path | sub($pwd; "")): length}) | add // {}) as $error_counts | $all_files[0][] | . as $file | if ($error_counts[$file] // 0) == 0 then "    \"\($file)\"," else empty end'
   "docs/conf.py",
   "docs/helpers.py",
+  "examples/configs/nm4_CI/run_sft_on_node_blocks.py",
   "examples/converters/convert_dcp_to_hf.py",
   "examples/converters/convert_lora_to_hf.py",
   "examples/converters/convert_megatron_to_hf.py",
@@ -360,6 +361,7 @@ project-includes = [
   "tools/model_diagnostics/4.vllm_precision_compilation_test.py",
   "tools/model_diagnostics/5.prefix_caching_nan.py",
   "tools/model_diagnostics/6.vllm_routed_experts_completeness.py",
+  "tools/nm4_data_diagnostics/summarize_drops.py",
   "tools/refit_bandwidth_calculator.py",
   "tools/verify_tq_data_plane_checkpoint.py",
   "tools/x_token/__init__.py",

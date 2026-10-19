@@ -1,0 +1,135 @@
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    # Avoid duplicate push pipelines for branches already covered by an MR.
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_OPEN_MERGE_REQUESTS'
+      when: never
+    # Branch push pipelines are limited to protected refs (for example, merges
+    # into nt4-posttraining). Feature branches are validated by their MR pipeline.
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+
+variables:
+  RL_MR_TEST_CLUSTER_REGEX:
+    description: "Select the cluster for NeMo-RL merge-request unit tests"
+    value: "/oci_aga_slurm_1/"
+  RL_MR_TEST_CLUSTER:
+    description: "Cluster selected for NeMo-RL merge-request unit tests"
+    value: "oci_aga_slurm_1"
+  RL_MR_TEST_PARTITION:
+    description: "Slurm partition for NeMo-RL merge-request unit tests"
+    value: "batch"
+  TEST_IMAGE:
+    description: "Optional prebuilt image for NeMo-RL merge-request image builds"
+    value: ""
+
+stages:
+  - lint
+  - build
+
+rl_lint:
+  stage: lint
+  interruptible: true
+  tags:
+    - eos-nemo-ci
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+    UV_VERSION: "0.12.2"
+    UV_CACHE_DIR: "/tmp/rl-uv-cache-$CI_JOB_ID"
+    UV_PROJECT_ENVIRONMENT: "/tmp/rl-venv-$CI_JOB_ID"
+    UV_NO_SYNC: "1"
+  before_script:
+    - export INSTALLER_NO_MODIFY_PATH=1
+    - curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
+    - export PATH="$HOME/.local/bin:$PATH"
+    - uv --version
+    - uv python install 3.13.14
+    - uv sync --frozen --python 3.13.14 --only-group dev --no-default-groups --no-install-project
+  script:
+    - SKIP=pyrefly-typecheck uv run --python 3.13.14 --no-sync pre-commit run --all-files --show-diff-on-failure --color=always
+    - |
+      files=()
+      while IFS= read -r file; do
+        files+=("$file")
+      done < <(git ls-files 'nemo_rl/**/*.py' 'examples/**/*.py' 'docs/*.py' 'tools/**/*.py')
+
+      set +o pipefail
+      uv run --python 3.13.14 --no-sync pyrefly check "${files[@]}" --output-format json |
+        uv run --python 3.13.14 --no-sync python -c '
+      import json
+      import pathlib
+      import sys
+
+      root = pathlib.Path.cwd()
+      files = sys.argv[1:]
+      errors = json.load(sys.stdin).get("errors", [])
+      error_counts = {}
+      for error in errors:
+          path = pathlib.Path(error["path"])
+          try:
+              relative_path = path.relative_to(root).as_posix()
+          except ValueError:
+              relative_path = path.as_posix()
+          error_counts[relative_path] = error_counts.get(relative_path, 0) + 1
+
+      whitelist = pathlib.Path("pyrefly.toml").read_text()
+      missing = [path for path in files if error_counts.get(path, 0) == 0 and path not in whitelist]
+      for path in missing:
+          print(f"File {path} has zero errors but is not in pyrefly.toml project-includes.")
+      sys.exit(len(missing))
+      ' "${files[@]}"
+  after_script:
+    - rm -rf -- "$UV_PROJECT_ENVIRONMENT" "$UV_CACHE_DIR"
+
+.rl_nemo_ci_bridge:
+  stage: build
+  interruptible: true
+  trigger:
+    project: dl/JoC/nemo-ci
+    branch: rl-nt4-ci
+    strategy: depend
+    forward:
+      pipeline_variables: true
+  variables:
+    BUILD_MODULE_REGEX: "/^rl$/"
+    ARCH: "x86/arm"
+    RL_REPO_URL: "https://gitlab-master.nvidia.com/dl/nemo/rl.git"
+    RL_REF: "$CI_COMMIT_SHA"
+    SLURM_ACCOUNT: "nemotron_sw_ci"
+    TEST_NT4: "False"
+    RL_CI_TRIGGER: "True"
+
+# Build a private RL-Gym image for each MR without running the RL test suite.
+# Read cache from the target branch first, then from this MR's previous build.
+rl_image_build_on_merge_request:
+  extends: .rl_nemo_ci_bridge
+  variables:
+    BUILD_MODULE_REGEX: "/^rl-gym$/"
+    GYM_TEST_IMAGE: "$TEST_IMAGE"
+    RL_MR_IID: "$CI_MERGE_REQUEST_IID"
+    RL_SOURCE_BRANCH: "$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME"
+    RL_TARGET_BRANCH: "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+    BUILD_IMAGE_REF: "mr-$CI_MERGE_REQUEST_IID"
+    BUILD_CACHE_FROM_REFS: "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME,mr-$CI_MERGE_REQUEST_IID"
+    TEST_NEMO_RL_MODULE: "False"
+    TESTS_TO_RUN_ON_THIS_COMMIT: "NONE"
+    TEST_REGEX_ON_THIS_COMMIT: "NONE"
+    TEST_CLUSTER_REGEX: "$RL_MR_TEST_CLUSTER_REGEX"
+    RL_CLUSTER_TAG: "$RL_MR_TEST_CLUSTER_REGEX"
+    PIPELINE_NAME: "rl-mr-${CI_MERGE_REQUEST_IID}"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+# Protected branch pushes refresh the branch image, including MR merge commits.
+rl_image_build_on_branch_push:
+  extends: .rl_nemo_ci_bridge
+  variables:
+    BUILD_IMAGE_REF: "$CI_COMMIT_BRANCH"
+    BUILD_CACHE_FROM_REFS: "$CI_COMMIT_BRANCH"
+    TEST_NEMO_RL_MODULE: "False"
+    RL_CI_TRIGGER: "False"
+    PIPELINE_NAME: "rl-push-${CI_COMMIT_BRANCH}"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'

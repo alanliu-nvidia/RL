@@ -30,7 +30,7 @@ mkdir -p session/<session_date_time>
 Use local time from the machine. Reuse the same session directory for all checkpoints in the same conversation unless the user explicitly starts a new session.
 
 Expected files:
-- `session_state.md` - overall goal, current subtask, loaded skills, status, plan, assumptions, blockers, and next actions.
+- `session-state.md` - overall goal, current subtask, loaded skills, status, plan, assumptions, blockers, and next actions.
 - `timeline.md` - append-only log of major actions, commands, results, and decisions.
 - `files.md` - files inspected, files changed, and why they matter.
 - `handoff.md` - concise resume instructions for the next agent.
@@ -46,9 +46,9 @@ At the start of a session:
 ls -dt session/* 2>/dev/null | head
 ```
 
-2. If the user is resuming work, read the latest relevant `session_state.md`, `timeline.md`, and `handoff.md`.
+2. If the user is resuming work, read the latest relevant `session-state.md`, `timeline.md`, and `handoff.md`.
 3. If no relevant session exists, create a new timestamped directory.
-4. Write an initial `session_state.md` with the user's overall goal, current subtask, loaded skills, repo path, branch, and known constraints.
+4. Write an initial `session-state.md` with the user's overall goal, current subtask, loaded skills, repo path, branch, and known constraints.
 
 Do not treat session notes as the only source of truth. Verify important claims against git state, files, and command output before acting.
 
@@ -66,7 +66,7 @@ Prefer updating the same files rather than creating many small checkpoint files.
 
 ## File Templates
 
-### `session_state.md`
+### `session-state.md`
 
 ```markdown
 # Session State
@@ -147,7 +147,7 @@ Prefer updating the same files rather than creating many small checkpoint files.
 
 When resuming after a disconnect:
 1. Find the likely latest session directory.
-2. Read `handoff.md` first, then `session_state.md`, then recent `timeline.md`.
+2. Read `handoff.md` first, then `session-state.md`, then recent `timeline.md`.
 3. Run lightweight verification such as `git status --short`, `git branch --show-current`, and targeted file reads.
 4. Continue from the latest verified next action.
 5. Append a timeline entry noting the recovery and any mismatches found.

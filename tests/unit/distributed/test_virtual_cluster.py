@@ -63,7 +63,6 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.utils.venvs import create_local_venv
 from tests.unit.conftest import TEST_ASSETS_DIR
 
-
 RAY_SUB_PATH = Path(__file__).resolve().parents[3] / "ray.sub"
 
 

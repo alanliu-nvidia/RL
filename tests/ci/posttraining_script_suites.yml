@@ -1,0 +1,32 @@
+schema_version: 1
+suites:
+  nt4_nightly:
+    posttraining_repo: https://gitlab-master.nvidia.com/post-training/pipeline.git
+    posttraining_ref: nm4-ci
+    cluster: oci_aga_slurm_1
+    slurm_account: nemotron_sw_ci
+    slurm_partition: batch
+    slurm_qos: short
+    wandb_project: nt4-posttraining-ci
+    rl_overlay_path: nemo_rl
+    job_id_pattern: 'Submitted AGA job ([0-9]+)'
+    assignment_overrides:
+      CONTAINER: CONTAINER
+      NRL_MEGATRON_CHECKPOINT_DIR: NRL_MEGATRON_CHECKPOINT_DIR
+      ACCOUNT: SLURM_ACCOUNT
+      QOS: SLURM_QOS
+    literal_overrides:
+      logger.wandb.project=liding_debug: WANDB_PROJECT
+    tests:
+      - name: nt4_fullgeneralist_32n_aga_muon_compact
+        script: SFT/scripts/nm4_ci/launch_nm4_fullgeneralist_32n_aga_muon_compact.sh
+      - name: nt4_fullgeneralist_32n_aga_mxfp8_gtp2
+        script: SFT/scripts/nm4_ci/launch_nm4_fullgeneralist_32n_aga_mxfp8_gtp2.sh
+      - name: nt4_fullgeneralist_32n_aga_mxfp8_egtp2
+        script: SFT/scripts/nm4_ci/launch_nm4_fullgeneralist_32n_aga_mxfp8_egtp2.sh
+      - name: nt4_fullgeneralist_16n_aga_mxfp8_hybridep
+        script: SFT/scripts/nm4_ci/launch_nm4_fullgeneralist_16n_aga_mxfp8_hybridep.sh
+      - name: nt4_fullgeneralist_16n_aga_mxfp8_alltoall
+        script: SFT/scripts/nm4_ci/launch_nm4_fullgeneralist_16n_aga_mxfp8_alltoall.sh
+      - name: nt4_clevr_4n_aga_mxfp8_cp4_2k
+        script: SFT/scripts/nm4_ci/launch_nm4_clevr_4n_aga_mxfp8_cp4_2k.sh
