@@ -307,6 +307,30 @@ def _reduce_seq_logprob_error_metrics(
         if masked_count
         else 0.0
     )
+
+    # The locator fields describe one token, so they cannot be averaged: carry
+    # the record holding the largest disagreement and let its own fields travel
+    # together. Averaging a position against a logprob would describe a token
+    # that does not exist. Reduced here rather than left in the record because
+    # this function names every key it forwards, so anything it does not
+    # mention is dropped before the metrics are logged.
+    for key in (
+        "logprob_err/num_seqs_over_1e3",
+        "logprob_err/num_toks_over_5nats",
+        "logprob_err/num_seqs_with_bad_tok",
+        "logprob_err/num_scored_toks",
+    ):
+        reduced[key] = float(sum(record.get(key, 0.0) for record in records))
+    worst = [r for r in records if "logprob_err/worst_tok_abs_diff_nats" in r]
+    if worst:
+        peak = max(worst, key=lambda r: r["logprob_err/worst_tok_abs_diff_nats"])
+        reduced.update(
+            {
+                k: v
+                for k, v in peak.items()
+                if k.startswith("logprob_err/worst_")
+            }
+        )
     return reduced
 
 

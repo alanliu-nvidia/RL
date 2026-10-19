@@ -1253,7 +1253,13 @@ def setup(
 
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
-    generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
+    # Needed for vLLM. Generation may have to load a different export of the same
+    # model than training does: NM4 trains from a megatron_bridge checkpoint whose
+    # provider comes from its own run_config, while vLLM needs the HF directory,
+    # and the two cannot be the same path. Only fall back to the policy's path
+    # when the recipe has not named one.
+    if not generation_config.get("model_name"):
+        generation_config["model_name"] = policy_config["model_name"]
     generation_config["_debug_payload_metrics"] = grpo_config.debug_payload_metrics
     remote_transport = None
     remote_synchronizer_cls = None
@@ -2818,6 +2824,87 @@ def _resolve_logprob_skip_flags(
     )
 
 
+def _locate_worst_logprob_error(
+    *,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    prev_logprobs: torch.Tensor,
+    generation_logprobs: torch.Tensor,
+    seq_mult_prob_error: torch.Tensor,
+    valid_seq_mask: torch.Tensor,
+) -> dict[str, float]:
+    """Localize the single token driving ``token_mult_prob_error``.
+
+    The error metric exponentiates before averaging, so a handful of tokens set
+    the batch value and the aggregate says nothing about where they are. These
+    fields name the offending token so the cause can be told apart:
+
+    * ``worst_gen_logprob`` of exactly 0.0 means generation never supplied a
+      logprob for a token that stayed in the mask, i.e. a zero-fill reaching
+      the comparison rather than a real disagreement.
+    * ``pos_from_mask_end`` of 0 puts the token at the last scored position,
+      which is where an off-by-one in the packed/CP gather would land.
+    * a large ``abs_diff_nats`` with both logprobs finite and nonzero is a
+      genuine disagreement between the two forwards.
+
+    Positions are relative to the scored span rather than the padded row, so
+    they stay comparable across the variable response lengths that appear once
+    generation terminates on its own.
+    """
+    mask = (token_mask * sample_mask.unsqueeze(-1)).bool()
+    out = {
+        "logprob_err/num_seqs_over_1e3": float(
+            ((seq_mult_prob_error > 1e3) & valid_seq_mask).sum().item()
+        ),
+    }
+
+    # Counting the badly scored tokens, not just naming the worst, is what
+    # separates a once-per-pack boundary effect from broad corruption: a pack
+    # holds about nine rollouts at the 16384 width and about four at 8192, so
+    # a boundary cause predicts a count that tracks the number of packs while
+    # a numerical cause predicts one that tracks total tokens. Five nats is far
+    # outside anything two forwards of the same weights produce by rounding and
+    # far below the 11-to-20 the real events land at, so the threshold does not
+    # have to be tuned.
+    bad = mask & ((generation_logprobs - prev_logprobs).abs() > 5.0)
+    out["logprob_err/num_toks_over_5nats"] = float(bad.sum().item())
+    out["logprob_err/num_seqs_with_bad_tok"] = float(
+        (bad.any(dim=-1) & valid_seq_mask).sum().item()
+    )
+    out["logprob_err/num_scored_toks"] = float(mask.sum().item())
+
+    if not valid_seq_mask.any():
+        return out
+
+    seq_idx = int(
+        torch.where(valid_seq_mask, seq_mult_prob_error, torch.zeros_like(seq_mult_prob_error))
+        .argmax()
+        .item()
+    )
+    row = mask[seq_idx]
+    if not row.any():
+        return out
+
+    diff = (generation_logprobs[seq_idx] - prev_logprobs[seq_idx]).abs()
+    tok_idx = int(torch.where(row, diff, torch.full_like(diff, -1.0)).argmax().item())
+    scored = torch.nonzero(row, as_tuple=False).flatten()
+    out.update(
+        {
+            "logprob_err/worst_tok_abs_diff_nats": float(diff[tok_idx].item()),
+            "logprob_err/worst_gen_logprob": float(generation_logprobs[seq_idx, tok_idx].item()),
+            "logprob_err/worst_prev_logprob": float(prev_logprobs[seq_idx, tok_idx].item()),
+            "logprob_err/worst_seq_scored_len": float(scored.numel()),
+            "logprob_err/worst_tok_pos_from_mask_start": float(
+                tok_idx - int(scored[0].item())
+            ),
+            "logprob_err/worst_tok_pos_from_mask_end": float(
+                int(scored[-1].item()) - tok_idx
+            ),
+        }
+    )
+    return out
+
+
 def compute_and_apply_seq_logprob_error_masking(
     train_data: BatchedDataDict,
     rewards: torch.Tensor,
@@ -2862,6 +2949,15 @@ def compute_and_apply_seq_logprob_error_masking(
         max_seq_mult_prob_error = 0.0
         mean_seq_mult_prob_error = 0.0
         min_seq_mult_prob_error = 0.0
+
+    locator = _locate_worst_logprob_error(
+        token_mask=token_mask,
+        sample_mask=sample_mask,
+        prev_logprobs=prev_logprobs,
+        generation_logprobs=generation_logprobs,
+        seq_mult_prob_error=seq_mult_prob_error,
+        valid_seq_mask=valid_seq_mask,
+    )
 
     # Apply sequence-level masking if configured
     num_masked_seqs = 0
@@ -2931,6 +3027,7 @@ def compute_and_apply_seq_logprob_error_masking(
         "min_seq_mult_prob_error_after_mask": min_seq_mult_prob_error_after_mask,
         "num_masked_seqs": num_masked_seqs,
         "masked_correct_pct": masked_correct_pct,
+        **locator,
     }
 
 

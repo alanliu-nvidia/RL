@@ -716,6 +716,7 @@ def _build_trainer(
         dp_cfg=master_config.data_plane,
         checkpointing=checkpointing,
         reserved_http_server_ports=reserved_http_server_ports,
+        allow_mimo_sft=True,
     )
     return trainer, time.perf_counter() - t0
 
