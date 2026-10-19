@@ -53,6 +53,7 @@ from nemo_rl.data.energon.multimodal.types import (
 from nemo_rl.data.multimodal_utils import (
     MIMO_MEDIA_OUTPUT_COUNTS_KEY,
     PackedTensor,
+    radio_token_count,
     resolve_to_image,
 )
 
@@ -157,24 +158,10 @@ class _VisualFrameSpec:
 def _radio_token_count(*, height: int, width: int, patch_dim: int) -> int:
     """Return RADIO features after the fixed 2x2 spatial pixel shuffle.
 
-    This matches ``_pixel_shuffled_token_count`` in the Apache-2.0
-    Megatron-Bridge source at revision 8c46dc4259080c510b7455f43e836fdff222c5d3.
+    GRPO needs the same count without running this task encoder, so the formula
+    lives in ``multimodal_utils`` and both paths share it.
     """
-    if patch_dim <= 0:
-        raise ValueError("patch_dim must be greater than zero.")
-    if height % patch_dim or width % patch_dim:
-        raise ValueError(
-            f"Processed image {height}x{width} is not divisible by "
-            f"patch_dim={patch_dim}."
-        )
-    patch_rows = height // patch_dim
-    patch_columns = width // patch_dim
-    if patch_rows % 2 or patch_columns % 2:
-        raise ValueError(
-            f"Processed image {height}x{width} produces a patch grid that is "
-            "not divisible by the 2x2 RADIO pixel shuffle."
-        )
-    return patch_rows * patch_columns // 4
+    return radio_token_count(height=height, width=width, patch_dim=patch_dim)
 
 
 def _video_prompt(

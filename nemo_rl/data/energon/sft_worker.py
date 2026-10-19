@@ -30,7 +30,7 @@ from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from nemo_rl.algorithms.sft import prepare_sft_batch
 from nemo_rl.data.energon.config import EnergonLoaderConfig
 from nemo_rl.data.energon.mimo_batch import MIMORole, mimo_data_plane_batch
-from nemo_rl.data.energon.mimo_image_split import EncoderShard
+from nemo_rl.data.energon.mimo_image_split import EncoderShard, encoder_shard_for_rank
 from nemo_rl.data.energon.sft_dataloader import (
     EnergonSFTDataLoader,
     build_energon_sft_loader,
@@ -128,9 +128,11 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             if mimo_role == "encoder":
                 # The lane's encoder ranks share its stream; each keeps one
                 # media range of every pack.
-                stride = dp_group.size() // logical_world_size
-                encoder_shard = EncoderShard(index=logical_rank % stride, count=stride)
-                logical_rank //= stride
+                encoder_shard, logical_rank = encoder_shard_for_rank(
+                    dp_rank=logical_rank,
+                    dp_size=dp_group.size(),
+                    language_dp_size=logical_world_size,
+                )
                 self._check_encoder_placement(
                     lane=logical_rank, shard=encoder_shard, single_owner=single_owner
                 )

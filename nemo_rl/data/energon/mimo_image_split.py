@@ -23,13 +23,17 @@ need no communication: every rank computes the same cut from the same pack.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
 
-from nemo_rl.data.multimodal_utils import MIMO_MEDIA_OUTPUT_COUNTS_KEY, PackedTensor
+from nemo_rl.data.multimodal_utils import (
+    MIMO_MEDIA_OUTPUT_COUNTS_KEY,
+    PackedTensor,
+    mimo_media_output_counts,
+)
 
 # Media fields that the split selects per range. Every other PackedTensor field
 # of an encoder batch is unsupported, except the pack boundaries below.
@@ -56,6 +60,28 @@ class EncoderShard:
             raise ValueError(
                 f"Encoder shard index {self.index} is outside [0, {self.count})."
             )
+
+
+def encoder_shard_for_rank(
+    *, dp_rank: int, dp_size: int, language_dp_size: int
+) -> tuple[EncoderShard, int]:
+    """Return an encoder rank's media shard and the language lane it feeds.
+
+    Encoder DP is a whole multiple of language DP, so the encoder ranks divide
+    into lanes of ``stride`` ranks, one lane per language rank. Every rank of a
+    lane sees the same packs and keeps one media range of each.
+    """
+    if language_dp_size <= 0:
+        raise ValueError("Language DP size must be positive.")
+    if dp_size <= 0 or dp_size % language_dp_size:
+        raise ValueError(
+            f"Encoder DP size {dp_size} must be a positive multiple of "
+            f"language DP size {language_dp_size}."
+        )
+    if not 0 <= dp_rank < dp_size:
+        raise ValueError(f"Encoder DP rank {dp_rank} is outside [0, {dp_size}).")
+    stride = dp_size // language_dp_size
+    return EncoderShard(index=dp_rank % stride, count=stride), dp_rank // stride
 
 
 @dataclass(frozen=True)
@@ -193,6 +219,86 @@ def _rebuilt(value: PackedTensor, rows: list[Optional[torch.Tensor]]) -> PackedT
     )
 
 
+@dataclass(frozen=True)
+class EncoderMediaSplit:
+    """Everything an encoder rank needs to keep only its own media range."""
+
+    shard: EncoderShard
+    patch_dim: int
+    temporal_patch_size: int
+    frame_weight: int
+    image_token_id: Optional[int] = None
+
+
+def apply_encoder_media_split(
+    batch: MutableMapping[str, Any], split: EncoderMediaSplit
+) -> None:
+    """Reduce a rollout batch in place to this encoder rank's media range.
+
+    This is the GRPO counterpart of what the Energon task encoder does in
+    ``encode_batch``: text stays whole on every rank, media does not. GRPO has
+    no task encoder, so the output counts are derived here first.
+    """
+    attach_mimo_media_output_counts(batch, patch_dim=split.patch_dim)
+    batch.update(
+        select_encoder_shard_media(
+            batch,
+            shard=split.shard,
+            patch_dim=split.patch_dim,
+            temporal_patch_size=split.temporal_patch_size,
+            frame_weight=split.frame_weight,
+            image_token_id=split.image_token_id,
+        )
+    )
+
+
+def attach_mimo_media_output_counts(
+    batch: MutableMapping[str, Any], *, patch_dim: int
+) -> None:
+    """Give a rollout batch the per-media output counts the encoder split needs.
+
+    Energon batches arrive with these counts already set by the task encoder, so
+    this is a no-op for them beyond an agreement check. GRPO batches never run
+    that encoder, and ``select_encoder_shard_media`` treats missing counts as
+    "unknown", which would leave encoder ranks unable to validate their media
+    rows. Rebuilding them from ``imgs_sizes`` keeps one row per pack, matching
+    the layout the split expects.
+    """
+    pixels = batch.get("pixel_values")
+    if pixels is None:
+        return
+    sizes = batch.get("imgs_sizes")
+    if not isinstance(sizes, PackedTensor):
+        raise ValueError("MIMO media output counts require 'imgs_sizes'.")
+
+    rows: list[Optional[torch.Tensor]] = []
+    for row in range(len(sizes)):
+        row_sizes = _row_value(sizes, row)
+        if row_sizes is None:
+            rows.append(None)
+            continue
+        rows.append(mimo_media_output_counts(row_sizes, patch_dim=patch_dim))
+
+    existing = batch.get(MIMO_MEDIA_OUTPUT_COUNTS_KEY)
+    if isinstance(existing, PackedTensor):
+        for row, derived in enumerate(rows):
+            present = _row_value(existing, row)
+            if present is None and derived is None:
+                continue
+            if (
+                present is None
+                or derived is None
+                or not torch.equal(present.to(torch.int32), derived)
+            ):
+                raise ValueError(
+                    "Derived MIMO media output counts disagree with the counts "
+                    f"already on the batch at pack {row}."
+                )
+        return
+
+    batch[MIMO_MEDIA_OUTPUT_COUNTS_KEY] = _rebuilt(sizes, rows)
+
+
 def select_encoder_shard_media(
     batch: Mapping[str, Any],
     *,
@@ -266,7 +372,10 @@ def select_encoder_shard_media(
             patch_offsets.append(
                 patch_offsets[-1] + (height // patch_dim) * (width // patch_dim)
             )
-        if row_pixels.ndim != 3 or row_pixels.shape[1] != patch_offsets[-1]:
+        # Energon rows carry a leading segment axis, [1, patches, features];
+        # rollout rows are the same data without it. The patch axis is the
+        # second to last on both.
+        if row_pixels.ndim not in (2, 3) or row_pixels.shape[-2] != patch_offsets[-1]:
             raise ValueError(
                 "Pack pixels disagree with imgs_sizes: "
                 f"pixels={tuple(row_pixels.shape)}, patches={patch_offsets[-1]}."
@@ -309,10 +418,13 @@ def select_encoder_shard_media(
                 kept_frames[unit.occurrence] = (
                     kept_frames.get(unit.occurrence, 0) + unit.frame_count
                 )
+        patch_start = patch_offsets[first_frame]
         selected["pixel_values"].append(
-            row_pixels[
-                :, patch_offsets[first_frame] : patch_offsets[last_frame]
-            ].clone()
+            row_pixels.narrow(
+                row_pixels.ndim - 2,
+                patch_start,
+                patch_offsets[last_frame] - patch_start,
+            ).clone()
         )
         selected["imgs_sizes"].append(row_sizes[first_frame:last_frame].clone())
         selected["num_frames"].append(

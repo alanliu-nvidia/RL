@@ -73,6 +73,8 @@ _PLACEHOLDER_STYLE_PROCESSOR_NAMES = frozenset(
         "NemotronH_Nano_Omni_Reasoning_V3Processor",
         "NemotronH_Super_Omni_Reasoning_V3Processor",
         "NemotronH_Omni_Reasoning_V3Processor",
+        # Expands <image> into per-patch tokens with break/end markers through
+        # __call__, and reports native per-image sizes for dynamic resolution.
         "PixtralProcessor",
     }
 )
@@ -155,6 +157,21 @@ PER_TOKEN_MULTIMODAL_FIELDS = frozenset(
     {
         "token_type_ids",  # gemma3: which tokens are image
         "mm_token_type_ids",  # qwen2.5-vl (transformers>=5.3): text(0)/image(1)/video(2) for 3D RoPE
+    }
+)
+
+# Geometry metadata the model reads on the host, not tensors it computes on.
+# ``get_multimodal_dict`` leaves these on CPU even when asked for a device:
+# Megatron's dynamic-resolution ViT builds its patch grid in Python and
+# ``vit_utils.dynamic_patch_grid_lists`` raises on a CUDA tensor outright,
+# precisely to keep a device-to-host sync out of the forward pass. They
+# originate on CPU, so this is one fewer round trip rather than an extra one.
+HOST_MULTIMODAL_FIELDS = frozenset(
+    {
+        "imgs_sizes",  # nemotron4 / nemotron-omni: per-image [H, W]
+        "num_frames",  # frames per image; compared, never computed on
+        # MIMO per-media output counts; host metadata for shape checks only.
+        MIMO_MEDIA_OUTPUT_COUNTS_KEY,
     }
 )
 
@@ -1412,6 +1429,48 @@ def get_preprocess(processor: Any, key: str) -> dict[str, Any]:
     return {"preprocess_mode": None, "preprocess_kwargs": {}}
 
 
+def radio_token_count(*, height: int, width: int, patch_dim: int) -> int:
+    """Return RADIO features for one image after the fixed 2x2 pixel shuffle.
+
+    Matches ``_pixel_shuffled_token_count`` in the Apache-2.0 Megatron-Bridge
+    source at revision 8c46dc4259080c510b7455f43e836fdff222c5d3. ``height`` and
+    ``width`` are processed pixel dimensions, not patch counts.
+    """
+    if patch_dim <= 0:
+        raise ValueError("patch_dim must be greater than zero.")
+    if height % patch_dim or width % patch_dim:
+        raise ValueError(
+            f"Processed image {height}x{width} is not divisible by "
+            f"patch_dim={patch_dim}."
+        )
+    patch_rows = height // patch_dim
+    patch_columns = width // patch_dim
+    if patch_rows % 2 or patch_columns % 2:
+        raise ValueError(
+            f"Processed image {height}x{width} produces a patch grid that is "
+            "not divisible by the 2x2 RADIO pixel shuffle."
+        )
+    return patch_rows * patch_columns // 4
+
+
+def mimo_media_output_counts(
+    imgs_sizes: torch.Tensor, *, patch_dim: int
+) -> torch.Tensor:
+    """Derive per-image MIMO encoder output counts from processed image sizes.
+
+    The Energon task encoder computes these while it builds its packing plan, but
+    GRPO assembles batches from rollouts and never runs that encoder. ``imgs_sizes``
+    carries the processed pixel geometry on both paths, and the count is a pure
+    function of it, so the same numbers are recoverable here.
+    """
+    sizes = torch.as_tensor(imgs_sizes).reshape(-1, 2)
+    counts = [
+        radio_token_count(height=int(height), width=int(width), patch_dim=patch_dim)
+        for height, width in sizes.tolist()
+    ]
+    return torch.tensor(counts, dtype=torch.int32)
+
+
 def _normalize_processor_image_sizes(processed: dict[str, Any], processor: Any) -> None:
     """Normalize placeholder processors' image-size alias before patchification."""
     if not uses_image_placeholder(processor) or "image_sizes" not in processed:
@@ -1452,17 +1511,47 @@ def extract_multimodal_model_inputs(
     if uses_image_placeholder(processor) and isinstance(sizes, torch.Tensor):
         pixels = processed["pixel_values"]
         segments = pixels if isinstance(pixels, list) else [pixels]
-        preprocess = get_preprocess(processor, "pixel_values")
-        patch_dim = preprocess["preprocess_kwargs"]["patch_dim"]
-        pixel_count = sum(
-            segment.shape[1]
-            if segment.ndim == 3
-            else segment.numel() // (3 * patch_dim**2)
-            for segment in segments
-        )
-        size_count = int(torch.prod(sizes // patch_dim, dim=1).sum())
-        if pixel_count != size_count:
-            raise ValueError("pixel_values and imgs_sizes have different patch counts")
+        if all(segment.ndim == 4 for segment in segments):
+            # Raw ``[N, C, H, W]``, where ``H x W`` is the batch's padded frame
+            # and not any single image's size, so true patch counts are
+            # *expected* to come out below the frame's and equating them would
+            # reject every mixed-resolution batch. The patch-count equality
+            # below was only ever vacuous here anyway: it passed by
+            # construction, because the sole producer of 4-D ``imgs_sizes`` was
+            # the synthesis above reading its sizes off that same frame. These
+            # two checks are what actually constrain the pair.
+            image_total = sum(segment.shape[0] for segment in segments)
+            if int(sizes.shape[0]) != image_total:
+                raise ValueError(
+                    f"imgs_sizes describes {int(sizes.shape[0])} images but "
+                    f"pixel_values holds {image_total}"
+                )
+            frame_height = max(segment.shape[-2] for segment in segments)
+            frame_width = max(segment.shape[-1] for segment in segments)
+            oversized = [
+                size
+                for size in sizes.tolist()
+                if size[0] > frame_height or size[1] > frame_width
+            ]
+            if oversized:
+                raise ValueError(
+                    "imgs_sizes must fit inside the padded pixel_values frame "
+                    f"[{frame_height}, {frame_width}], but got {oversized}"
+                )
+        else:
+            preprocess = get_preprocess(processor, "pixel_values")
+            patch_dim = preprocess["preprocess_kwargs"]["patch_dim"]
+            pixel_count = sum(
+                segment.shape[1]
+                if segment.ndim == 3
+                else segment.numel() // (3 * patch_dim**2)
+                for segment in segments
+            )
+            size_count = int(torch.prod(sizes // patch_dim, dim=1).sum())
+            if pixel_count != size_count:
+                raise ValueError(
+                    "pixel_values and imgs_sizes have different patch counts"
+                )
 
     input_ids = processed.get("input_ids")
     if input_ids is None:
