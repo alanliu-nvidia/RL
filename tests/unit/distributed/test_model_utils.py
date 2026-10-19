@@ -31,6 +31,7 @@ from nemo_rl.distributed.model_utils import (
     _compute_distributed_log_softmax,
     _compute_distributed_selected_logprobs,
     _get_tokens_on_this_cp_rank,
+    _get_tokens_on_this_cp_rank_for_layout,
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
@@ -143,6 +144,36 @@ def test_compute_distributed_selected_logprobs_tp_shards(monkeypatch):
             group=None,
         )
         torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_contiguous_cp_layout_covers_the_sequence_in_rank_order(cp_size):
+    """Contiguous shards, laid out by rank, reproduce the original order."""
+    tokens = torch.arange(8 * cp_size).unsqueeze(0)
+
+    shards = [
+        _get_tokens_on_this_cp_rank_for_layout(tokens, rank, cp_size, "contiguous")
+        for rank in range(cp_size)
+    ]
+
+    torch.testing.assert_close(torch.cat(shards, dim=1), tokens)
+
+
+def test_the_two_cp_layouts_select_different_tokens():
+    """A model handing back contiguous output cannot be read as zigzag."""
+    tokens = torch.arange(16).unsqueeze(0)
+
+    zigzag = _get_tokens_on_this_cp_rank_for_layout(tokens, 0, 2, "zigzag")
+    contiguous = _get_tokens_on_this_cp_rank_for_layout(tokens, 0, 2, "contiguous")
+
+    assert not torch.equal(zigzag, contiguous)
+
+
+def test_unknown_cp_layout_is_refused():
+    with pytest.raises(ValueError, match="Unknown context-parallel layout"):
+        _get_tokens_on_this_cp_rank_for_layout(
+            torch.arange(8).unsqueeze(0), 0, 2, "interleaved"
+        )
 
 
 @ray.remote(num_gpus=1)

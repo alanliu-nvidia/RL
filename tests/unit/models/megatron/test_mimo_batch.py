@@ -50,6 +50,74 @@ def test_mimo_language_batch_preserves_packed_positions_and_boundaries():
     assert batch["loss_mask"].tolist() == [[0, 1, 0, 0, 1, 0]]
 
 
+def test_mimo_language_batch_packs_masks_left_on_their_rows():
+    # Runtime packing packs the tokens at microbatch time and leaves the masks
+    # on the rows they came from, so they reach here in the unpacked layout.
+    rows = torch.tensor([[1, 2, 3, 0], [4, 5, 6, 7]])
+    packed = torch.tensor([[1, 2, 3, 0, 4, 5, 6, 7]])
+    # Every PackedSeqParams boundary is a padded one; the three-token first
+    # sequence is padded to four before the second one starts.
+    padded = torch.tensor([0, 4, 8], dtype=torch.int32)
+    microbatch = SimpleNamespace(
+        input_ids=packed,
+        position_ids=None,
+        packed_seq_params=SimpleNamespace(
+            cu_seqlens_q=padded, cu_seqlens_q_padded=padded, max_seqlen_q=4
+        ),
+        data_dict={
+            "input_ids": rows,
+            "input_lengths": torch.tensor([3, 4]),
+            "token_mask": torch.tensor([[1, 1, 1, 0], [1, 1, 1, 1]]),
+            "sample_mask": torch.ones(2),
+        },
+    )
+    batch = _mimo_language_batch(microbatch, SimpleNamespace(special_token_ids={}))
+    assert batch["loss_mask"].shape == packed.shape
+    # Each sequence predicts only its own tokens: position 2 is the last of the
+    # first sequence and must not be asked to predict the second sequence's 4.
+    assert batch["loss_mask"].tolist() == [[1, 1, 0, 0, 1, 1, 1, 0]]
+    assert batch["labels"].tolist() == [[2, 3, -100, -100, 5, 6, 7, -100]]
+
+
+def test_mimo_language_batch_rejects_masks_that_fit_no_layout():
+    boundaries = torch.tensor([0, 4], dtype=torch.int32)
+    microbatch = SimpleNamespace(
+        input_ids=torch.tensor([[1, 2, 3, 4]]),
+        position_ids=None,
+        packed_seq_params=SimpleNamespace(
+            cu_seqlens_q=boundaries, cu_seqlens_q_padded=boundaries, max_seqlen_q=4
+        ),
+        data_dict={
+            "input_ids": torch.tensor([[1, 2, 3]]),
+            "input_lengths": torch.tensor([3]),
+            "token_mask": torch.tensor([[1, 1]]),
+            "sample_mask": torch.ones(1),
+        },
+    )
+    with pytest.raises(ValueError, match="do not match the input batch rows"):
+        _mimo_language_batch(microbatch, SimpleNamespace(special_token_ids={}))
+
+
+def test_mimo_language_batch_withholds_labels_for_logits():
+    tokens = torch.tensor([[1, 2, 3]])
+    microbatch = SimpleNamespace(
+        input_ids=tokens,
+        position_ids=torch.tensor([[0, 1, 2]]),
+        packed_seq_params=None,
+        data_dict={
+            "token_mask": torch.tensor([[1, 1, 1]]),
+            "sample_mask": torch.ones(1),
+        },
+    )
+    batch = _mimo_language_batch(
+        microbatch, SimpleNamespace(special_token_ids={}), with_labels=False
+    )
+    # Labels make the language model return per-token losses; every NeMo-RL
+    # post-processor consumes the logits it returns without them.
+    assert batch["labels"] is None
+    assert batch["loss_mask"].tolist() == [[1, 1, 0]]
+
+
 def test_mimo_pixtral_batch_sends_x_and_no_input_ids() -> None:
     pixels = torch.ones(4, 588, dtype=torch.bfloat16)
     microbatch = SimpleNamespace(

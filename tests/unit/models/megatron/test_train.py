@@ -1142,17 +1142,26 @@ class TestMegatronForwardBackward:
         mock_get_fb.assert_called_once_with(
             schedule_pg_collection=runtime.multimodule_pg_collection
         )
-        mock_fb_func.assert_called_once_with(
-            forward_step_func=mimo_forward_with_post_processing_fn,
-            data_iterator=data_iterator,
-            model=[model],
-            num_microbatches=4,
-            seq_length=128,
-            micro_batch_size=1,
-            forward_only=False,
-            p2p_communicator=runtime.multimodule_communicator,
-            pg_collection=runtime.multimodule_pg_collection,
-        )
+        assert mock_fb_func.call_count == 1
+        call_kwargs = dict(mock_fb_func.call_args.kwargs)
+        forward_step_func = call_kwargs.pop("forward_step_func")
+        assert forward_step_func.func is mimo_forward_with_post_processing_fn
+        assert forward_step_func.keywords == {
+            "post_processing_fn": None,
+            "sampling_params": None,
+            "global_valid_seqs": None,
+            "global_valid_toks": None,
+        }
+        assert call_kwargs == {
+            "data_iterator": data_iterator,
+            "model": [model],
+            "num_microbatches": 4,
+            "seq_length": 128,
+            "micro_batch_size": 1,
+            "forward_only": False,
+            "p2p_communicator": runtime.multimodule_communicator,
+            "pg_collection": runtime.multimodule_pg_collection,
+        }
         assert result == mock_fb_func.return_value
 
     @patch("nemo_rl.models.megatron.train.get_forward_backward_func")
