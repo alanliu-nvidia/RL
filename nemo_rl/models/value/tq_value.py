@@ -81,6 +81,7 @@ class TQValue(TQDriverMixin, Value):
                 f"TP/PP/CP sizes."
             )
         self.dp_cfg = dp_cfg
+        self._value_train_micro_batch_size = self.cfg["train_micro_batch_size"]
         self.dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
         ray.get(
             self.worker_group.run_all_workers_single_data(
@@ -272,34 +273,46 @@ class TQValue(TQDriverMixin, Value):
         mbs: Optional[int] = None,
     ) -> None:
         """Open one logical value update on all workers."""
+        micro_batch_size = self.cfg["train_micro_batch_size"] if mbs is None else mbs
         ray.get(
             self.worker_group.run_all_workers_single_data(
                 "begin_train_step_presharded",
                 loss_fn=loss_fn,
                 gbs=self.cfg["train_global_batch_size"] if gbs is None else gbs,
-                mbs=self.cfg["train_micro_batch_size"] if mbs is None else mbs,
+                mbs=micro_batch_size,
             )
         )
+        self._value_train_micro_batch_size = micro_batch_size
 
     def train_microbatches_from_meta(
         self, meta: KVBatchMeta, timer: Optional[Timer] = None
     ) -> None:
-        """Accumulate a token-only chunk using the existing presharded worker API."""
+        """Accumulate one chunk, retaining images and every MIMO role's schedule."""
         spa, dba = self._packing_args("train_mb_tokens")
         train_meta = self._isolated_meta(
             meta,
             fields=list(DP_VALUE_TRAIN_FIELDS),
             task_name="value_train",
-            include_multimodal=False,
+            include_multimodal=bool(self.cfg.get("is_vlm")),
         )
         with timer.time("value_training/shard_meta") if timer else nullcontext():
             metas, _ = shard_meta_for_dp(
                 train_meta,
-                dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
+                dp_world=self.data_parallel_size,
                 batch_size=None,
                 sequence_packing_args=spa,
                 dynamic_batching_args=dba,
             )
+        if self.mimo_config is not None:
+            futures = self._submit_mimo_value_metas(
+                "train_microbatch_presharded",
+                train_meta,
+                metas,
+                micro_batch_size=self._value_train_micro_batch_size,
+                common_kwargs=trace_context_kwargs(),
+            )
+            ray.get(futures)
+            return
         futures = self.worker_group.run_all_workers_sharded_data(
             "train_microbatch_presharded",
             meta=metas,
@@ -316,7 +329,12 @@ class TQValue(TQDriverMixin, Value):
                 "finish_train_step_presharded",
             )
         )
-        return _aggregate_train_results([r for r in results if r["is_replica_leader"]])
+        leader_results = (
+            [results[r] for r in self._mimo_language_lane_ranks()]
+            if self.mimo_config is not None
+            else [r for r in results if r["is_replica_leader"]]
+        )
+        return _aggregate_train_results(leader_results)
 
     def abort_train_step(self) -> None:
         """Discard the open update on every worker without stepping."""

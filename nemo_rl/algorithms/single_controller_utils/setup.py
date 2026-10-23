@@ -1673,8 +1673,8 @@ def setup_single_controller(
             trainer.prepare_for_training()
         ppo_group_multiple, ppo_min_remaining_groups = resolve_ppo_chunk_alignment(
             master_config,
-            trainer.sharding_annotations.get_axis_size("data_parallel"),
-            value.sharding_annotations.get_axis_size("data_parallel"),
+            trainer.data_parallel_size,
+            value.data_parallel_size,
         )
         return trainer, value, time_metrics
 

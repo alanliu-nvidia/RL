@@ -3023,9 +3023,13 @@ class SingleControllerActor:
                                         await asyncio.to_thread(
                                             self._trainer.finish_inference
                                         )
-                        if self._value_dedicated and (
-                            self._policy_logprobs_required
-                            or self._reference_logprobs_required
+                        if (
+                            self._value_dedicated
+                            and self._algo_cfg.parallel_value_policy_inference
+                            and (
+                                self._policy_logprobs_required
+                                or self._reference_logprobs_required
+                            )
                         ):
                             train_meta = await self._run_parallel_ppo_inference(
                                 train_meta,

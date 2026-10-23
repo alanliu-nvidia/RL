@@ -126,15 +126,38 @@ class MegatronMIMOValueWorkerImpl(MegatronPolicyWorkerImpl):
                 split_encoder_media=split_encoder_media,
             )
             result = self.finish_train_step()
-            # The full scalar loss is replicated on CP ranks, while the policy
-            # finisher sums losses over DP x CP. Keep critic reporting unique.
-            result["global_loss"] /= torch.distributed.get_world_size(
-                self.mimo_runtime.local_pg_collection.cp
-            )
             return result
         except Exception:
             self.abort_train_step()
             raise
+
+    def finish_train_step(self) -> dict[str, Any]:
+        """Commit once and report scalar loss without counting CP replicas twice."""
+        state = self._assert_step_open()
+        if state.get("mimo_inference_paused", False):
+            raise RuntimeError("Resume value training before committing its update.")
+        result = super().finish_train_step()
+        result["global_loss"] /= torch.distributed.get_world_size(
+            self.mimo_runtime.local_pg_collection.cp
+        )
+        return result
+
+    def train_microbatch(
+        self,
+        data: Optional[BatchedDataDict[Any]],
+        num_microbatches: Optional[int] = None,
+        sequence_length: Optional[int] = None,
+        split_encoder_media: bool = False,
+    ) -> None:
+        """Accumulate a chunk while preserving resident value-inference state."""
+        if self._assert_step_open().get("mimo_inference_paused", False):
+            raise RuntimeError("Resume value training before accumulating a chunk.")
+        super().train_microbatch(
+            data=data,
+            num_microbatches=num_microbatches,
+            sequence_length=sequence_length,
+            split_encoder_media=split_encoder_media,
+        )
 
     def get_values(
         self,
@@ -156,13 +179,63 @@ class MegatronMIMOValueWorkerImpl(MegatronPolicyWorkerImpl):
                 post_processing_fn=ValuePostProcessor(),
             )
 
-    def prepare_for_inference(self) -> None:
-        """Reload parameters and release training buffers using the policy lifecycle."""
-        self.prepare_for_lp_inference()
+    def prepare_for_training(self, keep_resident: bool = False) -> None:
+        """Keep dedicated value buffers intact between streamed chunks."""
+        state = self._train_step_state
+        if state is not None and state.get("mimo_inference_paused", False):
+            raise RuntimeError("Finish the value inference pause before training.")
+        if keep_resident:
+            self.model.train()
+            return
+        super().prepare_for_training()
 
-    def finish_training(self) -> None:
+    def prepare_for_inference(
+        self, keep_resident: bool = False, preserve_train_step: bool = False
+    ) -> None:
+        """Allow old-value inference between chunks without releasing gradients."""
+        state = self._train_step_state
+        if state is not None:
+            if not keep_resident or not preserve_train_step:
+                raise RuntimeError(
+                    "An open value update requires resident preservation."
+                )
+            if state.get("mimo_inference_paused", False):
+                raise RuntimeError("The value update is already paused for inference.")
+            state["mimo_inference_paused"] = True
+        elif preserve_train_step:
+            raise RuntimeError("No value update is open to preserve.")
+        if keep_resident:
+            self.model.eval()
+        else:
+            self.prepare_for_lp_inference()
+
+    def finish_inference(
+        self, keep_resident: bool = False, preserve_train_step: bool = False
+    ) -> None:
+        """Resume a preserved update or release an ordinary value forward."""
+        state = self._train_step_state
+        if state is not None:
+            if (
+                not keep_resident
+                or not preserve_train_step
+                or not state.get("mimo_inference_paused", False)
+            ):
+                raise RuntimeError("Value inference needs a matching resident pause.")
+            self.model.train()
+            state["mimo_inference_paused"] = False
+            return
+        if preserve_train_step:
+            raise RuntimeError("No value update is open to resume.")
+        if not keep_resident:
+            super().finish_inference()
+
+    def finish_training(self, keep_resident: bool = False) -> None:
         """Release both language and visual model buffers and optimizer state."""
+        if self._train_step_state is not None:
+            raise RuntimeError("Finish or abort the value update before offloading.")
         self.model.eval()
+        if keep_resident:
+            return
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=True
         )

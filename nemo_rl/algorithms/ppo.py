@@ -201,6 +201,8 @@ class PPOConfig(BaseModel, extra="allow"):
     # SingleController only: split accumulates chunks; whole_batch uses train_from_meta.
     value_training_mode: Literal["split", "whole_batch"] = "whole_batch"
     stream_value_training: bool = False
+    # Benchmark ablation: serialize policy/value inference without changing placement.
+    parallel_value_policy_inference: bool = True
     reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
     reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)
     adv_estimator: GAEConfig = Field(default_factory=GAEConfig)

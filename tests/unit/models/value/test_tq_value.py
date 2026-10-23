@@ -359,6 +359,58 @@ class TestPadTargetIsolation:
 
 
 class TestTQValueSplitFanout:
+    def test_mimo_chunks_keep_images_use_lanes_and_exclude_encoder_metrics(self):
+        value, wg = _make_mimo_value()
+        meta = _meta(["s0", "s1", "s2", "s3"])
+        meta.fields = ["input_ids", "pixel_values", "imgs_sizes", "returns", "values"]
+        meta.sequence_lengths = [8] * 4
+        lanes = [_meta(["s0", "s1"]), _meta(["s2", "s3"])]
+        refs = [object() for _ in wg.workers]
+        wg.run_all_workers_multiple_data.return_value = refs
+        results = [
+            {
+                "global_loss": 1.0,
+                "grad_norm": 0.5,
+                "all_mb_metrics": {"loss": [float(i)]},
+                "is_replica_leader": True,
+            }
+            for i in range(6)
+        ]
+        with (
+            patch.object(TQValue, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.value.tq_value.shard_meta_for_dp",
+                return_value=(lanes, None),
+            ) as shard,
+            patch(
+                "nemo_rl.models.value.tq_value.ray.get", return_value=results
+            ) as get_results,
+        ):
+            value.begin_train_step(object(), gbs=4, mbs=1)
+            value.train_microbatches_from_meta(meta)
+            result = value.finish_train_step()
+        assert {"pixel_values", "imgs_sizes", "returns", "values"} <= set(
+            shard.call_args.args[0].fields
+        )
+        assert shard.call_args.kwargs["dp_world"] == 2
+        assert shard.call_args.kwargs["batch_size"] is None
+        call = wg.run_all_workers_multiple_data.call_args
+        assert call.args[0] == "train_microbatch_presharded"
+        assert call.kwargs["meta"] == [
+            lanes[0],
+            lanes[1],
+            lanes[0],
+            lanes[0],
+            lanes[1],
+            lanes[1],
+        ]
+        assert call.kwargs["common_kwargs"]["num_microbatches"] == 2
+        assert call.kwargs["common_kwargs"]["sequence_length"] == 8
+        assert call.kwargs["common_kwargs"]["split_encoder_media"] is True
+        get_results.assert_any_call(refs)
+        wg.get_all_worker_results.assert_not_called()
+        assert result["all_mb_metrics"]["loss"] == [0.0, 1.0]
+
     def test_lifecycle_and_replica_dedup(self):
         value, wg = _make_tq_value()
         loss_fn = object()

@@ -1,0 +1,9 @@
+# Fixed-placement ablation of the integrated PR stack.
+defaults: vlm_ppo-nt4nano-clevr-mimo-12n4g-benchmark-full.yaml
+ppo:
+  stream_value_training: false
+  parallel_value_policy_inference: true
+logger:
+  log_dir: logs/nt4nano-ppo-benchmark-parallel-only
+  wandb:
+    name: nt4nano-ppo-benchmark-parallel-only

@@ -1,0 +1,26 @@
+# Equal-GPU-budget Nano4 CLEVR PPO benchmark; first 3 steps are warmup.
+defaults: vlm_ppo-nt4nano-clevr-mimo-8n4g-smoke.yaml
+async_rl:
+  min_groups_for_streaming_train: 2
+cluster:
+  num_nodes: 12
+value:
+  resources:
+    dedicated: true
+    num_nodes: 4
+ppo:
+  seed: 42
+  max_num_steps: 13
+  max_num_epochs: 1
+  policy_training_start_step: 1
+  value_training_mode: split
+  stream_value_training: true
+  parallel_value_policy_inference: true
+  adv_estimator:
+    normalize_advantages: false
+logger:
+  log_dir: logs/nt4nano-ppo-benchmark-full
+  wandb:
+    name: nt4nano-ppo-benchmark-full
+checkpointing:
+  checkpoint_dir: results/nt4nano-ppo-benchmark-full

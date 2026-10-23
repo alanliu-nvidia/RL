@@ -1890,6 +1890,33 @@ class MegatronPolicyWorkerImpl(
                 "saved_finalize_model_grads_func"
             )
 
+    def _suspend_mimo_train_hooks(self, state: dict[str, Any]) -> None:
+        """Defer the heterogeneous schedule's reductions until logical commit."""
+        model_config = getattr(self.model, "config")
+        state["saved_grad_sync_func"] = model_config.grad_sync_func
+        state["saved_no_sync_func"] = model_config.no_sync_func
+        state["saved_finalize_model_grads_func"] = (
+            model_config.finalize_model_grads_func
+        )
+        if state["saved_finalize_model_grads_func"] is None:
+            raise RuntimeError("MIMO training requires Bridge's gradient finalizer.")
+        model_config.grad_sync_func = None
+        model_config.no_sync_func = nullcontext
+        model_config.finalize_model_grads_func = None
+
+    def _mimo_active_modules(self) -> list[Any]:
+        """Return this rank's modules using Bridge's authoritative role grid."""
+        from megatron.bridge.training.megatron_mimo_parallel_utils import (
+            is_current_rank_in_grid,
+        )
+
+        assert self.mimo_runtime is not None
+        return [
+            module
+            for module, grid in self.mimo_runtime.module_to_grid_tuple
+            if module is not None and is_current_rank_in_grid(grid)
+        ]
+
     @wrap_with_nvtx_name("megatron_policy_worker/begin_train_step")
     def begin_train_step(
         self,
@@ -1929,6 +1956,7 @@ class MegatronPolicyWorkerImpl(
             state = self._split_step_state_init(loss_fn=loss_fn, gbs=gbs, mbs=mbs)
             state["mimo"] = True
             state["mimo_losses_reduced"] = []
+            self._suspend_mimo_train_hooks(state)
             self._train_step_state = state
             return
 
@@ -2088,10 +2116,6 @@ class MegatronPolicyWorkerImpl(
             raise ValueError("MIMO training requires a positive num_microbatches.")
         if sequence_length is None or sequence_length <= 0:
             raise ValueError("MIMO training requires a positive sequence_length.")
-        if state["num_chunks"]:
-            raise RuntimeError(
-                "The initial MIMO SFT v2 path accepts one placed batch per step."
-            )
         if data is None:
             data_iterator: Iterator[Any] = iter([None] * num_microbatches)
             micro_batch_size = state["mbs"]
@@ -2126,35 +2150,40 @@ class MegatronPolicyWorkerImpl(
                     f"expected {sequence_length}, got {row_width}."
                 )
 
-        state["num_chunks"] = 1
-        state["total_num_microbatches"] = num_microbatches
+        state["num_chunks"] += 1
+        state["total_num_microbatches"] += num_microbatches
 
-        # One schedule invocation carries the whole step, so the loss
-        # denominators are known before the forward and the loss can apply
-        # them itself. The streaming path cannot do that -- it trains on raw
-        # sums and rescales the gradients at finish -- but it also nulls
-        # mcore's end-of-schedule gradient finalization, which MIMO leaves in
-        # place. Here the data-parallel reduce has already happened by the time
-        # the step is closed, too late for anything to rescale into it.
+        # Every role participates in this count reduction, with one language
+        # replica leader contributing each lane. Later chunks need not have
+        # arrived yet: accumulate raw sums and normalize once at commit.
         global_valid_seqs, global_valid_toks = self._reduce_mimo_valid_counts(data)
-        state["global_valid_seqs"] = global_valid_seqs
-        state["global_valid_toks"] = global_valid_toks
+        if state["num_chunks"] == 1:
+            state["global_valid_seqs"] = global_valid_seqs
+            state["global_valid_toks"] = global_valid_toks
+        else:
+            state["global_valid_seqs"] += global_valid_seqs
+            state["global_valid_toks"] += global_valid_toks
+        placeholder_n = torch.ones_like(global_valid_seqs)
 
-        losses_reduced = megatron_mimo_forward_backward(
-            model=self.model,
-            data_iterator=data_iterator,
-            num_microbatches=num_microbatches,
-            seq_length=forward_length,
-            mbs=micro_batch_size,
-            mimo_runtime=self.mimo_runtime,
-            post_processing_fn=self._mimo_loss_post_processor(
-                state["loss_fn"], num_microbatches
-            ),
-            sampling_params=self.sampling_params,
-            global_valid_seqs=global_valid_seqs,
-            global_valid_toks=global_valid_toks,
-        )
-        state["mimo_losses_reduced"] = list(losses_reduced or [])
+        # The inner schedule must not register or reduce a last microbatch at
+        # each chunk boundary. MimoModel.no_sync delegates to its active DDP
+        # components, and the Bridge finalizer is restored only at commit.
+        with self.model.no_sync():
+            losses_reduced = megatron_mimo_forward_backward(
+                model=self.model,
+                data_iterator=data_iterator,
+                num_microbatches=num_microbatches,
+                seq_length=forward_length,
+                mbs=micro_batch_size,
+                mimo_runtime=self.mimo_runtime,
+                post_processing_fn=self._mimo_loss_post_processor(
+                    state["loss_fn"], num_microbatches
+                ),
+                sampling_params=self.sampling_params,
+                global_valid_seqs=placeholder_n,
+                global_valid_toks=placeholder_n,
+            )
+        state["mimo_losses_reduced"].extend(losses_reduced or [])
 
     def _mimo_dataless_forward_length(self, sequence_length: int) -> int:
         """The forward length for a rank the controller handed no batch.
@@ -2463,6 +2492,37 @@ class MegatronPolicyWorkerImpl(
 
     def _finish_train_step_body(self, state: dict[str, Any]) -> dict[str, Any]:
         if self.mimo_runtime is not None:
+            from nemo_rl.algorithms.loss.interfaces import LossType, MetricNormalizer
+
+            if not state["num_chunks"]:
+                raise RuntimeError("Cannot finish an empty MIMO train step.")
+            global_valid_seqs = state["global_valid_seqs"]
+            global_valid_toks = state["global_valid_toks"]
+            inv_seqs = 1.0 / max(float(global_valid_seqs.item()), 1.0)
+            inv_toks = 1.0 / max(float(global_valid_toks.item()), 1.0)
+            inv_n = inv_toks if state["loss_type"] == LossType.TOKEN_LEVEL else inv_seqs
+            self._restore_saved_mcore_hooks(state)
+            for module in self._mimo_active_modules():
+                module.scale_gradients(inv_n)
+                if self.cfg["megatron_cfg"]["distributed_data_parallel_config"][
+                    "overlap_grad_reduce"
+                ]:
+                    module.start_grad_sync()
+            model_config = getattr(self.model, "config")
+            # The collectors return the legacy two-item loss tuple. Preserve
+            # its zero schedule token count when per-token finalization is on;
+            # our true global denominator has already been applied above.
+            schedule_tokens = (
+                torch.zeros((), dtype=torch.int, device=global_valid_toks.device)
+                if model_config.calculate_per_token_loss
+                else None
+            )
+            state["saved_finalize_model_grads_func"](
+                [self.model],
+                schedule_tokens,
+                pg_collection=self.mimo_runtime.multimodule_pg_collection,
+            )
+            torch.cuda.synchronize()
             opt_started = time.monotonic()
             update_successful, grad_norm, _ = self.optimizer.step()
             self._add_step_phase("finish_opt", time.monotonic() - opt_started)
@@ -2490,13 +2550,28 @@ class MegatronPolicyWorkerImpl(
                     raise RuntimeError(
                         "The MIMO language role produced no loss metrics."
                     )
-                # No rescale pass here, unlike the streaming path: the loss was
-                # given the step's true denominators, so these are final.
                 global_valid_seqs = float(state["global_valid_seqs"].item())
                 global_valid_toks = float(state["global_valid_toks"].item())
                 step_metrics = []
                 for m in mb_metrics:
-                    out = dict(m)
+                    out = {}
+                    for key, value in m.items():
+                        kind = state["metric_normalizations"].get(key)
+                        if (
+                            "_min" in key
+                            or "_max" in key
+                            or kind is MetricNormalizer.NONE
+                        ):
+                            out[key] = value
+                        else:
+                            scale = (
+                                inv_toks
+                                if kind is MetricNormalizer.TOKENS
+                                else inv_seqs
+                                if kind is MetricNormalizer.SEQUENCES
+                                else inv_n
+                            )
+                            out[key] = value * scale
                     out["lr"] = curr_lr
                     out["wd"] = curr_wd
                     out["global_valid_seqs"] = global_valid_seqs
@@ -2504,7 +2579,7 @@ class MegatronPolicyWorkerImpl(
                     step_metrics.append(out)
                 all_mb_metrics, global_loss = aggregate_training_statistics(
                     all_mb_metrics=step_metrics,
-                    losses=[float(sum(m["loss"] for m in mb_metrics))],
+                    losses=[float(sum(m["loss"] for m in step_metrics))],
                     data_parallel_group=self.mimo_runtime.local_pg_collection.dp_cp,
                 )
 
@@ -2840,6 +2915,7 @@ class MegatronPolicyWorkerImpl(
                 zero_grad_buffer_for_multimodule,
             )
 
+            self._restore_saved_mcore_hooks(state)
             zero_grad_buffer_for_multimodule(self.mimo_runtime.module_to_grid_tuple)
             self.optimizer.zero_grad()
             self._train_step_state = None
@@ -5464,16 +5540,28 @@ class MegatronPolicyWorkerImpl(
         state = self._assert_step_open()
         if state.get("offloaded", False):
             raise RuntimeError("the open train step is already offloaded")
-        if not isinstance(self.model, DistributedDataParallel):
-            raise ValueError("PPO streaming offload requires Megatron DDP")
-        if (
-            self.megatron_cfg.ddp.use_distributed_optimizer
-            and self.megatron_cfg.ddp.reuse_grad_buf_for_mxfp8_param_ag
-        ):
-            raise ValueError(
-                "PPO streaming offload with the distributed optimizer requires "
-                "reuse_grad_buf_for_mxfp8_param_ag=False"
-            )
+        modules = (
+            self._mimo_active_modules()
+            if self.mimo_runtime is not None
+            else [self.model]
+        )
+        for module in modules:
+            if not isinstance(module, DistributedDataParallel):
+                raise ValueError("PPO streaming offload requires Megatron DDP")
+        ddp_configs = (
+            [module.ddp_config for module in modules]
+            if self.mimo_runtime is not None
+            else [self.megatron_cfg.ddp]
+        )
+        for ddp_config in ddp_configs:
+            if (
+                ddp_config.use_distributed_optimizer
+                and ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+            ):
+                raise ValueError(
+                    "PPO streaming offload with the distributed optimizer requires "
+                    "reuse_grad_buf_for_mxfp8_param_ag=False"
+                )
 
         self.finalize_async_save()
         # eval may materialize model-specific caches; do it before CPU offload.

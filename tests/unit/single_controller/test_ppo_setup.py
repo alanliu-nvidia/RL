@@ -56,7 +56,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.models.value.config import ValueResourcesConfig
-from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import LoggerConfig
 
 _NUM_PROMPTS_PER_STEP = 4
@@ -732,6 +731,8 @@ def patched_ppo_factories():
     fake_value = MagicMock(name="value")
     fake_policy.sharding_annotations.get_axis_size.return_value = 1
     fake_value.sharding_annotations.get_axis_size.return_value = 1
+    fake_policy.data_parallel_size = 1
+    fake_value.data_parallel_size = 1
 
     with (
         patch.object(

@@ -63,7 +63,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     MasterConfig,
     resolve_ppo_chunk_alignment,
-    validate_single_controller_config,
 )
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
@@ -2688,8 +2687,9 @@ def test_train_pump_parks_the_policy_on_cpu_across_the_critic_stages(
 
 
 @pytest.mark.parametrize("policy_logprobs_required", [False, True])
+@pytest.mark.parametrize("parallel_inference", [False, True])
 def test_dedicated_value_keeps_both_models_resident_during_ppo_step(
-    monkeypatch, policy_logprobs_required
+    monkeypatch, policy_logprobs_required, parallel_inference
 ) -> None:
     meta = _single_group_meta()
     calls: list[str] = []
@@ -2699,6 +2699,8 @@ def test_dedicated_value_keeps_both_models_resident_during_ppo_step(
     )
     ctrl._value_dedicated = True
     ctrl._policy_logprobs_required = policy_logprobs_required
+    ctrl._algo_cfg.parallel_value_policy_inference = parallel_inference
+    ctrl._run_parallel_ppo_inference = AsyncMock(wraps=ctrl._run_parallel_ppo_inference)
     trainer = _OrderRecordingTrainer(calls)
     trainer.prepare_for_lp_inference = MagicMock(wraps=trainer.prepare_for_lp_inference)
     trainer.offload_to_cpu = MagicMock(wraps=trainer.offload_to_cpu)
@@ -2711,6 +2713,13 @@ def test_dedicated_value_keeps_both_models_resident_during_ppo_step(
 
     trainer.offload_to_cpu.assert_not_called()
     trainer.finish_inference.assert_not_called()
+    assert ctrl._run_parallel_ppo_inference.await_count == int(
+        parallel_inference and policy_logprobs_required
+    )
+    if policy_logprobs_required and not parallel_inference:
+        assert calls.index("critic.get_values_from_meta") < calls.index(
+            "policy.get_logprobs_from_meta"
+        )
     if policy_logprobs_required:
         trainer.prepare_for_lp_inference.assert_called_once_with(
             keep_train_buffers=True

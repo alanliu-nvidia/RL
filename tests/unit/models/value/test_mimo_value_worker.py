@@ -77,6 +77,7 @@ def test_finish_training_offloads_model_and_optimizer() -> None:
     worker = object.__new__(MegatronMIMOValueWorkerImpl)
     worker.model = MagicMock()
     worker.optimizer = object()
+    worker._train_step_state = None
     worker.optimizer_cpu_offload = False
     worker.move_model = MagicMock(return_value=worker.model)
     worker.move_optimizer = MagicMock()
