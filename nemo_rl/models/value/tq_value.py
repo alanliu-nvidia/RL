@@ -31,6 +31,7 @@ from nemo_rl.data_plane.schema import (
     VALUE_SEED_FIELDS,
 )
 from nemo_rl.models.value.lm_value import Value
+from nemo_rl.utils.ppo_benchmark_trace import trace_benchmark_rpc
 from nemo_rl.telemetry.instrumentation import trace_context_kwargs
 from nemo_rl.utils.timer import Timer
 
@@ -101,6 +102,7 @@ class TQValue(TQDriverMixin, Value):
 
     # ── 1-hop entrypoints (KVBatchMeta in, no re-fan-out) ──────────────────
 
+    @trace_benchmark_rpc("value/inference")
     def get_values_from_meta(
         self,
         meta: KVBatchMeta,
@@ -161,6 +163,7 @@ class TQValue(TQDriverMixin, Value):
         # Wait for completion; per-rank returns are None.
         self.worker_group.get_all_worker_results(futures)
 
+    @trace_benchmark_rpc("value/train_full")
     def train_from_meta(
         self,
         meta: KVBatchMeta,
@@ -266,6 +269,7 @@ class TQValue(TQDriverMixin, Value):
             },
         )
 
+    @trace_benchmark_rpc("value/begin")
     def begin_train_step(
         self,
         loss_fn: LossFunction,
@@ -284,6 +288,7 @@ class TQValue(TQDriverMixin, Value):
         )
         self._value_train_micro_batch_size = micro_batch_size
 
+    @trace_benchmark_rpc("value/train_chunk")
     def train_microbatches_from_meta(
         self, meta: KVBatchMeta, timer: Optional[Timer] = None
     ) -> None:
@@ -322,6 +327,7 @@ class TQValue(TQDriverMixin, Value):
         )
         self.worker_group.get_all_worker_results(futures)
 
+    @trace_benchmark_rpc("value/commit")
     def finish_train_step(self) -> dict[str, Any]:
         """Commit one update; deduplicate metrics from TP/CP/PP replicas."""
         results = ray.get(

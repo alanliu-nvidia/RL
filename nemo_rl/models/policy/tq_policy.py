@@ -65,6 +65,7 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.distributed.named_sharding import GTP_WEIGHT_REMAT_AXIS
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.utils.ppo_benchmark_trace import trace_benchmark_rpc
 from nemo_rl.telemetry.instrumentation import trace_context_kwargs
 from nemo_rl.utils.flops_tracker import get_theoretical_tflops
 from nemo_rl.utils.timer import Timer
@@ -506,15 +507,14 @@ class TQPolicy(TQDriverMixin, Policy):
                 # controller does not model that; each rank derives it from the
                 # batch it was handed, which lands on the same number because
                 # MIMO pins pipelining to 1.
-                "sequence_length": int(
-                    lp_meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN]
-                ),
+                "sequence_length": int(lp_meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN]),
                 # Rollout batches reach the worker whole. An SFT loader's do
                 # not: the Energon task encoder splits media as it encodes.
                 "split_encoder_media": True,
             },
         )
 
+    @trace_benchmark_rpc("policy/logprobs")
     def get_logprobs_from_meta(
         self,
         meta: KVBatchMeta,
@@ -531,6 +531,7 @@ class TQPolicy(TQDriverMixin, Policy):
             include_router_replay=True,
         )
 
+    @trace_benchmark_rpc("policy/reference_logprobs")
     def get_reference_policy_logprobs_from_meta(
         self,
         meta: KVBatchMeta,
@@ -678,6 +679,7 @@ class TQPolicy(TQDriverMixin, Policy):
     #
     # ``train_from_meta`` is unchanged and remains the sync entrypoint.
 
+    @trace_benchmark_rpc("policy/begin")
     def begin_train_step(
         self,
         loss_fn: LossFunction,
@@ -713,6 +715,7 @@ class TQPolicy(TQDriverMixin, Policy):
         )
         ray.get(futures)
 
+    @trace_benchmark_rpc("policy/train_chunk")
     def train_microbatches_from_meta(
         self,
         meta: KVBatchMeta,
@@ -1099,6 +1102,7 @@ class TQPolicy(TQDriverMixin, Policy):
             )
         ray.get(futures)
 
+    @trace_benchmark_rpc("policy/commit")
     def finish_train_step(self) -> dict[str, Any]:
         """Close an open train step: all_reduce, rescale, optimizer.step.
 

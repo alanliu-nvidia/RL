@@ -32,6 +32,7 @@ from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
 )
 from nemo_rl.models.value.config import ValueConfig
+from nemo_rl.utils.ppo_benchmark_trace import record_initial_value_head
 from nemo_rl.models.value.workers.megatron_value_worker import (
     _install_value_head_load_skip,
 )
@@ -56,6 +57,7 @@ def install_mimo_value_head(models: list[Any]) -> list[Any]:
             bias=False,
             tp_group=getattr(getattr(language, "pg_collection", None), "tp", None),
         )
+        record_initial_value_head(language.output_layer.weight)
         _install_value_head_load_skip(language)
 
         # Bridge checks the outer MIMO model when skipping a fresh scalar head

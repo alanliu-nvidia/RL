@@ -258,6 +258,11 @@ MOUNTS+=",${NT4_NANO_MIMO_CKPT}:${NT4_NANO_MIMO_CKPT}:ro"
 MOUNTS+=",${NT4_SHIM_DIR}:${NT4_SHIM_DIR}:ro"
 MOUNTS+=",${RUN_DIR}:${RUN_DIR}"
 MOUNTS+=",${CACHE_DIR}:${CACHE_DIR}"
+# Benchmark evidence must remain writable beneath the shared read-only overlay.
+if [[ -n "${NRL_PPO_BENCHMARK_TRACE_DIR:-}" ]]; then
+  mkdir -p "${NRL_PPO_BENCHMARK_TRACE_DIR}"
+  MOUNTS+=",${NRL_PPO_BENCHMARK_TRACE_DIR}:${NRL_PPO_BENCHMARK_TRACE_DIR}"
+fi
 # Checkpoints have to outlive a single job, so this cannot live under RUN_DIR,
 # which carries a per-launch timestamp. A chained job resumes by globbing
 # step_* in this directory, so every job in a chain must be given the same one.
