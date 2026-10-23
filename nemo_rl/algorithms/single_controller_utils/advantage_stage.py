@@ -548,8 +548,16 @@ class AdvantageComputer:
                 sequences["prev_logprobs"] = tensor_field(
                     data, adv_cfg.policy_logprobs_field
                 )
+            if cfg.reference_logprobs_required:
+                sequences[adv_cfg.reference_logprobs_field] = kwargs[
+                    "logprobs_reference"
+                ]
             if cfg.teacher_logprobs_required:
                 sequences["teacher_logprobs"] = kwargs["teacher_logprobs"]
+            if cfg.is_ppo:
+                assert returns is not None
+                sequences[adv_cfg.values_field] = kwargs["values"]
+                sequences[adv_cfg.returns_field] = returns
             await asyncio.to_thread(
                 self._train_data_dump.add_chunk,
                 step=request.train_step,
