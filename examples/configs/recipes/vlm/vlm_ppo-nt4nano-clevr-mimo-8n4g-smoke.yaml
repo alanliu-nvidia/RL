@@ -269,6 +269,9 @@ value:
       lr: 1.0e-05
       min_lr: 1.0e-06
       weight_decay: 0.01
+      # Fused norm/clip kernels require uniform gradient dtypes. The language
+      # backbone has FP32 parameters alongside BF16 weights; use FP32 for both.
+      main_grads_dtype: float32
     scheduler:
       start_weight_decay: 0.01
       end_weight_decay: 0.01
