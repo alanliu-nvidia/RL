@@ -83,6 +83,7 @@ from nemo_rl.models.megatron.router_replay import (
     set_router_replay_backward,
     set_router_replay_forward,
 )
+from nemo_rl.models.megatron.value import ValuePostProcessor
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.utils.sequence_lengths import CpuIntTuple, to_cpu_int_tuple
 
@@ -91,6 +92,7 @@ if TYPE_CHECKING:
 
 # Union type for any post-processing function (defined after classes below)
 PostProcessingFunction = Union[
+    "ValuePostProcessor",
     "LossPostProcessor",
     "LogprobsPostProcessor",
     "TeacherFullPayloadPostProcessor",
@@ -635,9 +637,7 @@ def _mimo_language_batch(
             )
         starts = packed_seq_params.cu_seqlens_q_padded.tolist()
         lengths = [int(length) for length in data[_MIMO_SEQ_LENGTH_KEY]]
-        labels = _mimo_pack_rows(
-            labels, starts, lengths, width, _MIMO_IGNORE_INDEX
-        )
+        labels = _mimo_pack_rows(labels, starts, lengths, width, _MIMO_IGNORE_INDEX)
         loss_mask = _mimo_pack_rows(loss_mask, starts, lengths, width, 0)
     if labels.shape != input_ids.shape:
         raise ValueError("MIMO language masks do not match the processed input batch.")
@@ -877,6 +877,19 @@ def mimo_forward_with_post_processing_fn(
 
     if not mimo_model.role.has_language_module:
         return output_tensor, _mimo_encoder_no_collection
+
+    if isinstance(post_processing_fn, ValuePostProcessor):
+        if microbatch.original_seq_length is None:
+            raise RuntimeError("MIMO values require original_seq_length.")
+        return output_tensor, post_processing_fn(
+            data_dict=microbatch.data_dict,
+            cu_seqlens_padded=microbatch.cu_seqlens_padded,
+            original_seq_length=microbatch.original_seq_length,
+            cp_layout=_mimo_cp_layout(mimo_model),
+            cp_group=get_context_parallel_group(),
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+        )
 
     # Element-wise, so it belongs on the logits here rather than inside the
     # post-processor, which is where the whole-vocabulary sampling parameters

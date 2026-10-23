@@ -25,7 +25,11 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta, build_data_plane_client
 from nemo_rl.data_plane.driver_mixin import TQDriverMixin
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
-from nemo_rl.data_plane.schema import DP_VALUE_TRAIN_FIELDS, VALUE_SEED_FIELDS
+from nemo_rl.data_plane.schema import (
+    DP_VALUE_TRAIN_FIELDS,
+    GLOBAL_FORWARD_PAD_SEQLEN,
+    VALUE_SEED_FIELDS,
+)
 from nemo_rl.models.value.lm_value import Value
 from nemo_rl.telemetry.instrumentation import trace_context_kwargs
 from nemo_rl.utils.timer import Timer
@@ -66,7 +70,7 @@ class TQValue(TQDriverMixin, Value):
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
-        dp_world = self.sharding_annotations.get_axis_size("data_parallel")
+        dp_world = self.data_parallel_size
         if dp_world <= 0:
             raise ValueError(
                 f"TQValue requires data_parallel axis size > 0, got {dp_world}. "
@@ -115,20 +119,30 @@ class TQValue(TQDriverMixin, Value):
             meta,
             fields=list(VALUE_SEED_FIELDS),
             task_name="value_fwd",
-            # A value model consumes tokens only; unioning the rollout's
-            # multimodal columns in would fetch and broadcast pixels this
-            # forward discards.
-            include_multimodal=False,
+            include_multimodal=bool(self.cfg.get("is_vlm")),
         )
         with timer.time("get_values/shard_meta") if timer else nullcontext():
             metas, _ = shard_meta_for_dp(
                 value_meta,
-                dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
+                dp_world=self.data_parallel_size,
                 batch_size=None,
                 sequence_packing_args=spa,
                 dynamic_batching_args=dba,
             )
         with timer.time("get_values/submit_value_futures") if timer else nullcontext():
+            if self.mimo_config is not None:
+                futures = self._submit_mimo_value_metas(
+                    "get_values_presharded",
+                    value_meta,
+                    metas,
+                    micro_batch_size=micro_batch_size or self.cfg["logprob_batch_size"],
+                    common_kwargs={
+                        "micro_batch_size": micro_batch_size,
+                        **trace_context_kwargs(),
+                    },
+                )
+                ray.get(futures)
+                return
             futures = self.worker_group.run_all_workers_sharded_data(
                 "get_values_presharded",
                 meta=metas,
@@ -173,13 +187,12 @@ class TQValue(TQDriverMixin, Value):
             meta,
             fields=list(DP_VALUE_TRAIN_FIELDS),
             task_name="value_train",
-            # See get_values: token-only inputs, so no multimodal union.
-            include_multimodal=False,
+            include_multimodal=bool(self.cfg.get("is_vlm")),
         )
         with timer.time("value_training/shard_meta") if timer else nullcontext():
             dp_metas, _ = shard_meta_for_dp(
                 train_meta,
-                dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
+                dp_world=self.data_parallel_size,
                 batch_size=batch_size,
                 sequence_packing_args=spa,
                 dynamic_batching_args=dba,
@@ -190,6 +203,24 @@ class TQValue(TQDriverMixin, Value):
             if timer
             else nullcontext()
         ):
+            if self.mimo_config is not None:
+                futures = self._submit_mimo_value_metas(
+                    "train_presharded",
+                    train_meta,
+                    dp_metas,
+                    micro_batch_size=micro_batch_size,
+                    common_kwargs={
+                        "loss_fn": loss_fn,
+                        "eval_mode": eval_mode,
+                        "gbs": batch_size,
+                        "mbs": micro_batch_size,
+                        **trace_context_kwargs(),
+                    },
+                )
+                results = ray.get(futures)
+                return _aggregate_train_results(
+                    [results[r] for r in self._mimo_language_lane_ranks()]
+                )
             futures = self.worker_group.run_all_workers_sharded_data(
                 "train_presharded",
                 meta=dp_metas,
@@ -206,4 +237,27 @@ class TQValue(TQDriverMixin, Value):
             )
         return _aggregate_train_results(
             self.worker_group.get_all_worker_results(futures)
+        )
+
+    def _submit_mimo_value_metas(
+        self,
+        worker_method: str,
+        meta: KVBatchMeta,
+        dp_metas: list[KVBatchMeta],
+        *,
+        micro_batch_size: int,
+        common_kwargs: dict[str, Any],
+    ) -> list[ray.ObjectRef]:
+        """Enter the same schedule on every language and encoder rank."""
+        return self.worker_group.run_all_workers_multiple_data(
+            worker_method,
+            meta=self._mimo_per_rank_shards(dp_metas),
+            common_kwargs={
+                **common_kwargs,
+                "num_microbatches": self._mimo_lane_microbatches(
+                    dp_metas, micro_batch_size
+                ),
+                "sequence_length": int(meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN]),
+                "split_encoder_media": True,
+            },
         )

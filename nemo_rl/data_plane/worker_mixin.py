@@ -932,6 +932,9 @@ class TQWorkerMixin:
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        num_microbatches: Optional[int] = None,
+        sequence_length: Optional[int] = None,
+        split_encoder_media: Optional[bool] = None,
     ) -> dict[str, Any]:
         """Per-rank training entrypoint. Fetch → packing prep → delegate."""
         data = self._fetch(meta)
@@ -942,6 +945,7 @@ class TQWorkerMixin:
             eval_mode=eval_mode,
             gbs=gbs,
             mbs=mbs,
+            **_mimo_call_kwargs(num_microbatches, sequence_length, split_encoder_media),
         )
 
     @accepts_trace_context
@@ -1138,6 +1142,9 @@ class TQWorkerMixin:
         self,
         meta: "KVBatchMeta",
         micro_batch_size: Optional[int] = None,
+        num_microbatches: Optional[int] = None,
+        sequence_length: Optional[int] = None,
+        split_encoder_media: Optional[bool] = None,
     ) -> None:
         """Per-rank value-forward entrypoint. Fetch → packing prep → run → write back.
 
@@ -1149,7 +1156,10 @@ class TQWorkerMixin:
         result: BatchedDataDict[Any] = self.get_values(  # type: ignore[attr-defined]
             data=data,
             micro_batch_size=micro_batch_size,
+            **_mimo_call_kwargs(num_microbatches, sequence_length, split_encoder_media),
         )
+        if not self._holds_logprob_vocabulary():
+            return
         self._write_back_result_field(
             meta,
             result,
