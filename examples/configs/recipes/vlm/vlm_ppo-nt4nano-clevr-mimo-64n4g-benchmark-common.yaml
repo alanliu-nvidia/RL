@@ -1,0 +1,55 @@
+# Formal Nano4 CLEVR PPO comparison: 2048 independent prompts, one sample each.
+# 256k is 262144 total tokens; generation clamps output budget to remaining context.
+# Equal budget: 64 GB300 nodes x4 GPUs, including32 generation nodes.
+defaults: vlm_ppo-nt4nano-clevr-mimo-8n4g-smoke.yaml
+ppo:
+  num_prompts_per_step: 2048
+  num_generations_per_prompt: 1
+  seed: 42
+  max_num_steps: 13
+  max_num_epochs: 1
+  policy_training_start_step: 1
+  adv_estimator:
+    normalize_advantages: false
+cluster:
+  num_nodes: 64
+policy:
+  train_global_batch_size: 2048
+  max_total_sequence_length: 262144
+  megatron_cfg:
+    model_overrides:
+      # The checkpoint provider defaults to8192; align its runtime sequence bound.
+      seq_length: 262144
+    mimo:
+      parallelism:
+        module_parallelisms:
+          language:
+            data_parallel_size: 32
+            rank_offset: 0
+          images:
+            data_parallel_size: 64
+            rank_offset: 64
+  sequence_packing:
+    train_mb_tokens: ${policy.max_total_sequence_length}
+    logprob_mb_tokens: ${policy.max_total_sequence_length}
+  generation:
+    max_new_tokens: ${policy.max_total_sequence_length}
+    colocated:
+      resources:
+        num_nodes: 32
+    vllm_cfg:
+      max_model_len: ${policy.max_total_sequence_length}
+      env_vars:
+        # Checkpoint HF metadata says8192. Permit the requested runtime cap
+        # without changing checkpoint weights or rotary scaling in either arm.
+        VLLM_ALLOW_LONG_MAX_MODEL_LEN: '1'
+    vllm_kwargs:
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 8192
+value:
+  train_global_batch_size: 2048
+  max_total_sequence_length: ${policy.max_total_sequence_length}
+async_rl:
+  min_groups_for_streaming_train: 128
+  max_inflight_prompts: 4096
+  max_buffered_rollouts: 4096
