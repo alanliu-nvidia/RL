@@ -2525,6 +2525,9 @@ class MegatronPolicyWorkerImpl(
             torch.cuda.synchronize()
             opt_started = time.monotonic()
             update_successful, grad_norm, _ = self.optimizer.step()
+            from nemo_rl.utils.ppo_benchmark_trace import record_optimizer_step
+
+            record_optimizer_step(self, state, update_successful, grad_norm)
             self._add_step_phase("finish_opt", time.monotonic() - opt_started)
 
             is_language_role = (

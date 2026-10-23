@@ -39,6 +39,7 @@ def benchmark_span(phase, instance, meta=None):
         yield
     except BaseException as error:
         record["status"] = type(error).__name__
+        record["error"] = str(error)
         raise
     finally:
         record["end_ns"] = time.monotonic_ns()
@@ -96,3 +97,31 @@ def record_initial_value_head(weight):
     (root / f"initial-head-{record['host']}-{record['pid']}.json").write_text(
         json.dumps(record) + "\n"
     )
+
+
+def record_optimizer_step(instance, state, update_successful, grad_norm):
+    """Archive actual native update decisions, including every MIMO role/rank."""
+    directory = os.environ.get("NRL_PPO_BENCHMARK_TRACE_DIR")
+    if not directory:
+        return
+    import torch
+
+    record = {
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "rank": torch.distributed.get_rank(),
+        "worker_class": type(instance).__name__,
+        "mimo_role": instance.mimo_runtime.active_module_name,
+        "cuda_device": torch.cuda.current_device(),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "wall_ns": time.time_ns(),
+        "update_successful": bool(update_successful),
+        "grad_norm": None if grad_norm is None else float(grad_norm),
+        "chunks": state["num_chunks"],
+        "global_valid_seqs": float(state["global_valid_seqs"]),
+        "global_valid_toks": float(state["global_valid_toks"]),
+    }
+    root = Path(directory)
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / f"updates-{record['host']}-{record['pid']}.jsonl").open("a") as out:
+        out.write(json.dumps(record) + "\n")
