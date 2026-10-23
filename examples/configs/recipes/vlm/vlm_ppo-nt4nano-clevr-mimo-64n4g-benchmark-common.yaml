@@ -30,6 +30,9 @@ policy:
             data_parallel_size: 64
             rank_offset: 64
   sequence_packing:
+    # Packing many CLEVR images into one 256k-token ViT microbatch OOMs.
+    # MBS=1 still permits an individual sequence up to the 256k model limit.
+    enabled: false
     train_mb_tokens: ${policy.max_total_sequence_length}
     logprob_mb_tokens: ${policy.max_total_sequence_length}
   generation:
@@ -49,6 +52,8 @@ policy:
 value:
   train_global_batch_size: 2048
   max_total_sequence_length: ${policy.max_total_sequence_length}
+  sequence_packing:
+    enabled: false
 async_rl:
   min_groups_for_streaming_train: 128
   max_inflight_prompts: 4096
