@@ -1,5 +1,5 @@
 # Formal Nano4 CLEVR PPO comparison: 2048 independent prompts, one sample each.
-# 256k is 262144 total tokens; generation clamps output budget to remaining context.
+# 256k is 262144 total tokens; keep the CLEVR case's 6144-token output cap.
 # Equal budget: 64 GB300 nodes x4 GPUs, including32 generation nodes.
 defaults: vlm_ppo-nt4nano-clevr-mimo-8n4g-smoke.yaml
 ppo:
@@ -33,7 +33,7 @@ policy:
     train_mb_tokens: ${policy.max_total_sequence_length}
     logprob_mb_tokens: ${policy.max_total_sequence_length}
   generation:
-    max_new_tokens: ${policy.max_total_sequence_length}
+    max_new_tokens: 6144
     colocated:
       resources:
         num_nodes: 32
