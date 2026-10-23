@@ -199,7 +199,8 @@ NT4_SHIM_DIR="${NT4_SHIM_DIR:-${NT4_AGA_ROOT}/shims}"
 # image's nested Megatron-LM imports mistral_adapter, which ends at a bare
 # `import cv2` that NeMo-RL excludes. Overlaying the whole repo at /opt/nemo-rl
 # covers both, and is what the Oct 4 attempts did.
-_provider="${PROJECT_ROOT}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src/megatron/bridge/models/nemotron4/nemotron4_provider.py"
+NT4_BRIDGE_ROOT="${NT4_BRIDGE_ROOT:-${PROJECT_ROOT}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge}"
+_provider="${NT4_BRIDGE_ROOT}/src/megatron/bridge/models/nemotron4/nemotron4_provider.py"
 if [[ ! -f "${_provider}" ]]; then
   echo "ERROR: NM4 bridge provider missing: ${_provider}" >&2
   exit 1
@@ -210,7 +211,7 @@ fi
 # stops existing inside the container. That surfaces as a ModuleNotFoundError in
 # every Megatron worker about 19 minutes in, after the vLLM engines are already
 # up, so check it here instead: see section 1 of RUN-ON-AGA.md for the fix.
-_megatron_core="${PROJECT_ROOT}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM/megatron/core/models/gpt/gpt_model.py"
+_megatron_core="${NT4_BRIDGE_ROOT}/3rdparty/Megatron-LM/megatron/core/models/gpt/gpt_model.py"
 if [[ ! -f "${_megatron_core}" ]]; then
   echo "ERROR: megatron.core missing from the nested Megatron-LM submodule." >&2
   echo "       Expected: ${_megatron_core}" >&2
@@ -250,7 +251,7 @@ mkdir -p "${RUN_DIR}/logs" "${CACHE_DIR}"
 # "couldn't chdir to ..." because only the overlay was mounted.
 MOUNTS="${PROJECT_ROOT}:${PROJECT_ROOT}"
 MOUNTS+=",${PROJECT_ROOT}:/opt/nemo-rl"
-MOUNTS+=",${PROJECT_ROOT}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
+MOUNTS+=",${NT4_BRIDGE_ROOT}:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
 MOUNTS+=",${NT4_NANO_MODEL_DIR}:${NT4_NANO_MODEL_DIR}:ro"
 MOUNTS+=",${NT4_NANO_PROCESSOR}:${NT4_NANO_PROCESSOR}:ro"
 MOUNTS+=",${NT4_NANO_MIMO_CKPT}:${NT4_NANO_MIMO_CKPT}:ro"
