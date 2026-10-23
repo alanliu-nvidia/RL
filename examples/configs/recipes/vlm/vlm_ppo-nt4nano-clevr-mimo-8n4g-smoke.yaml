@@ -278,6 +278,8 @@ value:
       lr_warmup_iters: 0
       lr_warmup_init: 0
     distributed_data_parallel_config:
+      # DDP chooses its actual buffer dtype with this flag, not optimizer.main_grads_dtype.
+      grad_reduce_in_fp32: true
       overlap_grad_reduce: false
       overlap_param_gather: false
     env_vars: ${policy.megatron_cfg.env_vars}
