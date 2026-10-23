@@ -23,6 +23,7 @@ asks workers for a column no producer wrote.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -36,6 +37,13 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.models.value.tq_value import TQValue
+
+
+@pytest.fixture(autouse=True)
+def _cpu_nvtx():
+    """These dispatch tests do not exercise CUDA profiling."""
+    with patch("torch.cuda.nvtx.range_push"), patch("torch.cuda.nvtx.range_pop"):
+        yield
 
 
 class _ValueStubWorker(TQWorkerMixin):
@@ -107,12 +115,109 @@ class TestGetValuesPresharded:
 def _make_tq_value() -> tuple[TQValue, MagicMock]:
     """Bare TQValue with the attributes the fan-out touches."""
     v = object.__new__(TQValue)
+    v.mimo_config = None
     v.cfg = {"train_global_batch_size": 8, "train_micro_batch_size": 2}
     wg = MagicMock()
     v.worker_group = wg
     v.sharding_annotations = MagicMock()
     v.sharding_annotations.get_axis_size.return_value = 2
     return v, wg
+
+
+def _make_mimo_value() -> tuple[TQValue, MagicMock]:
+    v, wg = _make_tq_value()
+    v.cfg.update(is_vlm=True, logprob_batch_size=1)
+    v.use_dynamic_batches = False
+    v.use_sequence_packing = False
+    v.mimo_config = SimpleNamespace(
+        parallelism={
+            "module_parallelisms": {
+                "language": {
+                    "tensor_model_parallel_size": 1,
+                    "pipeline_model_parallel_size": 1,
+                    "context_parallel_size": 1,
+                    "data_parallel_size": 2,
+                    "rank_offset": 0,
+                },
+                "images": {
+                    "tensor_model_parallel_size": 1,
+                    "pipeline_model_parallel_size": 1,
+                    "context_parallel_size": 1,
+                    "data_parallel_size": 4,
+                    "rank_offset": 2,
+                },
+            }
+        }
+    )
+    wg.workers = list(range(6))
+    return v, wg
+
+
+def test_mimo_value_dispatch_keeps_images_and_synchronizes_every_rank():
+    v, wg = _make_mimo_value()
+    refs = [object() for _ in wg.workers]
+    wg.run_all_workers_multiple_data.return_value = refs
+    meta = _meta()
+    meta.fields = ["input_ids", "input_lengths", "pixel_values", "imgs_sizes"]
+    meta.sequence_lengths = [8, 8]
+    meta.extra_info = {GLOBAL_FORWARD_PAD_SEQLEN: 8}
+    with (
+        patch.object(TQValue, "_packing_args", return_value=(None, None)),
+        patch(
+            "nemo_rl.models.value.tq_value.shard_meta_for_dp",
+            return_value=([meta, meta], None),
+        ) as shard,
+        patch("nemo_rl.models.value.tq_value.ray.get") as get_results,
+    ):
+        v.get_values_from_meta(meta)
+    assert "pixel_values" in shard.call_args.args[0].fields
+    assert "imgs_sizes" in shard.call_args.args[0].fields
+    assert shard.call_args.kwargs["dp_world"] == 2
+    call = wg.run_all_workers_multiple_data.call_args
+    assert call.args[0] == "get_values_presharded"
+    assert len(call.kwargs["meta"]) == 6
+    assert call.kwargs["common_kwargs"]["num_microbatches"] == 2
+    assert call.kwargs["common_kwargs"]["sequence_length"] == 8
+    assert call.kwargs["common_kwargs"]["split_encoder_media"] is True
+    wg.run_all_workers_sharded_data.assert_not_called()
+    get_results.assert_called_once_with(refs)
+    wg.get_all_worker_results.assert_not_called()
+
+
+def test_mimo_value_metrics_exclude_encoder_results():
+    v, wg = _make_mimo_value()
+    meta = _meta()
+    meta.sequence_lengths = [8, 8]
+    meta.extra_info = {GLOBAL_FORWARD_PAD_SEQLEN: 8}
+    results = [
+        {"global_loss": 1.0, "grad_norm": 0.5, "all_mb_metrics": {"loss": [float(i)]}}
+        for i in range(6)
+    ]
+    refs = [object() for _ in wg.workers]
+    wg.run_all_workers_multiple_data.return_value = refs
+    with (
+        patch.object(TQValue, "_packing_args", return_value=(None, None)),
+        patch(
+            "nemo_rl.models.value.tq_value.shard_meta_for_dp",
+            return_value=([meta, meta], None),
+        ),
+        patch(
+            "nemo_rl.models.value.tq_value.ray.get", return_value=results
+        ) as get_results,
+    ):
+        out = v.train_from_meta(meta, loss_fn=MagicMock())
+    assert out["all_mb_metrics"]["loss"] == [0.0, 1.0]
+    get_results.assert_called_once_with(refs)
+    wg.get_all_worker_results.assert_not_called()
+
+
+def test_mimo_encoder_completes_value_forward_without_writing_rows():
+    w = _ValueStubWorker(values=torch.empty(0, 3))
+    w._holds_logprob_vocabulary = lambda: False
+    with patch("nemo_rl.data_plane.column_io.write_columns") as write_columns:
+        w.get_values_presharded(meta=_meta())
+    assert w.calls[-1][0] == "get_values"
+    write_columns.assert_not_called()
 
 
 class TestTQValueFanout:

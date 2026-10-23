@@ -24,6 +24,8 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "nemo_rl/models/megatron/value.py",
+  "nemo_rl/models/value/workers/megatron_mimo_value_worker.py",
   "tests/unit/data/test_energon_nemotron4_mimo.py",
   "nemo_rl/data/captured_media.py",
   # TODO: enable these once we have 100 correctness

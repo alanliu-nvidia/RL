@@ -40,8 +40,8 @@ def test_mimo_language_batch_preserves_packed_positions_and_boundaries():
     )
     batch = _mimo_language_batch(microbatch, SimpleNamespace(special_token_ids={}))
     assert batch["position_ids"] is positions
-    assert batch["cu_seqlens"] is boundaries
-    assert batch["cu_seqlens_padded"] is boundaries
+    torch.testing.assert_close(batch["cu_seqlens"], boundaries.unsqueeze(0))
+    torch.testing.assert_close(batch["cu_seqlens_padded"], boundaries.unsqueeze(0))
     assert batch["max_seqlen"] == 3
     assert isinstance(batch["max_seqlen"], torch.Tensor)
     assert batch["max_seqlen"].dtype == torch.int32

@@ -472,58 +472,6 @@ class TQPolicy(TQDriverMixin, Policy):
         else:
             self.worker_group.get_all_worker_results(futures)
 
-    def _mimo_lane_microbatches(
-        self,
-        dp_metas: list[KVBatchMeta],
-        micro_batch_size: int,
-    ) -> int:
-        """How many microbatches every MIMO rank will step through.
-
-        The heterogeneous schedule only runs when all of its roles enter it
-        the same number of times, so this has to be one number for every
-        lane. Unpacked, a lane's row count decides it. Packed, the driver's
-        plan does: ``shard_meta_for_dp`` packs the whole batch with the bin
-        count forced to a multiple of the lane count, so the bins divide
-        evenly and every lane is handed the same number of them. That same
-        plan rides each lane's ``extra_info`` to the encoder ranks, which is
-        what lets them land on the boundaries the language rank will use
-        without seeing its tokens.
-
-        Dynamic batching has no equivalent guarantee -- it agrees microbatch
-        *boundaries* across shards but not how many there are -- so it stays
-        refused rather than hanging the schedule when two lanes disagree.
-        """
-        if self.use_dynamic_batches:
-            raise NotImplementedError(
-                "MIMO GRPO cannot use dynamic batching: it lets each lane "
-                "choose its own microbatch count, and the heterogeneous "
-                "schedule needs one count for every role."
-            )
-        counts: set[int] = set()
-        for meta in dp_metas:
-            plan = (meta.extra_info or {}).get(MICRO_BATCH_INDICES)
-            if plan is not None:
-                counts.add(len(plan[0]))
-                continue
-            if self.use_sequence_packing:
-                raise RuntimeError(
-                    "MIMO needs the driver's microbatch plan when sequence "
-                    "packing is on, but shard_meta_for_dp did not stamp one."
-                )
-            lane_size = len(meta.sample_ids)
-            if lane_size % micro_batch_size:
-                raise ValueError(
-                    f"MIMO lane batch {lane_size} is not a whole number of "
-                    f"microbatches of {micro_batch_size}."
-                )
-            counts.add(lane_size // micro_batch_size)
-        if len(counts) != 1:
-            raise ValueError(
-                "MIMO lanes must agree on their microbatch count so every "
-                f"rank steps through the same schedule; got {sorted(counts)}."
-            )
-        return counts.pop()
-
     def _submit_mimo_logprob_metas(
         self,
         worker_method: str,
@@ -1137,29 +1085,6 @@ class TQPolicy(TQDriverMixin, Policy):
                 },
             )
         ray.get(futures)
-
-    def _mimo_language_lane_ranks(self) -> list[int]:
-        """Rank of one language replica per data lane.
-
-        The MIMO stand-in for the ``is_replica_leader`` filter, which a flat
-        worker axis cannot answer: it reports every rank a leader, encoder
-        ranks included. Each module's ranks are contiguous
-        tensor x context x pipeline replicas from its offset, so striding by
-        that width picks exactly one rank per lane -- the same disjoint cover
-        of the batch the named-axis filter gives every other backend.
-        """
-        assert self.mimo_config is not None
-        language = self.mimo_config.parallelism["module_parallelisms"]["language"]
-        replica_width = (
-            language["tensor_model_parallel_size"]
-            * language["context_parallel_size"]
-            * language["pipeline_model_parallel_size"]
-        )
-        offset = language["rank_offset"]
-        return [
-            offset + lane * replica_width
-            for lane in range(language["data_parallel_size"])
-        ]
 
     def finish_train_step(self) -> dict[str, Any]:
         """Close an open train step: all_reduce, rescale, optimizer.step.

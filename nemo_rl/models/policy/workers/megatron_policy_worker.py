@@ -306,7 +306,11 @@ def _check_cp_replica_consistency(model: Any) -> None:
 
     stacked = torch.stack(gathered)
     mismatched = (stacked != stacked[0]).any(dim=0).nonzero().flatten().tolist()
-    nonfinite = [i for i, v in enumerate(local.tolist()) if v != v or v in (float("inf"), float("-inf"))]
+    nonfinite = [
+        i
+        for i, v in enumerate(local.tolist())
+        if v != v or v in (float("inf"), float("-inf"))
+    ]
     print(
         f"[NRL_CP_CHECK] rank={rank} cp_size={cp_size} params={len(named)} "
         f"mismatched_across_cp={len(mismatched)} nonfinite_local={len(nonfinite)} :: "
@@ -856,6 +860,7 @@ class MegatronPolicyWorkerImpl(
                 self.megatron_cfg,
                 world_size=torch.distributed.get_world_size(),
             )
+            self._configure_mimo_model_provider()
 
         self.defer_fp32_logits = self.cfg["megatron_cfg"].get(
             "defer_fp32_logits", None
@@ -1617,8 +1622,7 @@ class MegatronPolicyWorkerImpl(
             # says how close a packing regime runs to the card. Read without
             # resetting, so the _log_gpu_memory debug sampler keeps owning the
             # per-phase counters and this stays a whole-run ceiling.
-            "peak_memory_gib": torch.cuda.max_memory_allocated()
-            / float(1024**3),
+            "peak_memory_gib": torch.cuda.max_memory_allocated() / float(1024**3),
             "train_elapsed_seconds": metrics_train_elapsed,  # pragma: no cover
         }
         # Read "config" via getattr-by-string so the token stays out of
@@ -2044,6 +2048,20 @@ class MegatronPolicyWorkerImpl(
                 )
             raise
 
+    def _configure_mimo_model_provider(self) -> None:
+        """Customize a MIMO provider before wrapping and optimizer construction."""
+
+    def _mimo_loss_post_processor(
+        self, loss_fn: LossFunction, num_microbatches: int
+    ) -> Any:
+        """Build the role-local output processor for a training schedule."""
+        return LossPostProcessor(
+            loss_fn=loss_fn,
+            cfg=self.cfg,
+            num_microbatches=num_microbatches,
+            sampling_params=self.sampling_params,
+        )
+
     def _train_mimo_microbatch_body(
         self,
         state: dict[str, Any],
@@ -2124,11 +2142,8 @@ class MegatronPolicyWorkerImpl(
             seq_length=forward_length,
             mbs=micro_batch_size,
             mimo_runtime=self.mimo_runtime,
-            post_processing_fn=LossPostProcessor(
-                loss_fn=state["loss_fn"],
-                cfg=self.cfg,
-                num_microbatches=num_microbatches,
-                sampling_params=self.sampling_params,
+            post_processing_fn=self._mimo_loss_post_processor(
+                state["loss_fn"], num_microbatches
             ),
             sampling_params=self.sampling_params,
             global_valid_seqs=global_valid_seqs,
@@ -3029,24 +3044,51 @@ class MegatronPolicyWorkerImpl(
         sequence_length: Optional[int],
         split_encoder_media: bool = False,
     ) -> BatchedDataDict[LogprobOutputSpec]:
-        """Run one synchronized heterogeneous schedule to collect logprobs.
+        """Collect policy logprobs through the shared MIMO inference schedule."""
+        return self._get_mimo_predictions(
+            data=data,
+            micro_batch_size=micro_batch_size,
+            num_microbatches=num_microbatches,
+            sequence_length=sequence_length,
+            split_encoder_media=split_encoder_media,
+            result_key="logprobs",
+            post_processing_fn=LogprobsPostProcessor(
+                cfg=self.cfg,
+                sampling_params=self.sampling_params,
+                use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
+                    "use_fused_linear_logprobs", False
+                ),
+            ),
+        )
+
+    @torch.no_grad()
+    def _get_mimo_predictions(
+        self,
+        *,
+        data: Optional[BatchedDataDict[Any]],
+        post_processing_fn: Any,
+        result_key: str,
+        micro_batch_size: Optional[int],
+        num_microbatches: Optional[int],
+        sequence_length: Optional[int],
+        split_encoder_media: bool = False,
+    ) -> BatchedDataDict[Any]:
+        """Run one synchronized heterogeneous schedule to collect per-token predictions.
 
         Every rank in the MIMO grid has to enter the schedule with the same
         microbatch count and sequence length, so both are caller-supplied the
         way ``_train_mimo_microbatch_body`` takes them: an encoder rank cannot
         derive a language rank's token geometry from its own media batch. Only
-        ranks holding the language module produce logprobs; the rest return an
+        ranks holding the language module produce predictions; the rest return an
         empty tensor for the caller to drop.
         """
         assert self.mimo_runtime is not None
         if num_microbatches is None or num_microbatches <= 0:
-            raise ValueError("MIMO logprobs require a positive num_microbatches.")
+            raise ValueError("MIMO inference requires a positive num_microbatches.")
         if sequence_length is None or sequence_length <= 0:
-            raise ValueError("MIMO logprobs require a positive sequence_length.")
+            raise ValueError("MIMO inference requires a positive sequence_length.")
 
         self.timer.start("get_logprobs")
-        no_grad = torch.no_grad()
-        no_grad.__enter__()
         self.model.eval()
 
         is_language_rank = (
@@ -3095,13 +3137,6 @@ class MegatronPolicyWorkerImpl(
                     f"expected {sequence_length}, got {row_width}."
                 )
 
-        logprobs_post_processor = LogprobsPostProcessor(
-            cfg=self.cfg,
-            sampling_params=self.sampling_params,
-            use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
-                "use_fused_linear_logprobs", False
-            ),
-        )
         list_of_logprobs = megatron_mimo_forward_backward(
             model=self.model,
             data_iterator=mb_iterator,
@@ -3109,7 +3144,7 @@ class MegatronPolicyWorkerImpl(
             seq_length=forward_length,
             mbs=mbs,
             mimo_runtime=self.mimo_runtime,
-            post_processing_fn=logprobs_post_processor,
+            post_processing_fn=post_processing_fn,
             forward_only=True,
             sampling_params=self.sampling_params,
         )
@@ -3117,7 +3152,7 @@ class MegatronPolicyWorkerImpl(
         if is_language_rank:
             padded = []
             for entry in list_of_logprobs or []:
-                lp = entry["logprobs"]
+                lp = entry[result_key]
                 padding_needed = sequence_length - lp.shape[1]
                 if padding_needed > 0:
                     lp = torch.nn.functional.pad(
@@ -3130,12 +3165,11 @@ class MegatronPolicyWorkerImpl(
                 (0, sequence_length), device=torch.cuda.current_device()
             )
 
-        no_grad.__exit__(None, None, None)
         self.timer.stop("get_logprobs")
 
         cpu_logprobs = torch.empty_like(logprobs, device="cpu", pin_memory=True)
         cpu_logprobs.copy_(logprobs, non_blocking=False)
-        return BatchedDataDict[LogprobOutputSpec](logprobs=cpu_logprobs)
+        return BatchedDataDict({result_key: cpu_logprobs})
 
     def _resolve_output_layer_owner(self) -> Optional[Any]:
         """Return the unwrapped module owning ``output_layer``, or None off the last PP stage.

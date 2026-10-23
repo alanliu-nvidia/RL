@@ -331,6 +331,49 @@ value_loss_fn:
 
 For synchronous PPO, the remaining clipping, KL, sampling, and reward options work as documented in the [GRPO Guide](grpo.md). Async PPO has the limitations listed above.
 
+## Image-conditioned MIMO critic
+
+The NT4 Nano CLEVR candidates use an independent copy of the policy's full
+vision encoder, projector, and language backbone. Set `value.is_vlm: true`,
+configure `value.megatron_cfg.mimo`, and initialize `value.model_name` and
+`value.pretrained_checkpoint` from the actor's model and backbone checkpoint.
+The model parameters and optimizer are independent; only initialization and
+input processing are shared. A fresh scalar value head replaces the language
+output head before DDP wrapping, optimizer construction, and checkpoint loading.
+
+This path uses SingleController with the data plane (`TQValue`). Both value
+inference and training retain the rollout's multimodal fields and enter the
+same heterogeneous schedule as policy. Encoder ranks deliver visual embeddings
+and receive gradients; only language replica leaders write values to the data
+plane. Packed values are gathered according to the model's CP layout, unpacked,
+and shifted within each sample so position `t` estimates the state before token
+`t`. Value outputs do not use LM temperature or vocabulary post-processing.
+
+The NT4 recipes set `policy.megatron_cfg.mimo.balance_lane_placement: true`,
+which the critic inherits. Each node hosts a complete data lane: two language
+CP ranks and two vision ranks. This spreads optimizer CPU offload across all
+training hosts instead of concentrating it on language-only nodes. Logical
+module ranks and the MIMO grid remain unchanged; policy and critic use the
+same physical placement. Complete lanes must evenly tile the GPUs per node.
+On the GB300 nodes, `node_bundle_order: [0, 2, 1, 3]` places language ranks on
+GPUs 0 and 2, across both CPU NUMA domains; vision ranks use GPUs 1 and 3.
+This also avoids local-domain exhaustion in NVIDIA UVM page migrations, which
+can require GPU-local memory even without a process memory binding.
+The recipes also set `NRL_DISABLE_NUMA_MEMBIND=1` for both training workers: CPU
+affinity stays local, while optimizer offload can allocate across both NUMA
+memory domains rather than exhausting the domain shared by the language GPUs.
+
+The initial implementation requires one encoder component, encoder CP=1,
+PP=1, equal microbatch counts on all roles, and MTP disabled. Dynamic batching,
+legacy `Value.get_values` / `Value.train`, and `train(eval_mode=True)` are not
+supported for MIMO; use the SingleController metadata entrypoints and
+`get_values` for inference. The 8-node GB300 recipe completed a five-step PPO
+smoke with five critic updates, four actor updates, finite losses and values,
+and finite nonzero gradients. Native checkpoint initialization, heterogeneous
+forward/backward scheduling, and repeated CPU offload and generation refits ran
+successfully. The 64-node recipe and checkpoint resume remain unvalidated;
+checkpoint saving is disabled in both recipes.
+
 ## Metrics
 
 PPO logs all the same metrics as GRPO (see [GRPO Metrics](grpo.md#metrics)). It also logs the following PPO-specific metrics:

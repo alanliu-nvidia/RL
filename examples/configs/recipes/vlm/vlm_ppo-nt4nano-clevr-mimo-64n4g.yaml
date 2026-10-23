@@ -1,0 +1,51 @@
+# Full-scale candidate, not runtime-validated. Image-conditioned MIMO critic.
+# 32 time-shared actor/critic nodes + 32 generation nodes; 40 outer steps.
+# 10 critic warmup steps, then 30 actor/critic steps; checkpointing remains off.
+defaults: vlm_ppo-nt4nano-clevr-mimo-8n4g-smoke.yaml
+ppo:
+  num_prompts_per_step: 2048
+  max_num_steps: 40
+  max_num_epochs: 2
+  policy_training_start_step: 10
+policy:
+  max_total_sequence_length: 16384
+  train_global_batch_size: 16384
+  megatron_cfg:
+    mimo:
+      single_owner_loader: false
+      async_finish: false
+      parallelism:
+        module_parallelisms:
+          language:
+            tensor_model_parallel_size: 1
+            pipeline_model_parallel_size: 1
+            context_parallel_size: 2
+            expert_model_parallel_size: 8
+            expert_tensor_parallel_size: 1
+            data_parallel_size: 32
+            rank_offset: 0
+          images:
+            tensor_model_parallel_size: 1
+            pipeline_model_parallel_size: 1
+            context_parallel_size: 1
+            expert_model_parallel_size: 1
+            expert_tensor_parallel_size: 1
+            data_parallel_size: 64
+            rank_offset: 64
+  generation:
+    colocated:
+      resources:
+        num_nodes: 32
+    vllm_cfg:
+      max_model_len: 8192
+async_rl:
+  max_inflight_prompts: 4096
+  max_buffered_rollouts: 4096
+cluster:
+  num_nodes: 64
+logger:
+  log_dir: logs/nt4nano-clevr-ppo-mimo-64n4g
+  wandb:
+    name: nt4nano-clevr-ppo-mimo-64n4g
+checkpointing:
+  checkpoint_dir: results/nt4nano-clevr-ppo-mimo-64n4g

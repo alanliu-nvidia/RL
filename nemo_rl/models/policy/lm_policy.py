@@ -41,8 +41,9 @@ from nemo_rl.models.generation.interfaces import (
     RefitPayloadMode,
 )
 from nemo_rl.models.megatron.mimo import (
+    MIMODriverMixin,
     MIMOSFTConfig,
-    mimo_rank_to_lane,
+    mimo_worker_bundle_indices,
     mimo_worker_sharding,
     resolve_mimo_sft_config,
 )
@@ -109,7 +110,7 @@ def _aggregate_megatron_flops_metrics(
     return aggregated
 
 
-class Policy(ColocatablePolicyInterface, GenerationInterface):
+class Policy(MIMODriverMixin, ColocatablePolicyInterface, GenerationInterface):
     def __init__(
         self,
         cluster: RayVirtualCluster,
@@ -406,33 +407,31 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             **worker_kwargs,
         )
 
+        tied_groups = None
         if cluster._sorted_bundle_indices is not None:
-            # The cluster has initialized a unified placemenet group across nodes
-            # In this case, we need to create workers based on sorted bundle indices
-            group_size = cluster.num_gpus_per_node
-            tied_groups = [
-                (i // group_size, [bundle_idx])
-                for i, bundle_idx in enumerate(cluster._sorted_bundle_indices)
-            ]
-
-            self.worker_group = RayWorkerGroup(
-                cluster,
-                worker_builder,
-                name_prefix=name_prefix,
-                bundle_indices_list=tied_groups,
-                sharding_annotations=self.sharding_annotations,
-                env_vars=env_vars or {},
+            tied_groups = mimo_worker_bundle_indices(
+                self.mimo_config,
+                cluster._sorted_bundle_indices,
+                cluster.num_gpus_per_node,
             )
-
-        else:
-            self.worker_group = RayWorkerGroup(
-                cluster,
-                worker_builder,
-                name_prefix=name_prefix,
-                workers_per_node=workers_per_node,
-                sharding_annotations=self.sharding_annotations,
-                env_vars=env_vars or {},
+        elif self.mimo_config is not None and self.mimo_config.balance_lane_placement:
+            tied_groups = mimo_worker_bundle_indices(
+                self.mimo_config,
+                None,
+                cluster.num_gpus_per_node,
+                bundle_counts=[
+                    pg.bundle_count for pg in cluster.get_placement_groups()
+                ],
             )
+        self.worker_group = RayWorkerGroup(
+            cluster,
+            worker_builder,
+            name_prefix=name_prefix,
+            workers_per_node=workers_per_node,
+            bundle_indices_list=tied_groups,
+            sharding_annotations=self.sharding_annotations,
+            env_vars=env_vars or {},
+        )
 
         if config["dynamic_batching"]["enabled"]:
             assert pp_size == 1, (
@@ -606,25 +605,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     # DRY for Policy's logprob/train methods only. The data-plane sibling
     # TQPolicy shards KVBatchMeta via ``shard_meta_for_dp``; the
     # driver-on-data vs driver-on-meta split is by design.
-    def _mimo_per_rank_shards(self, sharded_data: list[Any]) -> list[Any]:
-        """Give every MIMO rank the shard of the lane it belongs to.
-
-        Encoder ranks of a lane each receive that lane's whole batch and reduce
-        it to their own media range in the worker, the way the Energon task
-        encoder does for SFT.
-        """
-        assert self.mimo_config is not None
-        if len(sharded_data) != self.data_parallel_size:
-            raise ValueError(
-                "MIMO expects one shard per language lane: lanes="
-                f"{self.data_parallel_size}, shards={len(sharded_data)}."
-            )
-        lanes = mimo_rank_to_lane(
-            self.mimo_config.parallelism,
-            world_size=len(self.worker_group.workers),
-        )
-        return [sharded_data[lane] for lane in lanes]
-
     def _mimo_schedule_shape(self, sharded_data: list[Any]) -> tuple[int, int]:
         """Return the microbatch count and padded length every MIMO rank will use.
 
