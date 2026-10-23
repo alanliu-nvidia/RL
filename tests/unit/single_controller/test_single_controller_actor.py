@@ -1771,6 +1771,9 @@ class _NoOpTrainer:
     def pause_train_step_with_offloading(self) -> None:
         pass
 
+    def offload_before_refit(self) -> None:
+        pass
+
     def sync_params_before_refit(self) -> None:
         pass
 
