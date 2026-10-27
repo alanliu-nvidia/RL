@@ -1,4 +1,4 @@
-# Formal Nano4 CLEVR PPO comparison: 2048 independent prompts, one sample each.
+# Colocated Nano4 CLEVR PPO: 2048 independent prompts, one sample each.
 # 256k is 262144 total tokens; keep the CLEVR case's 6144-token output cap.
 # Equal budget: 64 GB300 nodes x4 GPUs, including32 generation nodes.
 defaults: vlm_ppo-nt4nano-clevr-mimo-8n4g-smoke.yaml
@@ -57,6 +57,7 @@ value:
     train_mb_tokens: 8192
     logprob_mb_tokens: 8192
 async_rl:
-  min_groups_for_streaming_train: 128
+  # This colocated PPO code path trains one complete prompt batch per step.
+  min_groups_for_streaming_train: 2048
   max_inflight_prompts: 4096
   max_buffered_rollouts: 4096
