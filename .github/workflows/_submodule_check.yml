@@ -45,8 +45,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          submodules: 'recursive'
 
       - name: Fetch target branch reference
         run: |
@@ -94,7 +92,15 @@ jobs:
 
             echo "Target commit:  $target_commit"
 
+            # Matching gitlinks need no clone, including private submodules that
+            # are unavailable to pull request runners.
+            if [[ "$current_commit" = "$target_commit" ]]; then
+              echo "✅ $submodule_name: PR branch matches ${{ inputs.base_ref }} branch (same commit)"
+              continue
+            fi
+
             # Analyze the relationship between target and current commits
+            git submodule update --init --recursive "$submodule_path"
             cd "$submodule_path"
 
             # Check if this is a shallow repository and unshallow if needed
@@ -113,13 +119,8 @@ jobs:
               github_repo="$remote_url"
             fi
 
-            # Case 1: Same commit
-            if [[ "$current_commit" = "$target_commit" ]]; then
-              echo "✅ $submodule_name: PR branch matches ${{ inputs.base_ref }} branch (same commit)"
-              # No change, so don't add to changed count or comment
-
-            # Case 2: Check if target commit is an ancestor of current commit (current is fast-forward)
-            elif git merge-base --is-ancestor "$target_commit" "$current_commit" 2>/dev/null; then
+            # Check if target commit is an ancestor of current commit (current is fast-forward)
+            if git merge-base --is-ancestor "$target_commit" "$current_commit" 2>/dev/null; then
               echo "✅ $submodule_name: PR branch is ahead of ${{ inputs.base_ref }} branch (fast-forward)"
               echo "📊 Commits added in PR #${{ inputs.pr_number }} (${{ inputs.head_ref }} branch):"
               git log --oneline --graph "$target_commit".."$current_commit" 2>/dev/null || echo "   (Unable to show progression - possibly shallow clone)"

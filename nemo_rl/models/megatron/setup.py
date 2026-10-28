@@ -3775,6 +3775,8 @@ def make_policy_like_config(config: ValueConfig) -> dict:
 
     return {
         "model_name": config["model_name"],
+        "is_vlm": bool(config.get("is_vlm")),
+        "pretrained_checkpoint": config.get("pretrained_checkpoint"),
         "tokenizer": config["tokenizer"],
         "train_global_batch_size": config["train_global_batch_size"],
         "train_micro_batch_size": config["train_micro_batch_size"],

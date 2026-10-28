@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Frozen-input GTP1/GTP2 MXFP8 forward/gradient parity; standalone torchrun.
 
 Run on four nodes with four ranks per node and --cp-size 4. Each CP group

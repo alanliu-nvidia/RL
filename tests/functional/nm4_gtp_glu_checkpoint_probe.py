@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Identify GLU gate/up quarter permutations in the full NM4 weight audit."""
 
 import argparse

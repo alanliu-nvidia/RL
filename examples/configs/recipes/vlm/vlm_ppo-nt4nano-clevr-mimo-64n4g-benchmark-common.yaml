@@ -1,0 +1,64 @@
+# Colocated Nano4 CLEVR PPO: 2048 independent prompts, one sample each.
+# 256k is 262144 total tokens; keep the CLEVR case's 6144-token output cap.
+# Equal budget: 64 GB300 nodes x4 GPUs, including32 generation nodes.
+defaults: vlm_ppo-nt4nano-clevr-mimo-8n4g-smoke.yaml
+ppo:
+  num_prompts_per_step: 2048
+  num_generations_per_prompt: 1
+  critic_ppo_epochs: 2
+  seed: 42
+  max_num_steps: 13
+  max_num_epochs: 1
+  policy_training_start_step: 1
+  adv_estimator:
+    normalize_advantages: false
+cluster:
+  num_nodes: 64
+policy:
+  train_global_batch_size: 2048
+  max_total_sequence_length: 262144
+  megatron_cfg:
+    model_overrides:
+      # The checkpoint provider defaults to8192; align its runtime sequence bound.
+      seq_length: 262144
+    mimo:
+      parallelism:
+        module_parallelisms:
+          language:
+            data_parallel_size: 32
+            rank_offset: 0
+          images:
+            data_parallel_size: 64
+            rank_offset: 64
+  sequence_packing:
+    # CP requires packed sequence metadata. Bound each image-bearing pack to
+    # the validated CLEVR 8k microbatch budget while retaining 256k model cap.
+    enabled: true
+    train_mb_tokens: 8192
+    logprob_mb_tokens: 8192
+  generation:
+    max_new_tokens: 6144
+    colocated:
+      resources:
+        num_nodes: 32
+    vllm_cfg:
+      max_model_len: ${policy.max_total_sequence_length}
+      env_vars:
+        # Checkpoint HF metadata says8192. Permit the requested runtime cap
+        # without changing checkpoint weights or rotary scaling in either arm.
+        VLLM_ALLOW_LONG_MAX_MODEL_LEN: '1'
+    vllm_kwargs:
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 8192
+value:
+  train_global_batch_size: 2048
+  max_total_sequence_length: ${policy.max_total_sequence_length}
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: 8192
+    logprob_mb_tokens: 8192
+async_rl:
+  # This colocated PPO code path trains one complete prompt batch per step.
+  min_groups_for_streaming_train: 2048
+  max_inflight_prompts: 4096
+  max_buffered_rollouts: 4096

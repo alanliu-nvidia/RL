@@ -1,0 +1,7 @@
+defaults: vlm_ppo-nt4nano-clevr-mimo-64n4g-benchmark-common.yaml
+logger:
+  log_dir: logs/nt4nano-ppo-formal-baseline
+  wandb:
+    name: nt4nano-ppo-formal-baseline
+checkpointing:
+  checkpoint_dir: results/nt4nano-ppo-formal-baseline

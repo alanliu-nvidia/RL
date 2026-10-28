@@ -1,0 +1,336 @@
+# NT4 Nano CLEVR PPO smoke: independent image-conditioned MIMO critic.
+# Actor and critic initialize from the same VLM backbone checkpoint.
+# GB300 GPU smoke validated: 5 PPO steps, 5 critic and 4 actor updates.
+# Longer runs and checkpoint resume remain unvalidated.
+# 8 nodes: 4 time-shared actor/critic + 4 generation; 5 steps (1 critic warmup).
+defaults: ../../ppo_math_1B_megatron_single_controller.yaml
+ppo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  max_num_epochs: 1
+  max_num_steps: 5
+  ppo_epochs: 1
+  critic_ppo_epochs: 1
+  policy_training_start_step: 1
+  async_ppo: null
+  adv_estimator:
+    name: gae
+    gae_lambda: 0.95
+    gae_gamma: 1.0
+    normalize_advantages: true
+  reward_shaping:
+    enabled: false
+  reward_scaling:
+    enabled: false
+  val_period: 0
+  val_at_start: false
+loss_fn:
+  ratio_clip_max: 0.2
+  ratio_clip_c: null
+  use_importance_sampling_correction: true
+  use_cispo: false
+value_loss_fn:
+  scale: 1.0
+checkpointing:
+  checkpoint_dir: results/nt4nano-clevr-ppo-mimo-8n4g-smoke
+  pretrained_checkpoint:
+    path: ${oc.env:NT4_NANO_MIMO_CKPT}
+    format: megatron_bridge
+  enabled: false
+  metric_name: null
+  save_data_plane: true
+policy:
+  model_name: ${oc.env:NT4_NANO_MODEL_DIR}
+  tokenizer:
+    name: ${oc.env:NT4_NANO_PROCESSOR}
+    tokenizer_kwargs: null
+    chat_template: default
+  train_global_batch_size: ${mul:${ppo.num_prompts_per_step}, ${ppo.num_generations_per_prompt}}
+  train_micro_batch_size: 1
+  generation_batch_size: 32
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  logprob_chunk_size: 1024
+  megatron_cfg:
+    model_overrides:
+      moe_router_score_function: sigmoid
+      moe_router_topk: 10
+      num_moe_experts: 512
+      moe_router_topk_scaling_factor: 3.16
+      moe_router_quantile_balancing_estimation_scope: global_batch
+      moe_router_qb_num_bins: 1000
+      moe_router_quantile_balancing_ema: 0.0
+      moe_router_pre_softmax: false
+      moe_router_enable_expert_bias: true
+      moe_router_skip_muon: true
+      linear_cp_mode: chunkwise
+      linear_cp_layout: contiguous
+      moe_router_padding_for_quantization: false
+      fp8: null
+      fp8_recipe: blockwise
+      flash_attention_version: 4
+      moe_router_padding_for_fp8: false
+      residual_stream_recompute_num_layers: 1
+      use_transformer_engine_op_fuser: false
+      mtp_hsm: false
+      hybrid_layer_pattern: M-M-M*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEM-M-
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
+    use_fused_linear_logprobs: false
+    fused_linear_logprobs_chunk_size: 256
+    force_reconvert_from_hf: false
+    activation_checkpointing: true
+    cuda_graph_impl: none
+    cuda_graph_modules: []
+    cuda_graph_warmup_steps: 3
+    recompute_granularity: selective
+    recompute_modules:
+    - residual_stream
+    - moe_act
+    - gdp_in_proj
+    - gdp_qkv
+    - core_attn
+    expert_model_parallel_size: 8
+    context_parallel_size: 2
+    sequence_parallel: true
+    moe_router_dtype: fp32
+    moe_permute_fusion: true
+    apply_rope_fusion: false
+    bias_activation_fusion: false
+    defer_fp32_logits: true
+    moe_token_dispatcher_type: alltoall
+    moe_hybridep_prepad_packed_inputs: false
+    mtp_num_layers: 0
+    mtp_loss_scaling_factor: 0.0
+    mtp_use_repeated_layer: true
+    mtp_detach_heads: false
+    use_fused_weighted_squared_relu: true
+    peft:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: post
+      lora_A_init_method: xavier
+      lora_B_init_method: zero
+      a2a_experimental: false
+      lora_dtype: null
+      restore_from: null
+    optimizer:
+      optimizer: muon
+      lr: 1.5e-05
+      min_lr: 2.0e-06
+      adam_beta2: 0.95
+      adam_eps: 1.0e-16
+      use_precision_aware_optimizer: false
+      exp_avg_dtype: float32
+      exp_avg_sq_dtype: float32
+      store_param_remainders: false
+      muon_momentum: 0.9
+      muon_split_qkv: true
+      muon_extra_scale_factor: 0.2
+      muon_scale_mode: spectral
+      muon_coefficient_type: polar_express
+      muon_scalar_optimizer: adam
+      muon_expert_tp_mode: layer_sharded
+      use_layer_wise_distributed_optimizer: false
+      muon_nesterov: false
+      muon_num_ns_steps: 16
+      muon_fp32_matmul_prec: medium
+      muon_ns_batch_size: 1
+      muon_use_syrk: false
+      muon_concurrent_groups: true
+      muon_tp_mode: auto
+    scheduler:
+      lr_warmup_init: 2.0e-08
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+    fp4_cfg:
+      enabled: false
+      fp4: e2m1
+      fp4_recipe: nvfp4
+      fp4_param: false
+    first_last_layers_bf16: false
+    num_layers_at_start_in_bf16: 1
+    num_layers_at_end_in_bf16: 1
+    env_vars:
+      # Actor + critic CPU offload must be able to use both NUMA memory domains.
+      NRL_DISABLE_NUMA_MEMBIND: '1'
+      TORCH_CUDA_ARCH_LIST: '10.0'
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      FLA_TILELANG: '0'
+      NVTE_CUTEDSL_FUSED_GROUPED_MLP: '1'
+      NVTE_USE_CUTLASS_GROUPED_GEMM: '0'
+      NVTE_FWD_LAYERNORM_SM_MARGIN: '40'
+      NVTE_BWD_LAYERNORM_SM_MARGIN: '40'
+      NVTE_INF_LAYERNORM_SM_MARGIN: '40'
+      OMP_NUM_THREADS: '16'
+      UB_TIMEOUT: '720'
+      NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: '128'
+      NCCL_NET_PLUGIN: none
+    freeze_vision_encoder: false
+    freeze_vision_projector: false
+    attention_backend: auto
+    moe_router_fusion: true
+    moe_grouped_gemm: true
+    moe_aux_loss_coeff: 0.0
+    mimo:
+      single_owner_loader: false
+      async_finish: false
+      balance_lane_placement: true
+      # GB300: language ranks use GPU 0/2, one per CPU NUMA domain.
+      node_bundle_order: [0, 2, 1, 3]
+      parallelism:
+        module_parallelisms:
+          language:
+            tensor_model_parallel_size: 1
+            pipeline_model_parallel_size: 1
+            context_parallel_size: 2
+            expert_model_parallel_size: 8
+            expert_tensor_parallel_size: 1
+            data_parallel_size: 4
+            rank_offset: 0
+          images:
+            tensor_model_parallel_size: 1
+            pipeline_model_parallel_size: 1
+            context_parallel_size: 1
+            expert_model_parallel_size: 1
+            expert_tensor_parallel_size: 1
+            data_parallel_size: 8
+            rank_offset: 8
+    distributed_timeout_minutes: 120
+  sequence_packing:
+    mask_padding_from_moe: false
+    fuse_loss: true
+  make_sequence_length_divisible_by: 128
+  generation:
+    max_new_tokens: 6144
+    refit_transport: null
+    vllm_cfg:
+      skip_tokenizer_init: false
+      tensor_parallel_size: 2
+      gpu_memory_utilization: 0.85
+      env_vars:
+        NCCL_NET_PLUGIN: none
+      max_model_len: 8192
+    vllm_kwargs:
+      mm_processor_cache_gb: 0
+      kernel_config:
+        enable_jit_warmup: false
+        enable_cutedsl_warmup: false
+    colocated:
+      resources:
+        gpus_per_node: 4
+        num_nodes: 4
+  is_vlm: true
+  offload_optimizer_for_logprob: true
+value:
+  is_vlm: true
+  pretrained_checkpoint: ${checkpointing.pretrained_checkpoint}
+  model_name: ${policy.model_name}
+  tokenizer:
+    name: ${oc.env:NT4_NANO_PROCESSOR}
+  train_micro_batch_size: 1
+  make_sequence_length_divisible_by: 128
+  megatron_cfg:
+    empty_unused_memory_level: 2
+    model_overrides: ${policy.megatron_cfg.model_overrides}
+    mimo: ${policy.megatron_cfg.mimo}
+    expert_model_parallel_size: ${policy.megatron_cfg.expert_model_parallel_size}
+    expert_tensor_parallel_size: ${policy.megatron_cfg.expert_tensor_parallel_size}
+    moe_router_dtype: ${policy.megatron_cfg.moe_router_dtype}
+    moe_permute_fusion: ${policy.megatron_cfg.moe_permute_fusion}
+    apply_rope_fusion: ${policy.megatron_cfg.apply_rope_fusion}
+    bias_activation_fusion: ${policy.megatron_cfg.bias_activation_fusion}
+    moe_token_dispatcher_type: ${policy.megatron_cfg.moe_token_dispatcher_type}
+    moe_hybridep_prepad_packed_inputs: ${policy.megatron_cfg.moe_hybridep_prepad_packed_inputs}
+    mtp_num_layers: ${policy.megatron_cfg.mtp_num_layers}
+    mtp_loss_scaling_factor: ${policy.megatron_cfg.mtp_loss_scaling_factor}
+    mtp_use_repeated_layer: ${policy.megatron_cfg.mtp_use_repeated_layer}
+    mtp_detach_heads: ${policy.megatron_cfg.mtp_detach_heads}
+    use_fused_weighted_squared_relu: ${policy.megatron_cfg.use_fused_weighted_squared_relu}
+    freeze_vision_encoder: ${policy.megatron_cfg.freeze_vision_encoder}
+    freeze_vision_projector: ${policy.megatron_cfg.freeze_vision_projector}
+    moe_router_fusion: ${policy.megatron_cfg.moe_router_fusion}
+    moe_grouped_gemm: ${policy.megatron_cfg.moe_grouped_gemm}
+    moe_aux_loss_coeff: ${policy.megatron_cfg.moe_aux_loss_coeff}
+    recompute_granularity: ${policy.megatron_cfg.recompute_granularity}
+    recompute_modules: ${policy.megatron_cfg.recompute_modules}
+    activation_checkpointing: true
+    tensor_model_parallel_size: 1
+    context_parallel_size: 2
+    sequence_parallel: true
+    optimizer:
+      lr: 1.0e-05
+      min_lr: 1.0e-06
+      weight_decay: 0.01
+      # Fused norm/clip kernels require uniform gradient dtypes. The language
+      # backbone has FP32 parameters alongside BF16 weights; use FP32 for both.
+      main_grads_dtype: float32
+    scheduler:
+      start_weight_decay: 0.01
+      end_weight_decay: 0.01
+      lr_warmup_iters: 0
+      lr_warmup_init: 0
+    distributed_data_parallel_config:
+      # DDP chooses its actual buffer dtype with this flag, not optimizer.main_grads_dtype.
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+    env_vars: ${policy.megatron_cfg.env_vars}
+    attention_backend: auto
+    distributed_timeout_minutes: 120
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${value.max_total_sequence_length}
+    logprob_mb_tokens: ${value.max_total_sequence_length}
+  logprob_batch_size: 1
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  train:
+    dataset_name: clevr-cogent
+    split_validation_size: 0.05
+    seed: ${ppo.seed}
+    split: train
+  validation:
+    dataset_name: clevr-cogent
+    split: valA
+  default:
+    prompt_file: examples/prompts/clevr_cogent_cot_nt4nano.txt
+    processor: vlm_hf_data_processor
+    env_name: clevr-cogent
+env:
+  clevr-cogent:
+    num_workers: 8
+    reward_functions:
+    - name: format
+      weight: 0.2
+    - name: exact_alnum
+      weight: 0.8
+logger:
+  log_dir: logs/nt4nano-clevr-ppo-mimo-8n4g-smoke
+  wandb_enabled: true
+  wandb:
+    project: nt4nano_alanliu
+    name: nt4nano-clevr-ppo-mimo-8n4g-smoke
+    entity: nvidia
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8
+async_rl:
+  generation_fleet_health:
+    refit_timeout_s: 600.0
+  max_inflight_prompts: 16
+  max_buffered_rollouts: 16
+data_plane:
+  simple:
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}
+  observability:
+    enabled: true
+    verify_tensor_hash: false
+grpo: null

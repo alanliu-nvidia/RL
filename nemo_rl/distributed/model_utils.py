@@ -1488,8 +1488,9 @@ class AllGatherCPTensor(torch.autograd.Function):
         )
 
         index = torch.tensor(
-            [cp_rank, (2 * cp_size - cp_rank - 1)], device="cpu", pin_memory=True
-        ).cuda(non_blocking=True)
+            [cp_rank, (2 * cp_size - cp_rank - 1)],
+            device="cpu", pin_memory=grad_output.is_cuda,
+        ).to(device=grad_output.device, non_blocking=True)
 
         grad_input = grad_output.index_select(seq_dim, index)
         grad_input = grad_input.view(

@@ -30,6 +30,13 @@ from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.models.megatron.mimo import (
+    MIMODriverMixin,
+    mimo_rank_to_lane,
+    mimo_worker_bundle_indices,
+    mimo_worker_sharding,
+    resolve_mimo_sft_config,
+)
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface, ValueOutputSpec
 from nemo_rl.utils.timer import Timer
@@ -37,7 +44,7 @@ from nemo_rl.utils.timer import Timer
 PathLike = Union[str, "os.PathLike[Any]"]
 
 
-class Value(ValueInterface):
+class Value(MIMODriverMixin, ValueInterface):
     """Value function model for PPO using distributed training with Ray workers."""
 
     def __init__(
@@ -76,6 +83,22 @@ class Value(ValueInterface):
         # Value models use the same backend configuration as policy models
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
+        self.mimo_config = resolve_mimo_sft_config(config) if megatron_enable else None
+        if self.mimo_config is not None:
+            if not config.get("is_vlm"):
+                raise ValueError("A MIMO value model requires value.is_vlm=true.")
+            if config["dynamic_batching"]["enabled"]:
+                raise NotImplementedError(
+                    "MIMO values do not support dynamic batching."
+                )
+            # Validate complete, non-overlapping rank coverage before spawning workers.
+            mimo_rank_to_lane(
+                self.mimo_config.parallelism, world_size=cluster.world_size()
+            )
+        elif config.get("is_vlm"):
+            raise NotImplementedError(
+                "Multimodal values require value.megatron_cfg.mimo."
+            )
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (value.megatron_cfg.enabled=true) or "
@@ -86,6 +109,8 @@ class Value(ValueInterface):
             worker_builder_cls = (
                 "nemo_rl.models.value.workers.megatron_value_worker.MegatronValueWorker"
             )
+            if self.mimo_config is not None:
+                worker_builder_cls = "nemo_rl.models.value.workers.megatron_mimo_value_worker.MegatronMIMOValueWorker"
 
             tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
@@ -113,7 +138,7 @@ class Value(ValueInterface):
         model_parallel_size = pp_size * cp_size * tp_size
         actual_world_size = cluster.world_size()
 
-        if actual_world_size < model_parallel_size:
+        if self.mimo_config is None and actual_world_size < model_parallel_size:
             raise ValueError(
                 f"World size ({actual_world_size}) is insufficient for the parallelism configuration. "
                 f"Required minimum world size: PP({pp_size}) * CP({cp_size}) * TP({tp_size}) = {model_parallel_size}. "
@@ -121,7 +146,7 @@ class Value(ValueInterface):
                 f"Please either increase the number of GPUs/nodes or reduce the parallelism parameters."
             )
 
-        if actual_world_size % model_parallel_size != 0:
+        if self.mimo_config is None and actual_world_size % model_parallel_size != 0:
             dp_size_float = actual_world_size / model_parallel_size
             raise ValueError(
                 f"World size ({actual_world_size}) must be divisible by PP * CP * TP ({model_parallel_size}). "
@@ -130,19 +155,23 @@ class Value(ValueInterface):
                 f"Please adjust your cluster size or parallelism parameters."
             )
 
-        self.sharding_annotations = NamedSharding(
-            layout=np.arange(cluster.world_size()).reshape(
-                pp_size,  # PP
-                -1,  # DP
-                cp_size,  # CP
-                tp_size,  # TP
-            ),
-            names=[
-                "pipeline_parallel",
-                "data_parallel",
-                "context_parallel",
-                "tensor_parallel",
-            ],
+        self.sharding_annotations = (
+            mimo_worker_sharding(actual_world_size)
+            if self.mimo_config is not None
+            else NamedSharding(
+                layout=np.arange(cluster.world_size()).reshape(
+                    pp_size,  # PP
+                    -1,  # DP
+                    cp_size,  # CP
+                    tp_size,  # TP
+                ),
+                names=[
+                    "pipeline_parallel",
+                    "data_parallel",
+                    "context_parallel",
+                    "tensor_parallel",
+                ],
+            )
         )
 
         from ray.util.queue import Queue as RayQueue
@@ -162,31 +191,31 @@ class Value(ValueInterface):
             **worker_kwargs,
         )
 
+        tied_groups = None
         if cluster._sorted_bundle_indices is not None:
-            # The cluster has initialized a unified placement group across nodes
-            group_size = cluster.num_gpus_per_node
-            tied_groups = [
-                (i // group_size, [bundle_idx])
-                for i, bundle_idx in enumerate(cluster._sorted_bundle_indices)
-            ]
-
-            self.worker_group = RayWorkerGroup(
-                cluster,
-                worker_builder,
-                name_prefix=name_prefix,
-                bundle_indices_list=tied_groups,
-                sharding_annotations=self.sharding_annotations,
-                env_vars=env_vars or {},
+            tied_groups = mimo_worker_bundle_indices(
+                self.mimo_config,
+                cluster._sorted_bundle_indices,
+                cluster.num_gpus_per_node,
             )
-        else:
-            self.worker_group = RayWorkerGroup(
-                cluster,
-                worker_builder,
-                name_prefix=name_prefix,
-                workers_per_node=workers_per_node,
-                sharding_annotations=self.sharding_annotations,
-                env_vars=env_vars or {},
+        elif self.mimo_config is not None and self.mimo_config.balance_lane_placement:
+            tied_groups = mimo_worker_bundle_indices(
+                self.mimo_config,
+                None,
+                cluster.num_gpus_per_node,
+                bundle_counts=[
+                    pg.bundle_count for pg in cluster.get_placement_groups()
+                ],
             )
+        self.worker_group = RayWorkerGroup(
+            cluster,
+            worker_builder,
+            name_prefix=name_prefix,
+            workers_per_node=workers_per_node,
+            bundle_indices_list=tied_groups,
+            sharding_annotations=self.sharding_annotations,
+            env_vars=env_vars or {},
+        )
 
         # Configure dynamic batching
         if config["dynamic_batching"]["enabled"]:
@@ -231,6 +260,15 @@ class Value(ValueInterface):
 
         self.cfg = config
 
+    @property
+    def data_parallel_size(self) -> int:
+        """Number of language data lanes, independent of encoder parallelism."""
+        if self.mimo_config is not None:
+            return self.mimo_config.parallelism["module_parallelisms"]["language"][
+                "data_parallel_size"
+            ]
+        return self.sharding_annotations.get_axis_size("data_parallel")
+
     def get_values(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
@@ -245,6 +283,10 @@ class Value(ValueInterface):
         Returns:
             BatchedDataDict containing value predictions [batch_size, sequence_length]
         """
+        if self.mimo_config is not None:
+            raise NotImplementedError(
+                "Use TQValue.get_values_from_meta for MIMO values."
+            )
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         sharded_data: list[SlicedDataDict]
         unsorted_data_indices: list[int]
@@ -323,6 +365,8 @@ class Value(ValueInterface):
         Returns:
             Dictionary containing training metrics (loss, grad_norm, etc.)
         """
+        if self.mimo_config is not None:
+            raise NotImplementedError("Use TQValue.train_from_meta for MIMO values.")
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
 

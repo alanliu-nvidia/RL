@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Audit every tensor loaded from an NM4 Megatron-Bridge checkpoint."""
 
 from __future__ import annotations

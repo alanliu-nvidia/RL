@@ -30,6 +30,7 @@ from nemo_rl.models.policy import (
     SinglePytorchSchedulerConfig,
     TokenizerConfig,
 )
+from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 
 
 class ValueConfig(TypedDict):
@@ -41,6 +42,9 @@ class ValueConfig(TypedDict):
 
     model_name: str
     tokenizer: TokenizerConfig
+    # Multimodal values currently require the Megatron MIMO backend.
+    is_vlm: NotRequired[bool]
+    pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
 
     # Training batch sizes
     train_global_batch_size: int

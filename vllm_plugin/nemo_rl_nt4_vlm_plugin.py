@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """vLLM general plugin that registers NT4 as a multimodal model.
 
 Calling ``register_nemotron4_vlm`` from NeMo-RL's own patch path only reaches
