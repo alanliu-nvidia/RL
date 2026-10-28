@@ -4,6 +4,7 @@
 defaults: vlm_ppo-nt4nano-clevr-mimo-8n4g-smoke.yaml
 ppo:
   num_prompts_per_step: 2048
+  critic_ppo_epochs: 2
   max_num_steps: 40
   max_num_epochs: 2
   policy_training_start_step: 10
