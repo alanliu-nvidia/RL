@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Check compact-layout wiring before the paired NM4 production experiments."""
 
 from types import SimpleNamespace

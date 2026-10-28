@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Launch the standalone parity test inside an existing four-node rem allocation."""
 
 import argparse

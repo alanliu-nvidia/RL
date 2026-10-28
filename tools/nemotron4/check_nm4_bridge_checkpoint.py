@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Validate NM4 Bridge config round-tripping and NeMo-RL checkpoint loading.
 
 Examples:

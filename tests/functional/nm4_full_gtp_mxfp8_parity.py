@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Standalone full-architecture NM4 checkpoint GTP1/GTP2 parity on 16 GPUs.
 
 Uses the production NeMo-RL provider/configuration path and original checkpoint.

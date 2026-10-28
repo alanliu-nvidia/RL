@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Remove optional marker whitespace so the NM4 lock fits GitLab's file limit.
 
